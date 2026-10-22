@@ -177,7 +177,7 @@ class CheckBlobTests(unittest.TestCase):
     def test_substring_of_declared_string_passes(self):
         # Code or rodata layout may expose a run shorter than the constant.
         data = ENTRY + LOOP + END_MAGIC
-        data = data[:-1] + b"clared config pay"  # 17 bytes, substring of DECLARED
+        data = data[:-1] + b"clared config payload"  # 21 bytes, substring of DECLARED
         manifest = self.write_manifest([self.DECLARED.decode()])
         self.run_check(data, True, ["--manifest", manifest])
 

@@ -11,9 +11,11 @@ philosophy (docs/ETUDE-DE-FAISABILITE.md, section 1):
    script). Everything else — leaked panic messages, paths, symbol
    names — fails the build. Without a manifest, any such run fails.
    Threshold rationale: executable code naturally produces printable byte
-   runs (register push/pop sequences: "AWAVVWSH"), measured up to ~10;
-   real leaks (panic strings, build paths, identifiers) are prose-like
-   and longer. Shorter runs are still reported for review, not fatal.
+   runs (register push/pop sequences: "AWAVVWSH", deep prologues up to
+   "AWAVAUATVWUSH", 13-14 bytes observed); real leaks (panic strings, build
+   paths, identifiers) are prose-like and longer. The threshold sits at 18
+   with margin over the deepest observed code run. Shorter runs are still
+   reported for review, not fatal.
 2. Size budget: the blob must stay under the budget (raise it
    deliberately, in its own commit, never as a side effect).
 
@@ -24,9 +26,9 @@ import argparse
 import json
 import sys
 
-# Runs of 12+ printable bytes are failures; 5..11 are review-only.
+# Runs of 18+ printable bytes are failures; 5..17 are review-only.
 MIN_RUN = 5
-FAIL_RUN = 12
+FAIL_RUN = 18
 PRINTABLE = range(0x20, 0x7F)
 DEFAULT_MAX_SIZE = 4096
 

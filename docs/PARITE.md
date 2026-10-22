@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-22** (phase 1, itération 1).
+Dernière mise à jour : **2026-10-22** (phase 1, itération 2).
 
 ---
 
@@ -38,8 +38,8 @@ Dernière mise à jour : **2026-10-22** (phase 1, itération 1).
 |---|---|---|---|
 | `Config.h` généré par le plugin avant build | JSON (décision 2026-10-22) → `build.rs` → constantes typées no_std | Fait | Validation stricte ; défaut = `profiles/default.json` comme les `#ifndef` originaux |
 | Clé AES-256 injectée au build | `AES_KEY` const générée | Fait | Décodage hex testé ; consommation chiffrement à venir (wire, phase 3) |
-| Killswitch (epoch compilé, vérifié au bootstrap et après chaque sommeil) | `KILL_EPOCH` const générée | Partiel | Vérification runtime pas encore branchée (phase 2, cycle sleep) |
-| Sleep + jitter configurables | `SLEEP_MS`/`JITTER_MS` const générées | Partiel | Calcul runtime du sommeil effectif à venir (phase 2) |
+| Killswitch (epoch compilé, vérifié au bootstrap et après chaque sommeil) | `KILL_EPOCH` const + conversion FILETIME→epoch testée + contrôle dans le cycle | Fait | Sortie = boucle silencieuse (placeholder) ; `RtlExitUserThread(0)` en phase 2 |
+| Sleep + jitter configurables | Cycle runtime : `sleep_with_jitter(SLEEP_MS, JITTER_MS, rng)` → `Sleep()` | Fait | Hypothèse documentée : jitter symétrique ± ms, à réconcilier avec le dialogue du plugin en phase 4 ; `Sleep` plain remplacé par le masque obfusqué en phase 2 |
 | Profils malleables v2 embarqués (GET/POST, métadonnées, wrapping serveur) | Typés en const (`Profile` : rotation, hosts, UA, URIs, headers, placements…) | Partiel | Parsing/validation/faux défauts : fait ; consommation par le transport : phase 3 |
 | Watermark listener | `WATERMARK` const générée, lue par l'instance | Fait | — |
 | Debug checkbox → `specter.log` | — | À faire | Phase 3 (log mémoire + dump fichier optionnel) |
@@ -56,7 +56,7 @@ Dernière mise à jour : **2026-10-22** (phase 1, itération 1).
 | Walk PEB / LDR (bases de modules par hash) | `specter_core::peb::find_module` | Fait | Testé avec PEB mock ; offsets x64 épinglés |
 | Résolution d'exports par hash | `specter_core::peb::find_export` | Fait | Testé avec images PE mock ; scan borné |
 | Bootstrap (PEB → modules → instance) | `runtime::bootstrap::main` | Fait | Résout ntdll/kernel32, stocke l'instance TEB |
-| Heap custom / allocation | — | À faire | Phase 1 reste : `Instance`-scoped, pas de `GlobalAlloc` global |
+| Heap custom / allocation | `specter_core::heap::Heap` (handle + pointeurs résolus), méthodes Instance-scoped | Fait | Pas de `GlobalAlloc` global (philosophie no-globals) ; testé avec mocks WinAPI |
 | Sortie silencieuse `RtlExitUserThread(0)` | — | À faire | Phase 2 (résolution par hash) |
 | Watchdog | — | À faire | Phase 2/3 |
 
@@ -87,6 +87,7 @@ Dernière mise à jour : **2026-10-22** (phase 1, itération 1).
 
 | Commande (specter) | Implémentation specter-rs | Statut | Notes |
 |---|---|---|---|
+| `sleep` — le **cycle** (intervalle compilé + jitter, borne inférieure 0) est fait (voir §2) ; la **commande opérateur** (changement à runtime) | — | À faire | Phase 3 (nécessite le wire) |
 | Fichiers : `cat` `ls` `cd` `pwd` `mkdir` `rm` `cp` `mv` `upload` `download` | — | À faire | Phase 3 |
 | Process : `ps` (list/kill/run + PPID spoofing), `whoami` | — | À faire | Phase 3 |
 | `shell` (cmd.exe/PowerShell interactif) | — | À faire | Phase 3 |
@@ -95,7 +96,6 @@ Dernière mise à jour : **2026-10-22** (phase 1, itération 1).
 | `socks` (SOCKS5), `lportfwd`, `rportfwd` | — | À faire | Phase 3 |
 | `screenshot` | — | À faire | Phase 3 |
 | `joblist` / `jobkill` | — | À faire | Phase 3 |
-| `sleep` (intervalle + jitter), `exit`, `exit-process` | — | À faire | Phase 2 (cycle sleep/check-in) |
 
 ## 7. Protocole wire
 
@@ -129,8 +129,8 @@ Dernière mise à jour : **2026-10-22** (phase 1, itération 1).
 | Domaine | Fait | Partiel | À faire | Hors périmètre |
 |---|---|---|---|---|
 | Invariants philosophie | 9 | 0 | 0 | 1 |
-| Build / config | 4 | 3 | 1 | 4 |
-| Runtime | 4 | 0 | 3 | 0 |
+| Build / config | 6 | 1 | 1 | 4 |
+| Runtime | 5 | 0 | 2 | 0 |
 | Évasion | 0 | 0 | 9 | 0 |
 | Transports | 0 | 1 | 2 | 0 |
 | Commandes | 0 | 0 | 10 | 0 |

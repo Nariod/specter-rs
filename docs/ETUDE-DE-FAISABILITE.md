@@ -216,13 +216,16 @@ Découvertes de pipeline (points durs, à conserver comme règles du projet) :
    dans `.text` (le `.xdata` doit rester hors du blob, comme dans l'original
    qui livre pdata/xdata en artefacts séparés).
 
-**Phase 1 — Runtime** : en cours — livré à ce jour :
-contrat de config JSON plugin → `build.rs` → module généré (types no_std,
-validation stricte, manifeste de chaînes), FNV-64 (variantes ASCII/UTF-16,
-case-insensitive pour les noms de modules), PEB walk + résolution d'exports
-(testés sur host avec PEB/images mock), bootstrap du beacon (résolution par
-hash, instance dans le TEB). Le blob passe de 23 à 535 octets, toutes les
-gardes tiennent. Reste : allocateur heap, cycle sleep/check-in (phase 2).
+**Phase 1 — Runtime** : **terminée.** Livré : contrat de config JSON plugin →
+`build.rs` → module généré (types no_std, validation stricte, manifeste de
+chaînes), FNV-64 (variantes ASCII/UTF-16, case-insensitive pour les noms de
+modules), PEB walk + résolution d'exports (testés sur host avec PEB/images
+mock), bootstrap du beacon (résolution par hash, instance dans le TEB), heap
+Instance-scoped (mocks WinAPI), RNG xorshift64 (seedé par
+`QueryPerformanceCounter`), cycle sleep+jitter, killswitch FILETIME→epoch
+vérifié au bootstrap et après chaque sommeil. Blob : 936 octets, toutes les
+gardes tiennent. La sortie silencieuse (`RtlExitUserThread`) et le masque de
+sommeil obfusqué passent en phase 2.
 
 ## 8bis. Guardrails qualité (mis en place dès la phase 0/1)
 

@@ -82,12 +82,15 @@ Locally, `make test` runs everything CI runs.
 ## Status
 
 Phase 0 (toolchain spike) — **done**: PIC blob, entry `#[naked]` at offset 0,
-`SPT_END` marker last, PIC proven. Phase 1 (runtime) — **in progress**:
-JSON config contract (plugin → build.rs → typed consts), FNV-64 hashing,
-PEB walk and export resolution (host-tested with mock structures), beacon
-bootstrap with the TEB instance. 535-byte blob, all guardrails green.
-Next: sleep/check-in cycle, syscall stubs (phase 2). See the
-[feasibility study](docs/ETUDE-DE-FAISABILITE.md), section 8.
+`SPT_END` marker last, PIC proven. Phase 1 (runtime) — **done**: JSON config
+contract (plugin → build.rs → typed consts), FNV-64 hashing, PEB walk and
+export resolution (host-tested with mock structures), beacon bootstrap with
+the TEB instance, instance-scoped heap, xorshift64 jitter RNG, sleep cycle
+with jitter, FILETIME-based killswitch checked at bootstrap and after every
+sleep. 936-byte blob, all guardrails green. Next: indirect syscalls, HWBP
+hooks, obfuscated sleep (phase 2). See the
+[feasibility study](docs/ETUDE-DE-FAISABILITE.md) and the
+[parity tracking](docs/PARITE.md).
 
 ---
 
