@@ -30,7 +30,7 @@ import sys
 MIN_RUN = 5
 FAIL_RUN = 18
 PRINTABLE = range(0x20, 0x7F)
-DEFAULT_MAX_SIZE = 4096
+DEFAULT_MAX_SIZE = 8192
 
 
 def find_strings(blob):
