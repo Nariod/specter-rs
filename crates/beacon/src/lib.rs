@@ -1,6 +1,7 @@
 //! Specter-rs beacon — position-independent Windows x64 implant.
 //!
-//! Rust rewrite of https://github.com/Nariod/specter (`src_beacon`).
+//! Rust rewrite of Specter (https://github.com/0xC9H/specter), beacon
+//! (`src_beacon`).
 //!
 //! Philosophy preserved from the original (all non-negotiable, see
 //! docs/ETUDE-DE-FAISABILITE.md):

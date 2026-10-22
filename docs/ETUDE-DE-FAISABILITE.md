@@ -1,10 +1,14 @@
 # specter-rs — Étude de faisabilité
 
-> Réécriture de [Specter](https://github.com/Nariod/specter) (beacon Windows x64, C + NASM)
-> en Rust, en conservant la philosophie initiale du projet.
+> Réécriture de [Specter](https://github.com/0xC9H/specter) par **0xC9H**
+> (beacon Windows x64, C + NASM) en Rust, en conservant la philosophie
+> initiale du projet. Tous les crédits du projet original et de la recherche
+> d'évasion qu'il met en œuvre reviennent à son auteur — voir les
+> remerciements dans le README.
 >
-> Étude réalisée à partir de l'analyse du dépôt original (README, `Makefile`,
-> `Linker.ld`, en-têtes `src_beacon/include/`, structure `src_server/`, profils).
+> Étude réalisée à partir de l'analyse du code source original (README,
+> `Makefile`, `Linker.ld`, en-têtes `src_beacon/include/`, structure
+> `src_server/`, profils).
 
 ---
 

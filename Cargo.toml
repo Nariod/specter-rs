@@ -17,3 +17,8 @@ codegen-units = 1
 panic = "abort"
 strip = true
 overflow-checks = false
+
+# The beacon never unwinds: keep `cargo check`/`cargo build` (dev) working
+# with build-std=core, which otherwise rebuilds core with panic=unwind.
+[profile.dev]
+panic = "abort"

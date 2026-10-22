@@ -8,13 +8,16 @@
 
 > [!WARNING]
 > **Work in progress.** Specter-rs is the early-stage Rust rewrite of
-> [Specter](https://github.com/Nariod/specter). Nothing is functional yet.
+> [Specter](https://github.com/0xC9H/specter). Nothing is functional yet.
 > This repository currently contains the feasibility study and the project
 > scaffold.
 
 A Rust rewrite of the Specter beacon: an [AdaptixC2](https://github.com/nicecatch-cyber/AdaptixC2)
 Windows x64 agent focused on **EDR evasion**, preserving the original project's
-philosophy:
+philosophy. The original project is **[Specter](https://github.com/0xC9H/specter)
+by 0xC9H** — this rewrite exists on top of its ideas, architecture, and
+research; all credit for the original design and evasion research belongs
+to its author.
 
 - Position-independent, single `.text` section, no CRT, no import table
 - No globals: the instance lives in `TEB->NtTib.ArbitraryUserPointer`, fully reentrant
@@ -58,6 +61,25 @@ Phase 0 (toolchain spike) — **done**: 23-byte PIC blob, entry `#[naked]` at
 offset 0, `SPT_END` marker last, PIC proven. Phase 1 (runtime: allocator,
 FNV API hashing, TEB instance, build.rs config) in progress. See the
 [feasibility study](docs/ETUDE-DE-FAISABILITE.md), section 8.
+
+---
+
+## Acknowledgments
+
+This project is a Rust rewrite of **[Specter](https://github.com/0xC9H/specter)**
+by **0xC9H**, and would not exist without the original project — its design,
+philosophy, and evasion research. The original project's own acknowledgments
+carry over in full, as the techniques are the same:
+
+| Project | Author | Reference |
+|---------|--------|-----------|
+| **Specter** (original project) | 0xC9H | [0xC9H/specter](https://github.com/0xC9H/specter) |
+| **NaX** (NoNameAx AdaptixC2 agent) | MaorSabag | [NaX](https://github.com/MaorSabag/NaX) |
+| **Stardust** (PIC implant template behind NaX) | C5pider | [Stardust](https://github.com/Cracked5pider/Stardust) |
+| **Ekko** (RC4 sleep obfuscation) | C5pider | [Ekko](https://github.com/Cracked5pider/Ekko) |
+| **Astral Projection** (module-stomped sleep) | KuwaitiSt | [Astral_Projection](https://github.com/KuwaitiSt/Astral_Projection) |
+| **Hell's Gate** (direct SSN extraction) | am0nsec & smelly__vx | [HellsGate](https://github.com/am0nsec/HellsGate) |
+| **ThreadStackSpoofer** (TIB stack spoofing) | mgeeky | [ThreadStackSpoofer](https://github.com/mgeeky/ThreadStackSpoofer) |
 
 ---
 
