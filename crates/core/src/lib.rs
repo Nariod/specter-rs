@@ -51,4 +51,5 @@ pub mod sleep;
 pub mod sleepmask;
 pub mod syscalls;
 pub mod time;
+pub mod transport;
 pub mod wire;

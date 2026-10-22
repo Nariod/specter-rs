@@ -292,12 +292,46 @@ ci-dessus) :
   LTO-fusionné entier (~50 KiB) — le beacon embarque son propre
   `___chkstk_ms` (naked asm) et toutes les copies/init sont manuelles.
 - Les hashes de noms sont des `const` de crate (pliés) ; les littéraux
-  runtime légitimes (ex. `.text`) sont déclarés dans le manifeste de
-  chaînes du build script.
+  runtime légitimes (ex. `.text`, l'alphabet base64, les noms de modules
+  `amsi.dll`/`ntdll.dll`/`winhttp.dll`) sont déclarés dans le manifeste
+  de chaînes du build script.
+
+Nouvelles règles de pipeline découvertes en phase 3 (itération 6) :
+
+- **Les listes de `&str` de la config sont rendues en données compactées
+  + tableau d'offsets** (`packed_list`, build/render.rs) : une constante
+  `[&str; N]` — ou une struct avec champ `&str` — référencée par le code
+  émet des pointeurs gras absolus en statique, que la preuve PIC attrape ;
+  les chaînes compactées restent adressées rip-relative.
+- **Tampons de pile ≥ 512 octets : non initialisés (`MaybeUninit`)** —
+  chaque octet lu est écrit d'abord (packeur, API, lectures bornées) ;
+  une init `[0; N]` de grande taille émet un appel `memset` → tire
+  compiler_builtins. Le lint `uninit_assumed_init` est autorisé par site,
+  invariant documentée.
+- **La garde anti-strings décompose les runs** en chaînes déclarées +
+  colles < 5 octets : les constantes rdata adjacentes se concatètent dans
+  le `.text` fusionné ; une run n'est une fuite que si elle ne se
+  décompose pas (tests épinglés des deux côtés).
 
 **Phase 3 — Fonctionnel** : wire typé, HTTP (WinHTTP par hash), SMB pipe,
 tasks (fs, ps, tokens, socks, portfwd), COFF loader — les tests unitaires
 tournent sur la machine de dev.
+
+Itération 6 (2026-10-22) — transport HTTP + check-in câblé : contrat wire
+re-pinné contre la source du listener v1.2 (docs/WIRE.md : header beat
+`hb_header` = base64(RC4(clé listener, watermark || agentId || beat19)),
+réponse dans le gabarit de page, cadre 5 octets des résultats, pack de
+tâches préfixé u32 LE) ; `core::transport` pur, épinglé par des vecteurs
+générés par la sémantique Go exacte (crypto/rc4, base64, PackArray,
+PackTasks) ; `runtime::winhttp` (chargement à la demande, 9 exports par
+hash, transaction POST par cycle, échec non fatal) ; cycle de check-in
+dans `bootstrap::main` (clé de session 32 octets, agentId RNG, beat
+sysinfo, tâches sleep/terminate, accusés différés d'un cycle) ; plugin
+Go : `CreateAgent`/`Encrypt`/`Decrypt`/`PackTasks`/`ProcessData` portés
+du natif + `listener_key` et override du profil par le listener réel au
+build. Budget blob relevé 8192 → 12288 (commit dédié). Reste : rejeu du
+check-in contre le listener réel, dialogues de commandes, IP interne,
+élévation, domaine, SMB.
 
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B

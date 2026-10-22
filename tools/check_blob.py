@@ -30,7 +30,10 @@ import sys
 MIN_RUN = 5
 FAIL_RUN = 18
 PRINTABLE = range(0x20, 0x7F)
-DEFAULT_MAX_SIZE = 8192
+# Raised 8192 -> 12288 for the phase 3 HTTP transport (WinHTTP by hash,
+# check-in cycle, malleable shaping): ~1.9 KiB of transport glue plus the
+# listener-profile strings. Deliberate raise, its own commit.
+DEFAULT_MAX_SIZE = 12288
 
 
 def find_strings(blob):
@@ -51,8 +54,35 @@ def find_strings(blob):
 
 
 def allowed(s, manifest):
-    """A blob string is allowed if it is part of a declared config string."""
-    return any(s in allowed for allowed in manifest)
+    """A blob string is allowed if it is part of a declared config string,
+    or if it decomposes into declared strings glued by short printable
+    segments (adjacent rdata constants concatenate in the single .text
+    section: hosts+uris, name+": ", module-name literals)."""
+    if any(s in entry for entry in manifest):
+        return True
+    return decomposes(s, manifest)
+
+
+def decomposes(run, manifest):
+    """Greedy longest-match: consume declared strings; the glue segments
+    between them must stay under MIN_RUN (a real leak cannot hide in
+    4 printable bytes)."""
+    entries = sorted((e for e in manifest if e), key=len, reverse=True)
+    pos = 0
+    end = len(run)
+    while pos < end:
+        for entry in entries:
+            if run.startswith(entry, pos):
+                pos += len(entry)
+                break
+        else:
+            nexts = [run.find(e, pos + 1) for e in entries]
+            nexts = [i for i in nexts if i != -1]
+            nxt = min(nexts) if nexts else end
+            if nxt - pos >= MIN_RUN:
+                return False
+            pos = nxt
+    return True
 
 
 def main():

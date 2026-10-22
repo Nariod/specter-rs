@@ -24,6 +24,25 @@ impl<'a> Writer<'a> {
         self.pos
     }
 
+    /// The written prefix of the buffer.
+    #[inline]
+    pub fn written_bytes(&self) -> &[u8] {
+        &self.buf[..self.pos]
+    }
+
+    /// Backfill a big-endian u32 at an absolute position (the reserved
+    /// results-size field).
+    pub fn backfill_u32_be(&mut self, pos: usize, v: u32) {
+        if pos + 4 <= self.buf.len() {
+            let b = v.to_be_bytes();
+            let mut i = 0;
+            while i < 4 {
+                self.buf[pos + i] = b[i];
+                i += 1;
+            }
+        }
+    }
+
     /// Raw byte push (task framing).
     pub fn push(&mut self, bytes: &[u8]) -> bool {
         if self.buf.len() - self.pos < bytes.len() {

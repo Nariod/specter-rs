@@ -25,7 +25,24 @@ const agentConfig = `{
   "debug":      false
 }`
 
-const listenerProfile = `{"l_name":"BeaconHTTP","l_bind_host":"0.0.0.0","l_bind_port":"8080"}`
+// Realistic BeaconHTTP listener profile (TransportConfig as the teamserver
+// passes it to BuildPayload): every field BuildPayload consumes must be
+// present, exactly as a listener created from the UI would save them.
+const listenerProfile = `{
+  "host_bind": "0.0.0.0",
+  "port_bind": 8080,
+  "callback_addresses": ["127.0.0.1:8080"],
+  "encrypt_key": "00112233445566778899aabbccddeeff",
+  "ssl": false,
+  "http_method": "POST",
+  "uri": ["/api/v1/report"],
+  "hb_header": "X-Correlation-Id",
+  "user_agent": ["Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"],
+  "host_header": [],
+  "request_headers": "Content-Type: application/octet-stream\nAccept: application/json",
+  "page-error": "<html>404</html>",
+  "page-payload": "{\"result\":\"<<<PAYLOAD_DATA>>>\",\"status\":\"ok\"}"
+}`
 
 func fatal(format string, args ...any) {
 	fmt.Printf("[INT] FAIL: "+format+"\n", args...)

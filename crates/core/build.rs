@@ -46,6 +46,13 @@ fn main() {
     // conscious act — the anti-strings guardrail fails the build otherwise.
     let mut manifest = gen.strings_manifest;
     manifest.push(".text".to_string()); // find_section's section name probe
+                                        // base64 alphabet of the beat header (core::transport)
+    manifest.push("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".to_string());
+    // runtime module-name literals (amsi resolution, deferred loader hook,
+    // WinHTTP on-demand load)
+    manifest.push("amsi.dll".to_string());
+    manifest.push("ntdll.dll".to_string());
+    manifest.push("winhttp.dll".to_string());
     manifest.sort();
     manifest.dedup();
     let manifest = serde_json::to_string(&manifest).expect("manifest serialize");

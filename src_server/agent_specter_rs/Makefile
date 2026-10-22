@@ -12,7 +12,7 @@ GOEXPERIMENT ?= jsonv2,greenteagc
 all: plugin
 
 plugin:
-	GOEXPERIMENT=$(GOEXPERIMENT) go build -buildmode=plugin -ldflags="-s -w" -o agent_specter_rs.so pl_main.go
+	GOEXPERIMENT=$(GOEXPERIMENT) go build -buildmode=plugin -ldflags="-s -w" -o agent_specter_rs.so pl_main.go pl_packer.go
 
 # Integration harness: drives the plugin exactly the way the teamserver does
 # (ExAgentGenerate: GenerateProfiles then BuildPayload) against the real
@@ -22,7 +22,7 @@ test: harness
 	./agent_specter_rs_harness
 
 harness:
-	go build -o agent_specter_rs_harness harness_main.go pl_main.go
+	go build -o agent_specter_rs_harness harness_main.go pl_main.go pl_packer.go
 
 clean:
 	rm -f agent_specter_rs.so agent_specter_rs_harness

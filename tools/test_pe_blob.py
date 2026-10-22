@@ -189,6 +189,23 @@ class CheckBlobTests(unittest.TestCase):
         out = self.run_check(data, True)
         self.assertIn("review only", out)
 
+    def test_concatenated_declared_strings_pass(self):
+        # Adjacent rdata constants concatenate in the single .text section:
+        # a run of several declared strings glued by short segments must
+        # pass (the beacon's hosts+uris layout produces exactly this).
+        data = ENTRY + LOOP + END_MAGIC
+        run = self.DECLARED + b": " + self.DECLARED
+        data = data[:-1] + run
+        manifest = self.write_manifest([self.DECLARED.decode()])
+        self.run_check(data, True, ["--manifest", manifest])
+
+    def test_concatenation_with_long_undeclared_glue_fails(self):
+        data = ENTRY + LOOP + END_MAGIC
+        run = self.DECLARED + self.LEAK  # 26 bytes of undeclared glue
+        data = data[:-1] + run
+        manifest = self.write_manifest([self.DECLARED.decode()])
+        self.run_check(data, False, ["--manifest", manifest])
+
     def test_missing_manifest_fails(self):
         data = ENTRY + LOOP + END_MAGIC
         data = data[:-1] + self.LEAK

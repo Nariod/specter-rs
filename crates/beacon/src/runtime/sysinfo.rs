@@ -19,6 +19,7 @@ const H_GET_COMPUTER_NAME_A: u64 = fnv1a64(b"GetComputerNameA");
 const H_GET_USER_NAME_A: u64 = fnv1a64(b"GetUserNameA");
 const H_GET_MODULE_FILE_NAME_A: u64 = fnv1a64(b"GetModuleFileNameA");
 const H_RTL_GET_VERSION: u64 = fnv1a64(b"RtlGetVersion");
+const H_GET_TIME_ZONE_INFORMATION: u64 = fnv1a64(b"GetTimeZoneInformation");
 
 /// Partial OSVERSIONINFOW: size(+0), major(+4), minor(+8), build(+0xC).
 #[repr(C)]
@@ -39,6 +40,8 @@ pub struct SysInfo {
     pub major: u8,
     pub minor: u8,
     pub build: u32,
+    /// GMT offset in hours (`-(TIME_ZONE_INFORMATION.Bias / 60)`).
+    pub gmt_offset: i8,
     pub computer: [u8; 64],
     pub computer_len: usize,
     pub username: [u8; 64],
@@ -74,6 +77,7 @@ const SYSINFO_DEFAULT: SysInfo = SysInfo {
     major: 10,
     minor: 0,
     build: 0,
+    gmt_offset: 0,
     computer: [0; 64],
     computer_len: 0,
     username: [0; 64],
@@ -151,6 +155,21 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             }
             if info.process_name_off >= info.process_len {
                 info.process_name_off = 0;
+            }
+        }
+    }
+
+    // GMT offset: Bias is the first i32 of TIME_ZONE_INFORMATION
+    // (172 bytes = 86 u16; only the first word pair is read).
+    let p = export(kernel32, H_GET_TIME_ZONE_INFORMATION);
+    if !p.is_null() {
+        let mut tzi = [0u16; 86];
+        let zone = (*(p as *const unsafe extern "system" fn(*mut u16) -> u32))(tzi.as_mut_ptr());
+        if zone <= 2 {
+            let bias = ((tzi[1] as i32) << 16) | (tzi[0] as i32);
+            let hours = -bias / 60;
+            if (-128..=127).contains(&hours) {
+                info.gmt_offset = hours as i8;
             }
         }
     }

