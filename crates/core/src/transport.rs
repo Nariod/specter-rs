@@ -594,17 +594,57 @@ mod tests {
         let (dl, dd) = mk(b"C:\\dst.txt");
 
         let cases = [
-            (Task::Cd { path_len: l, path: p }, b"C:\\dir".as_slice()),
-            (Task::Ls { path_len: l, path: p }, b"C:\\dir".as_slice()),
-            (Task::Cat { path_len: l, path: p }, b"C:\\dir".as_slice()),
-            (Task::Mkdir { path_len: l, path: p }, b"C:\\dir".as_slice()),
-            (Task::Rm { path_len: l, path: p }, b"C:\\dir".as_slice()),
             (
-                Task::Cp { src_len: sl, src: sd, dst_len: dl, dst: dd },
+                Task::Cd {
+                    path_len: l,
+                    path: p,
+                },
+                b"C:\\dir".as_slice(),
+            ),
+            (
+                Task::Ls {
+                    path_len: l,
+                    path: p,
+                },
+                b"C:\\dir".as_slice(),
+            ),
+            (
+                Task::Cat {
+                    path_len: l,
+                    path: p,
+                },
+                b"C:\\dir".as_slice(),
+            ),
+            (
+                Task::Mkdir {
+                    path_len: l,
+                    path: p,
+                },
+                b"C:\\dir".as_slice(),
+            ),
+            (
+                Task::Rm {
+                    path_len: l,
+                    path: p,
+                },
+                b"C:\\dir".as_slice(),
+            ),
+            (
+                Task::Cp {
+                    src_len: sl,
+                    src: sd,
+                    dst_len: dl,
+                    dst: dd,
+                },
                 b"C:\\src.txt".as_slice(),
             ),
             (
-                Task::Mv { src_len: sl, src: sd, dst_len: dl, dst: dd },
+                Task::Mv {
+                    src_len: sl,
+                    src: sd,
+                    dst_len: dl,
+                    dst: dd,
+                },
                 b"C:\\src.txt".as_slice(),
             ),
         ];
@@ -612,11 +652,23 @@ mod tests {
             assert_eq!(task.path(), want, "path() of {task:?}");
         }
         assert_eq!(
-            Task::Cp { src_len: sl, src: sd, dst_len: dl, dst: dd }.dst(),
+            Task::Cp {
+                src_len: sl,
+                src: sd,
+                dst_len: dl,
+                dst: dd
+            }
+            .dst(),
             b"C:\\dst.txt".as_slice()
         );
         assert_eq!(
-            Task::Mv { src_len: sl, src: sd, dst_len: dl, dst: dd }.dst(),
+            Task::Mv {
+                src_len: sl,
+                src: sd,
+                dst_len: dl,
+                dst: dd
+            }
+            .dst(),
             b"C:\\dst.txt".as_slice()
         );
     }
