@@ -368,6 +368,20 @@ et le bit server. Budget relevé 12 288 → 16 384 (commit dédié) : blob à
 12 660 octets, PIC prouvé ; flux opérateur réel re-vérifié de bout en
 bout (génération 12 692 octets, tous paramètres présents).
 
+Itération 10 (2026-10-22) — premières commandes opérateur : `pwd`, `cd`,
+`ls`, `cat` de bout en bout. Côté beacon : dispatch typé (`core::transport`
+parse, `beacon::tasks` exécute via APIs résolues par hash, les résultats
+sont mis en file pour le POST suivant) ; échecs Win32 → record
+`COMMAND_ERROR` avec `GetLastError`. Côté plugin : `CreateCommand` et les
+cas `ProcessData` correspondants portés du natif (y compris le rendu du
+listing et la synchro du navigateur de fichiers), dialogues ax déclarés.
+Le harnais de rejeu fabrique les résultats comme le fait l'implant :
+`pwd`/`ls`/`cat` émis par l'API opérateur, reçus, accusés, et rendus
+correctement par le serveur réel (tâches complétées, texte affiché).
+Formats épinglés par vecteurs Go (PackArray int/string pour les tâches,
+enregistrements BE pour les résultats). Blob : 15 388/16 384 — la marge
+est quasi consommée, la prochaine commande demandera une relance.
+
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B
 détection en labo vs le beacon C, docs.

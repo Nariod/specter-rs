@@ -158,12 +158,73 @@ fn replay_check_in_against_real_listener() {
     let pack = head.take(total as usize).expect("truncated task pack");
     let mut r = Reader::new(pack);
 
-    let mut acks: Vec<(u32, u32, u32)> = Vec::new();
+    // Results are fabricated the way the Windows handlers produce them
+    // (the pure builders of core::transport): this replays the exact
+    // result bytes the implant would queue for its next POST.
+    let mut packed = [0u8; 2048];
+    let mut w = Writer::new(&mut packed);
+    assert!(transport::begin_results(&mut w));
+    let mut handled = 0usize;
     while r.remaining() >= 8 {
         match transport::parse_task(&mut r) {
             Some((transport::Task::Sleep { sec, jitter_pct }, id)) => {
                 println!("[replay] task {id:08x}: sleep {sec}s, jitter {jitter_pct}%");
-                acks.push((id, sec, jitter_pct));
+                assert!(transport::push_sleep_result(&mut w, id, sec, jitter_pct));
+                handled += 1;
+            }
+            Some((transport::Task::Pwd, id)) => {
+                println!("[replay] task {id:08x}: pwd (fabricated)");
+                assert!(transport::push_path_result(
+                    &mut w,
+                    id,
+                    transport::COMMAND_PWD,
+                    b"C:\\Users\\specter"
+                ));
+                handled += 1;
+            }
+            Some((task @ transport::Task::Cd { .. }, id)) => {
+                println!("[replay] task {id:08x}: cd (fabricated)");
+                assert!(transport::push_path_result(
+                    &mut w,
+                    id,
+                    transport::COMMAND_CD,
+                    task.path()
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::Ls { .. }, id)) => {
+                println!("[replay] task {id:08x}: ls (fabricated)");
+                assert!(transport::push_ls_result_header(
+                    &mut w,
+                    id,
+                    b"C:\\Users\\specter",
+                    2
+                ));
+                assert!(transport::push_ls_entry(
+                    &mut w,
+                    true,
+                    0,
+                    1_767_225_600,
+                    b"Documents"
+                ));
+                assert!(transport::push_ls_entry(
+                    &mut w,
+                    false,
+                    42,
+                    1_767_225_600,
+                    b"flag.txt"
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::Cat { .. }, id)) => {
+                println!("[replay] task {id:08x}: cat (fabricated)");
+                assert!(transport::push_cat_result(
+                    &mut w,
+                    id,
+                    b"C:\\Users\\specter\\flag.txt",
+                    b"specter-rs replay content\n"
+                ));
+                handled += 1;
             }
             Some((transport::Task::Terminate, id)) => {
                 println!("[replay] task {id:08x}: terminate");
@@ -172,19 +233,12 @@ fn replay_check_in_against_real_listener() {
             None => break,
         }
     }
-    if acks.is_empty() {
+    if handled == 0 {
         println!("[replay] no hosted tasks; session is alive");
         return;
     }
 
-    // Cycle 2: acknowledge every sleep task (the results body the beacon
-    // queues for its next POST).
-    let mut packed = [0u8; 512];
-    let mut w = Writer::new(&mut packed);
-    assert!(transport::begin_results(&mut w));
-    for (id, sec, jitter_pct) in &acks {
-        assert!(transport::push_sleep_result(&mut w, *id, *sec, *jitter_pct));
-    }
+    // Cycle 2: the results body the beacon queues for its next POST.
     assert!(transport::finish_results(&mut w));
     let mut body = [0u8; 640];
     let n = transport::wrap_results_frame(w.written_bytes(), &mut body).expect("frame");
@@ -195,5 +249,5 @@ fn replay_check_in_against_real_listener() {
         transport::extract_payload_range(&page2, prepend.as_bytes(), append.as_bytes())
             .expect("ack response page does not match the template");
     assert!(start2 == end2, "ack cycle should host no further tasks");
-    println!("[replay] acknowledged {} task(s)", acks.len());
+    println!("[replay] acknowledged {} task(s)", handled);
 }

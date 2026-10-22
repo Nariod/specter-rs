@@ -473,7 +473,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     let mut r = specter_core::wire::Reader::new(pack);
 
     // Dispatch + queue the acknowledgements for the next cycle.
-    let mut results: [u8; 512] = core::mem::MaybeUninit::uninit().assume_init();
+    let mut results: [u8; 2048] = core::mem::MaybeUninit::uninit().assume_init();
     let mut w = Writer::new(&mut results);
     if !transport::begin_results(&mut w) {
         return;
@@ -490,6 +490,10 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
             Some((Task::Terminate, _)) => {
                 syscalls::exit_thread(instance.exit_thread);
             }
+            Some((task, id)) => {
+                // File commands: execute, queue the result record.
+                crate::tasks::handle(instance, task, id, &mut w);
+            }
             None => break, // unknown command: drop the rest (stays hosted)
         }
     }
@@ -499,6 +503,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     // Manual copy (memcpy rule): only the written prefix moves to the
     // instance.
     let n = w.written();
+    if n > instance.results.len() {
+        return;
+    }
     let mut i = 0;
     while i < n {
         instance.results[i] = results[i];

@@ -57,6 +57,9 @@ type Teamserver interface {
 	TsAgentTerminate(agentId string, terminateTaskId string) error
 	TsTaskUpdate(agentId string, data adaptix.TaskData)
 	TsAgentConsoleOutput(agentId string, messageType int, message string, clearText string, store bool)
+	TsWin32Error(errorCode uint) string
+	TsClientGuiFilesWindows(taskData adaptix.TaskData, path string, files []adaptix.ListingFileDataWin)
+	TsConvertUTF8toCp(data string, cp int) string
 }
 
 var Ts Teamserver
@@ -71,6 +74,18 @@ func RC4Crypt(data []byte, key []byte) ([]byte, error) {
 	out := make([]byte, len(data))
 	cipher.XORKeyStream(out, data)
 	return out, nil
+}
+
+// sizeBytesToFormat: native pl_utils.go rendering (KiB/MiB/GiB).
+func sizeBytesToFormat(size int64) string {
+	if size > 1073741824 {
+		return fmt.Sprintf("%.2f GiB", float64(size)/1073741824)
+	} else if size > 1048576 {
+		return fmt.Sprintf("%.2f MiB", float64(size)/1048576)
+	} else if size > 1024 {
+		return fmt.Sprintf("%.2f KiB", float64(size)/1024)
+	}
+	return fmt.Sprintf("%d B", size)
 }
 
 // Dialog argument helpers (native beacon_agent semantics).
@@ -92,6 +107,11 @@ func getFloatArg(args map[string]any, key string) (float64, error) {
 const (
 	COMMAND_TERMINATE = 10
 	COMMAND_PROFILE   = 21
+	COMMAND_PWD       = 4
+	COMMAND_CD        = 8
+	COMMAND_LS        = 14
+	COMMAND_CAT       = 24
+	COMMAND_ERROR     = 0x1111ffff
 )
 
 // int32ToIPv4: host-order u32 to dotted quad (native pl_utils.go).
@@ -624,6 +644,33 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 
 		array = []interface{}{COMMAND_PROFILE, 1, sleepTime, jitterTime}
 
+	case "pwd":
+		array = []interface{}{COMMAND_PWD}
+
+	case "cd":
+		var path string
+		path, err = getStringArg(args, "path")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_CD, Ts.TsConvertUTF8toCp(path, agentData.ACP)}
+
+	case "ls":
+		var dir string
+		dir, err = getStringArg(args, "path")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_LS, Ts.TsConvertUTF8toCp(dir, agentData.ACP)}
+
+	case "cat":
+		var path string
+		path, err = getStringArg(args, "path")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_CAT, Ts.TsConvertUTF8toCp(path, agentData.ACP)}
+
 	case "terminate":
 		if subcommand == "thread" {
 			array = []interface{}{COMMAND_TERMINATE, 1}
@@ -700,6 +747,111 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 		task.TaskId = fmt.Sprintf("%08x", TaskId)
 
 		switch commandId {
+
+		case COMMAND_ERROR:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			errorCode := packer.ParseInt32()
+			task.Message = fmt.Sprintf("Error [%d]: %s", errorCode, Ts.TsWin32Error(errorCode))
+			task.MessageType = adaptix.MESSAGE_ERROR
+
+		case COMMAND_PWD:
+			if false == packer.CheckPacker([]string{"array"}) {
+				goto HANDLER
+			}
+			path := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+			task.Message = "Current working directory:"
+			task.ClearText = path
+
+		case COMMAND_CD:
+			if false == packer.CheckPacker([]string{"array"}) {
+				goto HANDLER
+			}
+			path := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+			task.Message = "Current working directory:"
+			task.ClearText = path
+
+		case COMMAND_CAT:
+			if false == packer.CheckPacker([]string{"array", "array"}) {
+				goto HANDLER
+			}
+			path := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+			fileContent := packer.ParseBytes()
+			task.Message = fmt.Sprintf("'%v' file content:", path)
+			task.ClearText = string(fileContent)
+
+		case COMMAND_LS:
+			if false == packer.CheckPacker([]string{"byte"}) {
+				goto HANDLER
+			}
+			result := packer.ParseInt8()
+
+			var items []adaptix.ListingFileDataWin
+			var rootPath string
+
+			if result == 0 {
+				if false == packer.CheckPacker([]string{"int"}) {
+					goto HANDLER
+				}
+				errorCode := packer.ParseInt32()
+				task.Message = fmt.Sprintf("Error [%d]: %s", errorCode, Ts.TsWin32Error(errorCode))
+				task.MessageType = adaptix.MESSAGE_ERROR
+
+			} else {
+				if false == packer.CheckPacker([]string{"array", "int"}) {
+					goto HANDLER
+				}
+				rootPath = Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+				rootPath, _ = strings.CutSuffix(rootPath, "\\*")
+
+				filesCount := int(packer.ParseInt32())
+
+				if filesCount == 0 {
+					task.Message = fmt.Sprintf("The '%s' directory is EMPTY", rootPath)
+				} else {
+					var folders []adaptix.ListingFileDataWin
+					var files []adaptix.ListingFileDataWin
+
+					for i := 0; i < filesCount; i++ {
+						if false == packer.CheckPacker([]string{"byte", "long", "int", "array"}) {
+							goto HANDLER
+						}
+						isDir := packer.ParseInt8()
+						fileData := adaptix.ListingFileDataWin{
+							IsDir:    false,
+							Size:     int64(packer.ParseInt64()),
+							Date:     int64(packer.ParseInt32()),
+							Filename: Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP),
+						}
+						if isDir > 0 {
+							fileData.IsDir = true
+							folders = append(folders, fileData)
+						} else {
+							files = append(files, fileData)
+						}
+					}
+
+					items = append(folders, files...)
+
+					OutputText := fmt.Sprintf(" %-8s %-14s %-20s  %s\n", "Type", "Size", "Last Modified      ", "Name")
+					OutputText += fmt.Sprintf(" %-8s %-14s %-20s  %s", "----", "---------", "----------------   ", "----")
+
+					for _, item := range items {
+						t := time.Unix(item.Date, 0).UTC()
+						lastWrite := fmt.Sprintf("%02d/%02d/%d %02d:%02d", t.Day(), t.Month(), t.Year(), t.Hour(), t.Minute())
+
+						if item.IsDir {
+							OutputText += fmt.Sprintf("\n %-8s %-14s %-20s  %-8v", "dir", "", lastWrite, item.Filename)
+						} else {
+							OutputText += fmt.Sprintf("\n %-8s %-14s %-20s  %-8v", "", sizeBytesToFormat(item.Size), lastWrite, item.Filename)
+						}
+					}
+					task.Message = fmt.Sprintf("Listing '%s'", rootPath)
+					task.ClearText = OutputText
+				}
+			}
+			Ts.TsClientGuiFilesWindows(task, rootPath, items)
 
 		case COMMAND_PROFILE:
 			if false == packer.CheckPacker([]string{"int", "int", "int"}) {

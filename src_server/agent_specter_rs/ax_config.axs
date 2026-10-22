@@ -8,6 +8,17 @@
 
 function RegisterCommands(listenerType)
 {
+    let cmd_pwd = ax.create_command("pwd", "Print current working directory", "pwd", "Task: show working directory");
+
+    let cmd_cd = ax.create_command("cd", "Change current working directory", "cd C:\\Windows", "Task: change working directory");
+    cmd_cd.addArgString("path", true);
+
+    let cmd_ls = ax.create_command("ls", "List files in a directory", "ls C:\\Users", "Task: list files");
+    cmd_ls.addArgString("path", true);
+
+    let cmd_cat = ax.create_command("cat", "Read first 2048 bytes of the specified file", "cat C:\\file.txt", "Task: read file");
+    cmd_cat.addArgString("path", true);
+
     let cmd_sleep = ax.create_command("sleep", "Sets sleep time", "sleep 30m5s 10", "Task: sleep");
     cmd_sleep.addArgString("sleep", true, "Time in '%h%m%s' format or number of seconds");
     cmd_sleep.addArgInt("jitter", false, "Max random amount of time in % added to sleep");
@@ -18,7 +29,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 

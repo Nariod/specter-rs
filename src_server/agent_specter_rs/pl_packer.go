@@ -91,6 +91,15 @@ func (p *Packer) ParseInt32() uint {
 	return value
 }
 
+func (p *Packer) ParseInt64() uint64 {
+	if len(p.buffer) < 8 {
+		return 0
+	}
+	value := binary.BigEndian.Uint64(p.buffer[:8])
+	p.buffer = p.buffer[8:]
+	return value
+}
+
 // ParseBytes: u32 BE length || bytes.
 func (p *Packer) ParseBytes() []byte {
 	size := p.ParseInt32()
