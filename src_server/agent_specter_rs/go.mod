@@ -1,0 +1,5 @@
+module agent_specter_rs
+
+go 1.25.4
+
+require github.com/Adaptix-Framework/axc2 v1.2.0

@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-22** (phase 2, itération 3).
+Dernière mise à jour : **2026-10-22** (phase 2 it. 3 + plugin intégration v1.2).
 
 ---
 
@@ -107,7 +107,7 @@ Dernière mise à jour : **2026-10-22** (phase 2, itération 3).
 
 | Composant (specter) | Statut | Notes |
 |---|---|---|
-| `agent_specter` (génération payloads, dialogue, build du beacon) | Hors périmètre | Phase 4 : adaptation de l'appel gcc → cargo (le contrat JSON est prêt côté Rust) |
+| `agent_specter` (génération payloads, dialogue, build du beacon) | `src_server/agent_specter_rs` (Go, ABI AdaptixC2 **v1.2** — le serveur installé ; l'original vise 2.0) : dialogue de génération, `BuildPayload` pilotant le pipeline cargo via `SPT_CONFIG`, chargé et vérifié sur le serveur réel (test négatif : le serveur logge l'échec si le .so manque) | Partiel | Génération de bout en bout vérifiée par harnais (chemin exact `ExAgentGenerate`) ; `CreateAgent`/wire attendent le transport phase 3 ; hosts du profil malleable pas encore câblés au listener |
 | `listener_specter_http` | Hors périmètre | Inchangé |
 | `listener_specter_smb` | Hors périmètre | Inchangé |
 | `specter_refs` | Hors périmètre | Inchangé |
@@ -135,4 +135,4 @@ Dernière mise à jour : **2026-10-22** (phase 2, itération 3).
 | Transports | 0 | 1 | 2 | 0 |
 | Commandes | 0 | 0 | 10 | 0 |
 | Wire | 0 | 0 | 1 | 0 |
-| Serveur Go | 1 | 0 | 0 | 4 |
+| Serveur Go | 1 | 1 | 0 | 3 |

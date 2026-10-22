@@ -2,3 +2,5 @@
 Cargo.lock
 build/
 *.bin
+*.so
+agent_specter_rs_harness
