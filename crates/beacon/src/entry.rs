@@ -33,9 +33,7 @@ pub unsafe extern "C" fn SptEntry() {
 /// unwind (the panic handler aborts).
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spt_main() -> ! {
-    loop {
-        core::hint::spin_loop();
-    }
+    crate::runtime::bootstrap::main()
 }
 
 /// End-of-beacon marker (port of the `.sptend` section from Linker.ld).

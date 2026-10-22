@@ -79,9 +79,12 @@ Locally, `make test` runs everything CI runs.
 
 ## Status
 
-Phase 0 (toolchain spike) — **done**: 23-byte PIC blob, entry `#[naked]` at
-offset 0, `SPT_END` marker last, PIC proven. Phase 1 (runtime: allocator,
-FNV API hashing, TEB instance, build.rs config) in progress. See the
+Phase 0 (toolchain spike) — **done**: PIC blob, entry `#[naked]` at offset 0,
+`SPT_END` marker last, PIC proven. Phase 1 (runtime) — **in progress**:
+JSON config contract (plugin → build.rs → typed consts), FNV-64 hashing,
+PEB walk and export resolution (host-tested with mock structures), beacon
+bootstrap with the TEB instance. 535-byte blob, all guardrails green.
+Next: sleep/check-in cycle, syscall stubs (phase 2). See the
 [feasibility study](docs/ETUDE-DE-FAISABILITE.md), section 8.
 
 ---

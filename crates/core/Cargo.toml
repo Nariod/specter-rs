@@ -7,8 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 # Pure logic only: no_std (so it links into the no_std beacon without
-# dragging std), and no panic handler (so host-side std test binaries can
-# link against it — the panic handler belongs to the beacon crate alone).
+# dragging std), and its panic handler is cfg(not(test)) (so host-side std
+# test binaries can link against it — the handler belongs to this crate,
+# consumed by the beacon through the dependency graph).
 # Everything here must stay free of host APIs and allocation: it ends up in
 # the raw PIC blob where every byte counts.
 
@@ -18,3 +19,12 @@ crate-type = ["rlib", "staticlib"]
 # Doctests compile the lib without cfg(test) under panic=unwind, which is
 # unsupported for a no_std crate; unit tests inside the crate cover it.
 doctest = false
+
+[build-dependencies]
+# Host-side only (never enters the blob): parses the per-build config JSON
+# written by the agent_specter Go plugin.
+serde_json = "1"
+
+[dev-dependencies]
+# Same module (build/render.rs) is unit-tested on the host.
+serde_json = "1"

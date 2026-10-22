@@ -6,6 +6,7 @@ the tools against them through their CLI, asserting both success and every
 failure mode. Run with `python3 tools/test_pe_blob.py` or `make test`.
 """
 
+import json
 import os
 import struct
 import subprocess
@@ -138,6 +139,12 @@ class CheckBlobTests(unittest.TestCase):
             f.write(data)
         return path
 
+    def write_manifest(self, strings):
+        path = os.path.join(self.tmp.name, "manifest.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(strings, f)
+        return path
+
     def run_check(self, data, expect_ok, extra=None):
         path = self.write_blob(data)
         cmd = [sys.executable, CHECK_BLOB, path] + (extra or [])
@@ -152,15 +159,46 @@ class CheckBlobTests(unittest.TestCase):
     def test_clean_blob_passes(self):
         self.run_check(ENTRY + LOOP + END_MAGIC, True)
 
-    def test_string_in_blob_fails(self):
+    LEAK = b"undeclared secret material"   # 26 bytes: over the fail threshold
+    DECLARED = b"declared config payload"  # 23 bytes: over the fail threshold
+
+    def test_string_without_manifest_fails(self):
         data = ENTRY + LOOP + END_MAGIC
-        data = data[:-1] + b"hello world"  # long printable run
-        self.run_check(data, False)
+        data = data[:-1] + self.LEAK
+        out = self.run_check(data, False)
+        self.assertIn("undeclared", out)
+
+    def test_declared_string_passes(self):
+        data = ENTRY + LOOP + END_MAGIC
+        data = data[:-1] + self.DECLARED
+        manifest = self.write_manifest([self.DECLARED.decode()])
+        self.run_check(data, True, ["--manifest", manifest])
+
+    def test_substring_of_declared_string_passes(self):
+        # Code or rodata layout may expose a run shorter than the constant.
+        data = ENTRY + LOOP + END_MAGIC
+        data = data[:-1] + b"clared config pay"  # 17 bytes, substring of DECLARED
+        manifest = self.write_manifest([self.DECLARED.decode()])
+        self.run_check(data, True, ["--manifest", manifest])
 
     def test_short_printable_run_passes(self):
+        # Runs under the fail threshold (12) are review-only: executable code
+        # naturally contains printable byte runs like "AWAVVWSH".
         data = ENTRY + LOOP + END_MAGIC
-        data = data[:-1] + b"abcd"  # 4 printable bytes: under the threshold
-        self.run_check(data, True)
+        data = data[:-1] + b"AWAVVWSH"  # 8 printable bytes of code-like bytes
+        out = self.run_check(data, True)
+        self.assertIn("review only", out)
+
+    def test_missing_manifest_fails(self):
+        data = ENTRY + LOOP + END_MAGIC
+        data = data[:-1] + self.LEAK
+        self.run_check(data, False, ["--manifest", "/nonexistent/manifest.json"])
+
+    def test_invalid_manifest_fails(self):
+        path = os.path.join(self.tmp.name, "manifest.json")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("not a json list")
+        self.run_check(ENTRY + LOOP + END_MAGIC, False, ["--manifest", path])
 
     def test_size_budget_fails(self):
         data = b"\x00" * 8192

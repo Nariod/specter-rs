@@ -29,8 +29,10 @@ extern crate std;
 /// (phase 1), this becomes unreachable.
 #[cfg(not(test))]
 #[panic_handler]
-fn panic(_info: &core::panic::PanicInfo) -> ! {
+fn spt_panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+pub mod config;
 pub mod fnv;
+pub mod peb;

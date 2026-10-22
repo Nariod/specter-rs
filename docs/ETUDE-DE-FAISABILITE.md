@@ -216,8 +216,13 @@ Découvertes de pipeline (points durs, à conserver comme règles du projet) :
    dans `.text` (le `.xdata` doit rester hors du blob, comme dans l'original
    qui livre pdata/xdata en artefacts séparés).
 
-**Phase 1 — Runtime** : `GlobalAlloc` sur le heap porté, hashing FNV par API,
-instance TEB, `build.rs` consommant la config du plugin Go (contrat inchangé).
+**Phase 1 — Runtime** : en cours — livré à ce jour :
+contrat de config JSON plugin → `build.rs` → module généré (types no_std,
+validation stricte, manifeste de chaînes), FNV-64 (variantes ASCII/UTF-16,
+case-insensitive pour les noms de modules), PEB walk + résolution d'exports
+(testés sur host avec PEB/images mock), bootstrap du beacon (résolution par
+hash, instance dans le TEB). Le blob passe de 23 à 535 octets, toutes les
+gardes tiennent. Reste : allocateur heap, cycle sleep/check-in (phase 2).
 
 ## 8bis. Guardrails qualité (mis en place dès la phase 0/1)
 
@@ -246,6 +251,9 @@ garder le pipeline vert) :
 | Pas de `crate-type = "rlib"` sur le beacon | rustc émet des thunks `__imp_` dllimport dans `.data`, cassant l'invariant `.text` unique |
 | `doctest = false` sur `specter-core` | les doctests compilent la lib sans `cfg(test)` sous `panic=unwind`, interdit en no_std |
 | `build-std=core` **par flag** (Makefile), pas en config globale | la config globale reconstruirait aussi std et casse les tests host |
+| `.xdata` fusionné vers `.pdata`, jamais vers `.text` | lld-link fusionne par ordre alphabétique : `xdata` viendrait après `sptend` et le marqueur de fin ne serait plus le dernier octet du blob |
+| Le seuil anti-strings échoue à 12+ octets imprimables | le code exécutable produit naturellement des runs imprimables (`41 57 41 56...` = prologues) mesurés jusqu'à ~10 ; les runs plus courts sont affichés en revue, pas fatals |
+| Pas d'allocateur global (`#[global_allocator]`) | un allocateur global exige un `static` — interdit par la philosophie no-globals ; l'allocation passe par l'instance TEB (APIs explicites, pas de `Box`/`Vec` dans le beacon) |
 
 **Phase 2 — Evasion core** : port des stubs syscalls en `#[naked]` (Hell's
 Gate / Tartarus / Hall), HWBP + VEH, retspoof (NASM conservé), Ekko/Astral

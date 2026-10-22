@@ -40,8 +40,8 @@ jobs:
       - name: Blob build and layout verification
         run: make blob
 
-      - name: Blob guardrails (no strings, size budget)
-        run: python3 tools/check_blob.py build/beacon.x64.bin
+      - name: Blob guardrails (declared strings, size budget)
+        run: python3 tools/check_blob.py build/beacon.x64.bin --manifest build/config_strings.json
 
       - name: Position-independence proof
         run: make pic-check

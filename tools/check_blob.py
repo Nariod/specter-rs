@@ -4,9 +4,16 @@
 Enforces the invariants that keep the beacon true to the project's
 philosophy (docs/ETUDE-DE-FAISABILITE.md, section 1):
 
-1. No text strings: the blob must contain no ASCII run of 5+ printable
-   bytes. Strings mean leaked panic messages, paths, or identifiers —
-   in a raw blob they are signatures for defenders.
+1. No unintended text strings: the blob must contain no ASCII run of 12+
+   printable bytes that is not accounted for. Intended config data
+   (user agents, URIs, headers from the malleable profile) is declared by
+   the build in a strings manifest (--manifest, produced by the build
+   script). Everything else — leaked panic messages, paths, symbol
+   names — fails the build. Without a manifest, any such run fails.
+   Threshold rationale: executable code naturally produces printable byte
+   runs (register push/pop sequences: "AWAVVWSH"), measured up to ~10;
+   real leaks (panic strings, build paths, identifiers) are prose-like
+   and longer. Shorter runs are still reported for review, not fatal.
 2. Size budget: the blob must stay under the budget (raise it
    deliberately, in its own commit, never as a side effect).
 
@@ -14,10 +21,12 @@ Run by `make check` and by CI on every push.
 """
 
 import argparse
+import json
 import sys
 
-# 5+ printable bytes qualify as a string; 4 or fewer can occur in code.
+# Runs of 12+ printable bytes are failures; 5..11 are review-only.
 MIN_RUN = 5
+FAIL_RUN = 12
 PRINTABLE = range(0x20, 0x7F)
 DEFAULT_MAX_SIZE = 4096
 
@@ -39,20 +48,56 @@ def find_strings(blob):
     return found
 
 
+def allowed(s, manifest):
+    """A blob string is allowed if it is part of a declared config string."""
+    return any(s in allowed for allowed in manifest)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("blob")
     ap.add_argument("--max-size", type=int, default=DEFAULT_MAX_SIZE)
+    ap.add_argument(
+        "--manifest",
+        help="JSON array of strings the config intentionally embeds "
+        "(build/config_strings.json, produced by the build script)",
+    )
     args = ap.parse_args()
     blob = open(args.blob, "rb").read()
+
+    manifest = []
+    if args.manifest:
+        try:
+            manifest = json.load(open(args.manifest, encoding="utf-8"))
+            if not isinstance(manifest, list):
+                raise ValueError("not a list")
+        except (OSError, ValueError) as e:
+            print(f"[-] cannot read strings manifest {args.manifest}: {e}")
+            sys.exit(1)
 
     ok = True
 
     strings = find_strings(blob)
-    if strings:
+    undeclared = [
+        (off, s)
+        for off, s in strings
+        if len(s) >= FAIL_RUN and not allowed(s.decode("ascii", "replace"), manifest)
+    ]
+    review = [
+        (off, s)
+        for off, s in strings
+        if len(s) < FAIL_RUN and not allowed(s.decode("ascii", "replace"), manifest)
+    ]
+    if undeclared:
         ok = False
-        print(f"[-] {len(strings)} text string(s) in the blob:")
-        for off, s in strings[:10]:
+        print(f"[-] {len(undeclared)} undeclared text string(s) in the blob:")
+        for off, s in undeclared[:10]:
+            print(f"    {off:#08x}: {s!r}")
+        if manifest:
+            print("    (config strings are declared via --manifest; anything else is a leak)")
+    if review:
+        print(f"[*] {len(review)} short printable run(s), review only (under {FAIL_RUN} bytes):")
+        for off, s in review[:5]:
             print(f"    {off:#08x}: {s!r}")
 
     if len(blob) > args.max_size:

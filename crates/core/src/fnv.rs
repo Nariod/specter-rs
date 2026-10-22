@@ -39,6 +39,51 @@ pub const fn fnv1a64_utf16(units: &[u16]) -> u64 {
     hash
 }
 
+/// FNV-1a 64 over UTF-16 code units with ASCII case folding (A-Z folded to
+/// a-z before hashing). Windows module names are not consistently cased
+/// (`KERNEL32.DLL`, `ntdll.dll`): module resolution must be
+/// case-insensitive, exactly like the original project's hash.py.
+#[inline]
+pub const fn fnv1a64_utf16_ci(units: &[u16]) -> u64 {
+    let mut hash = FNV_OFFSET;
+    let mut i = 0;
+    while i < units.len() {
+        let mut u = units[i];
+        if u >= 0x41 && u <= 0x5A {
+            u += 0x20;
+        }
+        hash ^= (u & 0xff) as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        hash ^= (u >> 8) as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    hash
+}
+
+/// Compile-time hash of a lowercase ASCII string as UTF-16 LE code units,
+/// case-folded — the constant form of [`fnv1a64_utf16_ci`]. Use it to build
+/// module-name hash constants: `const H: u64 = fnv1a64_wide_ascii_ci("ntdll.dll");`.
+/// The input must be lowercase ASCII (module names are).
+#[inline]
+pub const fn fnv1a64_wide_ascii_ci(s: &str) -> u64 {
+    let bytes = s.as_bytes();
+    let mut hash = FNV_OFFSET;
+    let mut i = 0;
+    while i < bytes.len() {
+        let mut u = bytes[i] as u16;
+        if u >= 0x41 && u <= 0x5A {
+            u += 0x20;
+        }
+        hash ^= (u & 0xff) as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        hash ^= (u >> 8) as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        i += 1;
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +129,26 @@ mod tests {
         // A one-byte difference must change the hash (avalanche sanity
         // check, not a collision proof).
         assert_ne!(fnv1a64(b"kernel32.dll"), fnv1a64(b"kernel32.dlL"));
+    }
+
+    #[test]
+    fn case_folded_utf16_matches_const_form() {
+        // The runtime-side fold over any casing must equal the compile-time
+        // constant computed from the lowercase name.
+        let units: std::vec::Vec<u16> = "KERNEL32.DLL".encode_utf16().collect();
+        let folded = fnv1a64_utf16_ci(&units);
+        assert_eq!(folded, fnv1a64_wide_ascii_ci("kernel32.dll"));
+
+        let lower: std::vec::Vec<u16> = "kernel32.dll".encode_utf16().collect();
+        assert_eq!(folded, fnv1a64_utf16_ci(&lower));
+
+        // And folding agrees with the exact-casing hash of the lowercase form.
+        assert_eq!(folded, fnv1a64_utf16(&lower));
+    }
+
+    #[test]
+    fn fold_is_a_noop_for_lowercase() {
+        let units: std::vec::Vec<u16> = "ntdll.dll".encode_utf16().collect();
+        assert_eq!(fnv1a64_utf16_ci(&units), fnv1a64_utf16(&units));
     }
 }
