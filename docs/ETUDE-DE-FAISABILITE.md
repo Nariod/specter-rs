@@ -270,9 +270,16 @@ testée sur host, armement via NtGet/NtSetContextThread indirects),
 aveuglement ETW (EtwEventWrite, EtwEventWriteFull, NtTraceEvent) et bypass
 AMSI (Dr3, hook immédiat si amsi.dll est mappé, sinon différé par
 `LdrRegisterDllNotification`, retour `E_INVALIDARG` synthétisé).
-Blob : 3 835 octets, **zéro compiler_builtins lié** (voir règles), gardes
-vertes, PIC prouvé. Reste phase 2 : retspoof, masque de sommeil chiffré
-(Ekko/Astral), ré-armement HWBP multi-threads.
+Itérations 4-5 : return-address spoofing (harness naked `JMP [RBX]`,
+continuation en paramètre — l'opérande `sym` a été attrapé par la preuve
+PIC : il émettait une adresse absolue) et masque de sommeil chiffré
+(stub naked auto-suffisant : xorshift64 byte-stream sur l'image entière
+hormis sa fenêtre, `NtDelayExecution` indirect, déchiffrement par flux
+identique ; bornes découvertes par fonctions pures testées). Blob :
+5 018 octets, **zéro compiler_builtins lié**, gardes vertes, PIC prouvé.
+Reste phase 2 : spoofing pile/tas pendant le sommeil
+(ThreadStackSpoofer), fallback retspoof `ADD RSP`, ré-armement HWBP
+multi-threads.
 
 Nouvelles règles de pipeline découvertes en phase 2 (ajoutées à la liste
 ci-dessus) :

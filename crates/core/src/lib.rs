@@ -46,5 +46,6 @@ pub mod peb;
 pub mod retspoof;
 pub mod rng;
 pub mod sleep;
+pub mod sleepmask;
 pub mod syscalls;
 pub mod time;

