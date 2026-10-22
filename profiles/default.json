@@ -1,0 +1,61 @@
+{
+    "version": 2,
+    "rotation": "sequential",
+    "beacon_id_header": "X-Request-Id",
+    "hosts": ["localhost:443"],
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "get": {
+        "uris": ["/api/v1/status", "/api/v1/health"],
+        "client": {
+            "metadata": {
+                "format": "base64url",
+                "mask": true,
+                "placement": "cookie",
+                "name": "session"
+            },
+            "headers": [
+                "Accept: application/json",
+                "Cache-Control: no-cache"
+            ]
+        },
+        "server": {
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body",
+                "prepend": "{\"data\":\"",
+                "append": "\",\"status\":\"ok\"}"
+            }
+        }
+    },
+    "post": {
+        "uris": ["/api/v1/report", "/api/v1/telemetry"],
+        "client": {
+            "metadata": {
+                "format": "base64url",
+                "mask": true,
+                "placement": "header",
+                "name": "X-Correlation-Id"
+            },
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body"
+            },
+            "headers": [
+                "Content-Type: application/octet-stream",
+                "Accept: application/json"
+            ]
+        },
+        "server": {
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body",
+                "prepend": "{\"result\":\"",
+                "append": "\"}"
+            }
+        }
+    }
+}
+

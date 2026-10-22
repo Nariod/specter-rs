@@ -1,0 +1,70 @@
+{
+    "version": 2,
+    "rotation": "sequential",
+    "beacon_id_header": "x-ms-client-request-id",
+    "hosts": ["management.azure.com:443"],
+    "user_agent": "Azure-Monitor/2.0 (Windows NT 10.0; x64)",
+    "get": {
+        "uris": [
+            "/subscriptions/metrics",
+            "/providers/Microsoft.Insights/metrics",
+            "/resourceGroups/monitoring/providers/diagnosticSettings"
+        ],
+        "client": {
+            "metadata": {
+                "format": "base64url",
+                "mask": true,
+                "placement": "header",
+                "name": "x-ms-client-request-id"
+            },
+            "headers": [
+                "Accept: application/json",
+                "api-version: 2024-02-01",
+                "x-ms-version: 2024-02-01"
+            ],
+            "params": ["timespan=PT1H", "interval=PT5M"]
+        },
+        "server": {
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body",
+                "prepend": "{\"value\":[{\"id\":\"/subscriptions/metrics\",\"type\":\"Microsoft.Insights/metrics\",\"name\":{\"value\":\"Percentage CPU\",\"localizedValue\":\"Percentage CPU\"},\"timeseries\":[{\"data\":[{\"timeStamp\":\"2024-01-01T00:00:00Z\",\"average\":",
+                "append": "}]}]}]}"
+            }
+        }
+    },
+    "post": {
+        "uris": [
+            "/providers/Microsoft.Insights/diagnosticSettings",
+            "/subscriptions/diagnosticSettings/write"
+        ],
+        "client": {
+            "metadata": {
+                "format": "base64url",
+                "mask": true,
+                "placement": "header",
+                "name": "x-ms-correlation-request-id"
+            },
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body"
+            },
+            "headers": [
+                "Content-Type: application/json",
+                "api-version: 2024-02-01"
+            ]
+        },
+        "server": {
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body",
+                "prepend": "{\"id\":\"/diagnosticSettings/default\",\"properties\":{\"status\":\"Succeeded\",\"correlationId\":\"",
+                "append": "\"}}"
+            }
+        }
+    }
+}
+

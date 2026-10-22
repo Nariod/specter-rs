@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["crates/beacon"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "BSD-3-Clause"
+repository = "https://github.com/Nariod/specter-rs"
+
+# Beacon size discipline (see docs/ETUDE-DE-FAISABILITE.md, section 4).
+# The final artifact is a raw PIC blob extracted from .text: every byte counts.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = false

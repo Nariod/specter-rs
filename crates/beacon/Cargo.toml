@@ -1,0 +1,18 @@
+[package]
+name = "specter-beacon"
+description = "Specter PIC beacon, Rust rewrite of specter's src_beacon (scaffold)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+build = "build.rs"
+
+# no_std PIC beacon: no std, no allocator by default (a custom GlobalAlloc over
+# the ported runtime heap is wired in phase 1), no dependencies until the
+# phase 0 toolchain spike settles the size budget.
+
+[lib]
+name = "specter_beacon"
+crate-type = ["lib"]
+
+[dependencies]

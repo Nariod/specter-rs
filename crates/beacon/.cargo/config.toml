@@ -1,0 +1,18 @@
+# Toolchain settings for the PIC blob build.
+#
+# All flags below are placeholders pending the phase 0 toolchain spike
+# (docs/ETUDE-DE-FAISABILITE.md, section 8). Do not treat them as validated.
+#
+# [build]
+# target = "x86_64-pc-windows-gnu"
+#
+# [target.x86_64-pc-windows-gnu]
+# rustflags = [
+#     "-C", "relocation-model=pic",
+#     "-C", "link-arg=-TLinker.ld",      # port of specter's Linker.ld (single .text, /DISCARD)
+#     "-C", "link-self-contained=no",    # rust-lld with the custom script
+#     "--remap-path-prefix=/home=/",     # no build paths in the blob
+# ]
+#
+# Nightly + build-std decision (panic_immediate_abort, no panic strings) is a
+# phase 0 outcome; see the study, section 4.

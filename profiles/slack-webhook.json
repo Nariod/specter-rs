@@ -1,0 +1,67 @@
+{
+    "version": 2,
+    "rotation": "random",
+    "beacon_id_header": "X-Slack-Request-Timestamp",
+    "hosts": ["hooks.slack.com:443"],
+    "user_agent": "Slackbot 1.0 (+https://api.slack.com/robots)",
+    "get": {
+        "uris": [
+            "/services/T0XXXXXXX/B0XXXXXXX/XXXXXXXXXXXXXXXXXXXXXXXX",
+            "/api/conversations.list"
+        ],
+        "client": {
+            "metadata": {
+                "format": "base64url",
+                "mask": true,
+                "placement": "cookie",
+                "name": "d"
+            },
+            "headers": [
+                "Accept: application/json",
+                "X-Slack-No-Retry: 1"
+            ]
+        },
+        "server": {
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body",
+                "prepend": "{\"ok\":true,\"channels\":[{\"id\":\"C0XXXXXXX\",\"name\":\"general\",\"topic\":{\"value\":\"",
+                "append": "\"}}],\"response_metadata\":{\"next_cursor\":\"\"}}"
+            }
+        }
+    },
+    "post": {
+        "uris": [
+            "/api/chat.postMessage",
+            "/api/files.upload"
+        ],
+        "client": {
+            "metadata": {
+                "format": "base64url",
+                "mask": true,
+                "placement": "header",
+                "name": "X-Slack-Signature"
+            },
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body"
+            },
+            "headers": [
+                "Content-Type: application/json; charset=utf-8",
+                "X-Slack-No-Retry: 1"
+            ]
+        },
+        "server": {
+            "output": {
+                "format": "base64",
+                "mask": true,
+                "placement": "body",
+                "prepend": "{\"ok\":true,\"channel\":\"C0XXXXXXX\",\"ts\":\"",
+                "append": "\",\"message\":{\"type\":\"message\",\"subtype\":\"bot_message\"}}"
+            }
+        }
+    }
+}
+
