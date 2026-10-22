@@ -1,18 +1,19 @@
 [package]
 name = "specter-beacon"
-description = "Specter PIC beacon, Rust rewrite of specter's src_beacon (scaffold)"
+description = "Specter PIC beacon, Rust rewrite of specter's src_beacon"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 build = "build.rs"
 
-# no_std PIC beacon: no std, no allocator by default (a custom GlobalAlloc over
-# the ported runtime heap is wired in phase 1), no dependencies until the
-# phase 0 toolchain spike settles the size budget.
+# no_std PIC beacon, built as a static archive of COFF objects. The final
+# blob is linked from the archive with rust-lld (flavor lld-link) and a
+# Makefile-driven pipeline — see the top-level Makefile and tools/pe_blob.py.
+# No dependencies until the phase 0 spike settles the size budget.
 
 [lib]
 name = "specter_beacon"
-crate-type = ["lib"]
+crate-type = ["staticlib"]
 
 [dependencies]

@@ -178,10 +178,39 @@ indirects, HWBP, Ekko, spoofing) sont orthogonales au langage. specter-rs doit
 
 ## 8. Feuille de route recommandée
 
-**Phase 0 — Spike toolchain (2-3 j)**, critère de sortie : un blob PIC Rust
-minimal (entry naked asm → fn Rust → boucle), `.text` unique, zéro reloc, zéro
-chaîne, taille mesurée ; décision stable vs nightly tranchée ; pdata/xdata et
-stack probes tranchés.
+**Phase 0 — Spike toolchain** : ✅ **terminée, tous les critères de sortie atteints.**
+
+Résultats (2026-10-22, `make blob` / `make pic-check`) :
+
+| Critère de sortie | Résultat |
+|---|---|
+| Blob PIC Rust minimal (entry naked → fn Rust → boucle) | 23 octets : `sub rsp,8` / `call spt_main` / `ud2` + boucle + marqueur |
+| `.text` unique | Oui — `.rdata` et `.sptend` fusionnés via lld-link, rien d'autre |
+| Zéro reloc / zéro adresse absolue | Oui — preuve par double base d'image (`pic-check` : octets identiques à `0x10000000` et `0x40000000`) |
+| Zéro chaîne | Oui — aucun `panic!` de formatage, handler muet |
+| Décision stable vs nightly | **Nightly** (`nightly-2026-10-21`, épinglé dans `rust-toolchain.toml`) : `build-std=core` est requis, la std précompilée traîne des références à `rust_eh_personality` incompatibles avec `panic=abort` |
+| `.pdata`/`.xdata` | Non émis par le crate beacon sous `build-std` + `panic=abort` ; à revoir quand le VEH/HWBP existera |
+| Stack probes | Absents du spike ; à re-surveiller quand du vrai code existera |
+
+Découvertes de pipeline (points durs, à conserver comme règles du projet) :
+
+1. **Lier l'archive, jamais les objets extraits** — le linker fait alors la
+   sélection paresseuse des membres ; autrement tout `compiler_builtins`
+   atterrit dans le blob (mesuré : 54 Ko au lieu de 23 octets).
+2. `rust-lld` est multi-call : invoqué sous le nom `lld-link` (symlink), il
+   pilote le lien COFF — **aucun besoin de MinGW**, contrairement au C
+   original (NASM reste également absent du pipeline : l'entry est une
+   fonction `#[naked]` Rust).
+3. Le PE final n'a **pas de table de symboles** : la vérification du blob se
+   fait par patterns d'octets (prologue d'entrée, cible du `call`, magique
+   de fin) dans `tools/pe_blob.py`.
+4. Le marqueur `.sptend` porte un magique 8 octets (`SPT_END\0`) au lieu
+   d'un octet nul : seule déviation documentée par rapport au C, motivée
+   par le point 3 (vérifiabilité post-link).
+5. `lld-link` fusionne les sections par ordre alphabétique — le marqueur de
+   fin reste dernier tant qu'aucune section au nom postérieur n'est fusionnée
+   dans `.text` (le `.xdata` doit rester hors du blob, comme dans l'original
+   qui livre pdata/xdata en artefacts séparés).
 
 **Phase 1 — Runtime** : `GlobalAlloc` sur le heap porté, hashing FNV par API,
 instance TEB, `build.rs` consommant la config du plugin Go (contrat inchangé).
@@ -200,13 +229,14 @@ détection en labo vs le beacon C, docs.
 
 ---
 
-## 9. Points ouverts (à trancher en phase 0)
+## 9. Points ouverts
 
-1. Nécessité réelle de `.pdata`/`.xdata` (interaction avec le VEH HWBP).
-2. Stack probes rustc : émission effective et contournement.
-3. Nightly + `build-std` vs stable : à trancher sur le spike.
-4. Budget de taille réel : blob Rust vs blob C sur des fonctions équivalentes.
-5. Format d'échange config plugin → build (`Config.h` → JSON/env).
+1. ~~Nécessité réelle de `.pdata`/`.xdata`~~ → tranché en phase 0 : non émis
+   sous `build-std` + `panic=abort` ; à revoir à l'arrivée du VEH/HWBP.
+2. ~~Stack probes rustc~~ → absents du spike ; à re-surveiller avec du code réel.
+3. ~~Nightly + `build-std` vs stable~~ → nightly, épinglé dans `rust-toolchain.toml`.
+4. Budget de taille réel : à mesurer en phase 3 (23 octets pour le spike).
+5. Format d'échange config plugin → `build.rs` (`Config.h` → JSON/env) : phase 1.
 
 ## 10. Décision
 

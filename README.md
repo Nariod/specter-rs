@@ -41,9 +41,23 @@ docs/                 Feasibility study
 profiles/             Malleable C2 profile definitions (JSON, format v2, unchanged)
 ```
 
+## Build
+
+```bash
+make            # build/beacon.x64.bin — raw PIC blob (single .text)
+make pic-check  # position-independence proof (double image base)
+```
+
+Toolchain: Rust nightly pinned in `rust-toolchain.toml` (build-std=core),
+target `x86_64-pc-windows-gnu`, final link with the Rust-bundled `rust-lld`.
+No MinGW, no NASM required.
+
 ## Status
 
-Phase 0 (toolchain spike) — see the study, section 8.
+Phase 0 (toolchain spike) — **done**: 23-byte PIC blob, entry `#[naked]` at
+offset 0, `SPT_END` marker last, PIC proven. Phase 1 (runtime: allocator,
+FNV API hashing, TEB instance, build.rs config) in progress. See the
+[feasibility study](docs/ETUDE-DE-FAISABILITE.md), section 8.
 
 ---
 

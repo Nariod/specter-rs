@@ -8,13 +8,14 @@
 //! - no CRT, no import table: every API is resolved at runtime by FNV-64 hash
 //! - no globals: the instance lives in `TEB->NtTib.ArbitraryUserPointer` and
 //!   is passed explicitly; fully reentrant
-//! - single `.text` section via the custom linker script; the artifact is a
-//!   raw blob extracted with objcopy
+//! - single `.text` section via the link pipeline; the artifact is a raw blob
+//!   extracted from the linked image
 //! - no formatting, no logging, no unwinding
 
 #![no_std]
 
 pub mod coff;
+pub mod entry;
 pub mod net;
 pub mod runtime;
 pub mod tasks;
