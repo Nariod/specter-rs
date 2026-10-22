@@ -1,15 +1,15 @@
 # Specter-rs beacon toolchain (phase 0 outcome, see docs/ETUDE-DE-FAISABILITE.md).
 #
-# - nightly (pinned in rust-toolchain.toml) + build-std=core: core and
-#   compiler_builtins are rebuilt from source with panic=abort, removing the
-#   unwinding personality references the precompiled std archives carry.
+# - nightly (pinned in rust-toolchain.toml) + build-std: core and compiler_builtins
+#   are rebuilt from source with panic=abort, removing the unwinding personality
+#   references the precompiled std archives carry. std is rebuilt as well so the
+#   host-side test harness never mixes a from-source core with the precompiled
+#   one (duplicate lang items otherwise).
 # - target x86_64-pc-windows-gnu: Microsoft x64 calling convention for every
 #   extern "system" call (ntdll, kernel32, WinHTTP).
 # - final link: rust-lld (lld-link flavor) driven by the Makefile; the
 #   artifact is a raw PIC blob extracted from the single .text section.
 
-[unstable]
-build-std = ["core"]
 
 [build]
 target = "x86_64-pc-windows-gnu"

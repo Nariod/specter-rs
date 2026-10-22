@@ -1,0 +1,20 @@
+[package]
+name = "specter-core"
+description = "Specter-rs pure logic: compiled into the PIC beacon and tested on the host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Pure logic only: no_std (so it links into the no_std beacon without
+# dragging std), and no panic handler (so host-side std test binaries can
+# link against it — the panic handler belongs to the beacon crate alone).
+# Everything here must stay free of host APIs and allocation: it ends up in
+# the raw PIC blob where every byte counts.
+
+[lib]
+name = "specter_core"
+crate-type = ["rlib", "staticlib"]
+# Doctests compile the lib without cfg(test) under panic=unwind, which is
+# unsupported for a no_std crate; unit tests inside the crate cover it.
+doctest = false

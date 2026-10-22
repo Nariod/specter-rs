@@ -14,6 +14,17 @@ build = "build.rs"
 
 [lib]
 name = "specter_beacon"
+# staticlib: the COFF archive the blob pipeline links (see Makefile).
+# rlib must NOT be added: it changes rustc's symbol emission for the COFF
+# objects (dllimport-style __imp_ thunks land in .data and break the
+# single-.text invariant).
 crate-type = ["staticlib"]
+# The beacon carries the panic handler and naked win64 glue: it cannot be
+# built under the host std test harness (duplicate panic_impl lang item).
+# Its behavior is guarded by the blob pipeline tests; pure logic lives in
+# specter-core and is unit-tested there.
+test = false
+doctest = false
 
 [dependencies]
+specter-core = { path = "../core" }

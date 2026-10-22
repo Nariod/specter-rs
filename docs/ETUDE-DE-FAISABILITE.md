@@ -219,6 +219,34 @@ Découvertes de pipeline (points durs, à conserver comme règles du projet) :
 **Phase 1 — Runtime** : `GlobalAlloc` sur le heap porté, hashing FNV par API,
 instance TEB, `build.rs` consommant la config du plugin Go (contrat inchangé).
 
+## 8bis. Guardrails qualité (mis en place dès la phase 0/1)
+
+CI (`.github/workflows/ci.yml`) — 4 couches, toutes exécutables localement
+via `make test` :
+
+1. **Discipline source** : rustfmt + clippy `-D warnings`, composants de la
+   toolchain épinglée.
+2. **Tests unitaires host** (`specter-core`) : la logique pure est dans un
+   crate dédié, testable sous harnais std ; le beacon consomme le même code
+   en dépendance no_std.
+3. **Invariants du blob** : layout vérifié par patterns d'octets, **aucune
+   chaîne ASCII** (le marqueur de fin est passé en magique binaire
+   `DEADBEEF`), **budget de taille** 4 KiB (`tools/check_blob.py`),
+   preuve PIC par double base.
+4. **Tests du pipeline Python** : PEs synthétiques, tous les modes d'échec
+   (`tools/test_pe_blob.py`).
+
+Règles d'architecture découvertes en cours de route (à respecter pour
+garder le pipeline vert) :
+
+| Règle | Pourquoi |
+|---|---|
+| `specter-core` : logique pure, sans handler de panic | le handler de panic vit dans `specter-core` (gated `#[cfg(not(test))]`) : présent dans le graphe du beacon, absent quand le harnais std teste le crate |
+| `#[panic_handler]` jamais dans le crate beacon | empêche tout lien du beacon dans un binaire std (doublon de lang item) — le beacon n'est testable que via le pipeline blob |
+| Pas de `crate-type = "rlib"` sur le beacon | rustc émet des thunks `__imp_` dllimport dans `.data`, cassant l'invariant `.text` unique |
+| `doctest = false` sur `specter-core` | les doctests compilent la lib sans `cfg(test)` sous `panic=unwind`, interdit en no_std |
+| `build-std=core` **par flag** (Makefile), pas en config globale | la config globale reconstruirait aussi std et casse les tests host |
+
 **Phase 2 — Evasion core** : port des stubs syscalls en `#[naked]` (Hell's
 Gate / Tartarus / Hall), HWBP + VEH, retspoof (NASM conservé), Ekko/Astral
 (sleepmask NASM conservé, embedding via `include_bytes!`).

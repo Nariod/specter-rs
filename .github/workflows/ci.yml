@@ -1,0 +1,50 @@
+# Specter-rs CI — quality gate for every push and pull request.
+#
+# The beacon is a raw PIC blob with no test harness of its own, so quality is
+# enforced through layers:
+#   1. source discipline: rustfmt + clippy (-D warnings)
+#   2. host-side unit tests: pure logic runs under the std test harness
+#   3. build invariants: the blob must build, pass layout verification,
+#      contain no text strings, stay under the size budget, and be
+#      position-independent (double image base)
+#   4. tooling tests: the Python verification pipeline is itself tested
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # rustup reads rust-toolchain.toml (pinned nightly + components).
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --release -Z build-std=core -- -D warnings
+
+      - name: Check (beacon target)
+        run: cargo check --release -Z build-std=core
+
+      - name: Host unit tests
+        run: cargo test --target x86_64-unknown-linux-gnu -p specter-core --lib
+
+      - name: Blob build and layout verification
+        run: make blob
+
+      - name: Blob guardrails (no strings, size budget)
+        run: python3 tools/check_blob.py build/beacon.x64.bin
+
+      - name: Position-independence proof
+        run: make pic-check
+
+      - name: Pipeline tool tests
+        run: python3 tools/test_pe_blob.py

@@ -35,12 +35,12 @@ LDFLAGS := /entry:SptEntry \
 	/nodefaultlib \
 	/nologo
 
-.PHONY: all blob pic-check clean
+.PHONY: all blob check test pic-check clean
 
 all: blob
 
 $(LIB):
-	cargo build --release
+	cargo build --release -Z build-std=core
 
 $(OUT_DIR):
 	@mkdir -p $(OUT_DIR)
@@ -64,7 +64,22 @@ pic-check: $(LLD) $(LIB)
 	python3 tools/pe_blob.py $(OUT_DIR)/base_b.exe $(OUT_DIR)/blob_b.bin >/dev/null
 	cmp $(OUT_DIR)/blob_a.bin $(OUT_DIR)/blob_b.bin \
 		&& echo "[+] PIC: .text identical at both image bases" \
-		|| echo "[-] NOT position-independent (bytes differ between bases)"
+		|| (echo "[-] NOT position-independent (bytes differ between bases)"; exit 1)
+
+# Blob guardrails: no text strings, size budget (see tools/check_blob.py).
+check: blob
+	python3 tools/check_blob.py $(BLOB)
+	$(MAKE) pic-check
+
+# Full local gate: everything CI runs. The Rust unit tests run on the host
+# target (std test harness); the beacon itself is checked for its own target.
+test:
+	cargo fmt --all --check
+	cargo clippy --release -Z build-std=core -- -D warnings
+	cargo check --release -Z build-std=core
+	cargo test --target x86_64-unknown-linux-gnu -p specter-core --lib
+	python3 tools/test_pe_blob.py
+	$(MAKE) check
 
 clean:
 	rm -rf $(OUT_DIR) target

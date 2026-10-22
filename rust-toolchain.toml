@@ -1,7 +1,9 @@
 # Pinned toolchain — same discipline as specter pins the Go version and
 # GOEXPERIMENT on the teamserver. install.sh (phase 4) installs exactly this.
+# fmt and clippy are part of the pin: CI enforces both, so a dev machine
+# without them must not exist.
 [toolchain]
 channel = "nightly-2026-10-21"
 profile = "minimal"
-components = ["rust-src"]
-targets = ["x86_64-pc-windows-gnu"]
+components = ["rust-src", "rustfmt", "clippy"]
+targets = ["x86_64-pc-windows-gnu", "x86_64-unknown-linux-gnu"]

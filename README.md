@@ -4,6 +4,7 @@
   <img src="https://img.shields.io/badge/Platform-Windows_x64-0078D4?style=for-the-badge" alt="platform"/>
   <img src="https://img.shields.io/badge/C2-AdaptixC2_2.0-006400?style=for-the-badge" alt="C2"/>
   <img src="https://img.shields.io/badge/Lang-Rust_2021-DEA584?style=for-the-badge" alt="lang"/>
+  <img src="https://github.com/Nariod/specter-rs/actions/workflows/ci.yml/badge.svg" alt="CI"/>
 </p>
 
 > [!WARNING]
@@ -54,6 +55,27 @@ make pic-check  # position-independence proof (double image base)
 Toolchain: Rust nightly pinned in `rust-toolchain.toml` (build-std=core),
 target `x86_64-pc-windows-gnu`, final link with the Rust-bundled `rust-lld`.
 No MinGW, no NASM required.
+
+## Quality guardrails
+
+CI (`.github/workflows/ci.yml`) gates every push and PR through layers:
+
+1. **Source discipline** — `rustfmt --check` and `clippy -D warnings`
+   (both part of the pinned toolchain, so a dev machine without them
+   cannot exist).
+2. **Host unit tests** — pure logic lives in `specter-core` (no_std,
+   no panic handler, no host API): it is linked into the PIC beacon and
+   unit-tested under the std harness on the host.
+3. **Blob invariants** — the blob must build, pass layout verification
+   (`tools/pe_blob.py`: entry prologue at offset 0, call target in range,
+   `SPT_END` marker last), contain **no text strings** and stay under the
+   **size budget** (`tools/check_blob.py`, 4 KiB — raise it deliberately,
+   in its own commit), and prove **position independence** by byte-identical
+   double-base linking (`make pic-check`).
+4. **Tooling tests** — the Python verification pipeline is itself tested
+   (`tools/test_pe_blob.py`, synthetic PEs, all failure modes).
+
+Locally, `make test` runs everything CI runs.
 
 ## Status
 

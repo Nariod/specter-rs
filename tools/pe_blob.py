@@ -29,7 +29,8 @@ PE_MAGIC = 0x00004550
 ENTRY_PROLOGUE = b"\x48\x83\xec\x08\xe8"   # sub rsp,8 ; call rel32
 ENTRY_EPILOGUE = b"\x0f\x0b"                # ud2 (at offset 9)
 ENTRY_SIZE = 11
-END_MAGIC = b"SPT_END\x00"
+# 0xDEADBEEF little-endian + four zeros: non-ASCII by design (see entry.rs).
+END_MAGIC = b"\xef\xbe\xad\xde\x00\x00\x00\x00"
 
 
 def fail(msg):
