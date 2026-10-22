@@ -160,8 +160,204 @@ pub unsafe fn find_export(base: *const c_void, fn_hash: u64) -> *mut c_void {
     ptr::null_mut()
 }
 
+/// Find a section by name (e.g. `.text`) in a mapped PE image: returns the
+/// in-memory pointer (base + VA) and the virtual size.
+///
+/// # Safety
+///
+/// `base` must point to a mapped PE image with intact headers.
+pub unsafe fn find_section(base: *const c_void, name: &[u8]) -> Option<(*const u8, usize)> {
+    let image = base as *const u8;
+    if image.is_null() || read_u16(image, 0) != 0x5A4D {
+        return None;
+    }
+    let nt = read_u32(image, 0x3C) as usize;
+    if read_u32(image, nt) != 0x0000_4550 {
+        return None;
+    }
+    let num_sections = read_u16(image, nt + 6) as usize;
+    let optsz = read_u16(image, nt + 20) as usize;
+    let mut off = nt + 4 + 20 + optsz;
+    for _ in 0..num_sections {
+        let sec = image.add(off);
+        let sec_name = core::slice::from_raw_parts(sec, 8);
+        // Manual comparison: slice `==` lowers to memcmp, and the blob links
+        // without libc — compiler_builtins does not export the raw C symbol.
+        let mut eq = sec_name.len() >= name.len();
+        let mut i = 0;
+        while eq && i < name.len() {
+            eq = sec_name[i] == name[i];
+            i += 1;
+        }
+        let matches =
+            eq && (sec_name.get(name.len()).copied().unwrap_or(0) == 0 || name.len() == 8);
+        if matches {
+            let vsize = read_u32(sec, 8) as usize;
+            let vaddr = read_u32(sec, 12) as usize;
+            return Some((image.add(vaddr), vsize));
+        }
+        off += 40;
+    }
+    None
+}
+
+/// Iterator over a module's named exports: raw export-name C strings paired
+/// with function addresses. Iterates in export-table (name) order.
+pub struct ExportIter {
+    image: *const u8,
+    count: usize,
+    addr_names: usize,
+    addr_funcs: usize,
+    addr_ords: usize,
+    i: usize,
+}
+
+impl ExportIter {
+    /// Next (name pointer, function pointer) pair, or `None` at the end.
+    /// The name is a raw C string: read it with a bounded scan.
+    ///
+    /// # Safety
+    ///
+    /// The iterator must come from [`exports`] on a valid mapped image.
+    #[inline]
+    pub unsafe fn next(&mut self) -> Option<(*const u8, *const u8)> {
+        if self.i >= self.count {
+            return None;
+        }
+        let image = self.image;
+        let name_rva = read_u32(image, self.addr_names + 4 * self.i) as usize;
+        let ord = read_u16(image, self.addr_ords + 2 * self.i) as usize;
+        let func_rva = read_u32(image, self.addr_funcs + 4 * ord) as usize;
+        self.i += 1;
+        Some((image.add(name_rva), image.add(func_rva)))
+    }
+}
+
+/// Open a module's export directory for iteration.
+///
+/// # Safety
+///
+/// `base` must point to a mapped PE image with an intact export directory.
+pub unsafe fn exports(base: *const c_void) -> Option<ExportIter> {
+    let image = base as *const u8;
+    if image.is_null() || read_u16(image, 0) != 0x5A4D {
+        return None;
+    }
+    let nt = read_u32(image, 0x3C) as usize;
+    if read_u32(image, nt) != 0x0000_4550 {
+        return None;
+    }
+    let optional = nt + 4 + 20;
+    if read_u16(image, optional) != 0x020B {
+        return None;
+    }
+    let data_dir = optional + 0x70;
+    let export_rva = read_u32(image, data_dir) as usize;
+    if export_rva == 0 {
+        return None;
+    }
+    let exp = image.add(export_rva);
+    Some(ExportIter {
+        image,
+        count: read_u32(exp, 0x18) as usize,
+        addr_funcs: read_u32(exp, 0x1C) as usize,
+        addr_names: read_u32(exp, 0x20) as usize,
+        addr_ords: read_u32(exp, 0x24) as usize,
+        i: 0,
+    })
+}
+
+#[cfg(test)]
+pub(crate) mod testutil {
+    //! Shared mock builders for host tests (used by the peb and syscalls
+    //! test modules): mapped-style PE images with sections, export
+    //! directories and controlled stub bytes.
+
+    use super::*;
+    use std::prelude::v1::*;
+
+    pub const TEXT_VA: usize = 0x1000;
+    pub const TEXT_SIZE: usize = 0x1000;
+
+    /// Export descriptor: name, function RVA within the image.
+    pub struct MockExport<'a> {
+        pub name: &'a str,
+        pub func_rva: u32,
+    }
+
+    /// Build a mapped-style PE image (leaked) with:
+    /// - a `.text` section mapped at TEXT_VA covering TEXT_SIZE bytes,
+    /// - the given exports (pointers and export directory),
+    /// - `extra` raw bytes placed at `TEXT_VA` (the image file is laid out
+    ///   as a mapped image: file offset == RVA).
+    pub fn mock_mapped_module(exports: &[MockExport], text: &[u8]) -> *mut c_void {
+        assert!(text.len() <= TEXT_SIZE, "mock .text overflow");
+        const NT: usize = 0x40;
+        const OPTIONAL: usize = NT + 4 + 20;
+        const EXPORT_RVA: usize = 0x400;
+        const NAMES_PTRS_RVA: usize = 0x600;
+        const NAMES_STR_RVA: usize = 0x700;
+        const ORDS_RVA: usize = 0x900;
+        const FUNCS_RVA: usize = 0xA00;
+
+        let mut image = Vec::new();
+        image.resize(TEXT_VA + TEXT_SIZE, 0u8);
+        let put_u16 = |img: &mut Vec<u8>, off: usize, v: u16| {
+            img[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_u32 = |img: &mut Vec<u8>, off: usize, v: u32| {
+            img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+
+        put_u16(&mut image, 0, 0x5A4D);
+        put_u32(&mut image, 0x3C, NT as u32);
+        put_u32(&mut image, NT, 0x0000_4550);
+        put_u16(&mut image, NT + 6, 1); // one section
+        put_u16(&mut image, NT + 20, 0xF0); // optional header size
+        put_u16(&mut image, OPTIONAL, 0x020B);
+        put_u32(&mut image, OPTIONAL + 0x70, EXPORT_RVA as u32);
+        put_u32(&mut image, OPTIONAL + 0x74, 0x100);
+
+        // .text section header: raw offset == VA (mapped-image style).
+        let sec = NT + 4 + 20 + 0xF0;
+        image[sec..sec + 8].copy_from_slice(b".text\0\0\0");
+        put_u32(&mut image, sec + 8, TEXT_SIZE as u32);
+        put_u32(&mut image, sec + 12, TEXT_VA as u32);
+        put_u32(&mut image, sec + 16, TEXT_SIZE as u32);
+        put_u32(&mut image, sec + 20, TEXT_VA as u32);
+        put_u32(&mut image, sec + 36, 0x6000_0060); // code, execute, read
+
+        // Export directory.
+        put_u32(&mut image, EXPORT_RVA + 0x18, exports.len() as u32);
+        put_u32(&mut image, EXPORT_RVA + 0x1C, FUNCS_RVA as u32);
+        put_u32(&mut image, EXPORT_RVA + 0x20, NAMES_PTRS_RVA as u32);
+        put_u32(&mut image, EXPORT_RVA + 0x24, ORDS_RVA as u32);
+
+        let mut str_off = 0usize;
+        for (i, e) in exports.iter().enumerate() {
+            put_u32(
+                &mut image,
+                NAMES_PTRS_RVA + 4 * i,
+                (NAMES_STR_RVA + str_off) as u32,
+            );
+            put_u16(&mut image, ORDS_RVA + 2 * i, i as u16);
+            put_u32(&mut image, FUNCS_RVA + 4 * i, e.func_rva);
+            let bytes = e.name.as_bytes();
+            image[NAMES_STR_RVA + str_off..NAMES_STR_RVA + str_off + bytes.len()]
+                .copy_from_slice(bytes);
+            str_off += bytes.len() + 1;
+        }
+
+        // Controlled .text content.
+        image[TEXT_VA..TEXT_VA + text.len()].copy_from_slice(text);
+
+        Box::leak(image.into_boxed_slice()).as_ptr() as *mut c_void
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::testutil::*;
     use super::*;
     use std::prelude::v1::*;
 
@@ -379,5 +575,70 @@ mod tests {
         unsafe {
             assert_eq!(find_export(base, fnv1a64(b"Anything")), ptr::null_mut());
         }
+    }
+
+    // --- mapped-style module: sections and export iteration ---
+
+    fn mock_exports() -> Vec<MockExport<'static>> {
+        std::vec![
+            MockExport {
+                name: "NtDelayExecution",
+                func_rva: (TEXT_VA + 0x10) as u32
+            },
+            MockExport {
+                name: "ZwDelayExecution",
+                func_rva: (TEXT_VA + 0x10) as u32
+            },
+            MockExport {
+                name: "RtlExitUserThread",
+                func_rva: (TEXT_VA + 0x40) as u32
+            },
+        ]
+    }
+
+    #[test]
+    fn find_section_locates_text() {
+        let base = mock_mapped_module(&mock_exports(), &[0u8; 16]);
+        unsafe {
+            let (ptr, len) = find_section(base, b".text").expect("section");
+            assert_eq!(ptr, (base as usize + TEXT_VA) as *const u8);
+            assert_eq!(len, TEXT_SIZE);
+            assert!(find_section(base, b".rdata").is_none());
+            assert!(find_section(ptr::null(), b".text").is_none());
+        }
+    }
+
+    #[test]
+    fn exports_iterate_names_and_addresses() {
+        let base = mock_mapped_module(&mock_exports(), &[0u8; 16]);
+        unsafe {
+            let mut it = exports(base).expect("exports");
+            let (name, func) = it.next().expect("first");
+            assert_eq!(read_cstr(name, 32), b"NtDelayExecution");
+            assert_eq!(func, (base as usize + TEXT_VA + 0x10) as *const u8);
+
+            let (name, _) = it.next().expect("second");
+            assert_eq!(read_cstr(name, 32), b"ZwDelayExecution");
+
+            let (name, _) = it.next().expect("third");
+            assert_eq!(read_cstr(name, 32), b"RtlExitUserThread");
+
+            assert!(it.next().is_none());
+            assert!(exports(ptr::null()).is_none());
+        }
+    }
+
+    fn read_cstr(ptr: *const u8, max: usize) -> Vec<u8> {
+        let mut out = Vec::new();
+        unsafe {
+            for i in 0..max {
+                let b = *ptr.add(i);
+                if b == 0 {
+                    break;
+                }
+                out.push(b);
+            }
+        }
+        out
     }
 }

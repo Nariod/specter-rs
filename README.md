@@ -81,14 +81,14 @@ Locally, `make test` runs everything CI runs.
 
 ## Status
 
-Phase 0 (toolchain spike) — **done**: PIC blob, entry `#[naked]` at offset 0,
-`SPT_END` marker last, PIC proven. Phase 1 (runtime) — **done**: JSON config
-contract (plugin → build.rs → typed consts), FNV-64 hashing, PEB walk and
-export resolution (host-tested with mock structures), beacon bootstrap with
-the TEB instance, instance-scoped heap, xorshift64 jitter RNG, sleep cycle
-with jitter, FILETIME-based killswitch checked at bootstrap and after every
-sleep. 936-byte blob, all guardrails green. Next: indirect syscalls, HWBP
-hooks, obfuscated sleep (phase 2). See the
+Phase 0 (toolchain spike) and phase 1 (runtime) — **done**: PIC blob, JSON
+config contract, FNV-64 hashing, PEB walk, TEB instance, heap, jitter RNG,
+killswitch. Phase 2 (evasion) — **in progress**: indirect syscall engine
+(Hell's Gate SSN extraction, Tartarus' Gate interpolation, Hell's Hall
+gadget rotation — host-tested against a mock ntdll), sleep through
+NtDelayExecution via a rotating ntdll gadget, silent exit through
+RtlExitUserThread. 2448-byte blob, zero compiler_builtins linked, all
+guardrails green. Next: HWBP hooks, ETW/AMSI, obfuscated sleep. See the
 [feasibility study](docs/ETUDE-DE-FAISABILITE.md) and the
 [parity tracking](docs/PARITE.md).
 

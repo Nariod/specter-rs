@@ -1,3 +1,5 @@
+cargo-features = ["panic-immediate-abort"]
+
 [workspace]
 resolver = "2"
 members = ["crates/beacon", "crates/core"]
@@ -14,7 +16,10 @@ repository = "https://github.com/Nariod/specter-rs"
 opt-level = "z"
 lto = true
 codegen-units = 1
-panic = "abort"
+# immediate-abort: a panicking beacon traps inline (ud2) — no formatting,
+# no panic strings, no core::fmt machinery in the blob (the nightly
+# panic_immediate_abort strategy, promoted to `panic = "immediate-abort"`).
+panic = "immediate-abort"
 strip = true
 overflow-checks = false
 
@@ -22,3 +27,5 @@ overflow-checks = false
 # with build-std=core, which otherwise rebuilds core with panic=unwind.
 [profile.dev]
 panic = "abort"
+
+

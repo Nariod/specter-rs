@@ -257,10 +257,31 @@ garder le pipeline vert) :
 | `.xdata` fusionné vers `.pdata`, jamais vers `.text` | lld-link fusionne par ordre alphabétique : `xdata` viendrait après `sptend` et le marqueur de fin ne serait plus le dernier octet du blob |
 | Le seuil anti-strings échoue à 12+ octets imprimables | le code exécutable produit naturellement des runs imprimables (`41 57 41 56...` = prologues) mesurés jusqu'à ~10 ; les runs plus courts sont affichés en revue, pas fatals |
 | Pas d'allocateur global (`#[global_allocator]`) | un allocateur global exige un `static` — interdit par la philosophie no-globals ; l'allocation passe par l'instance TEB (APIs explicites, pas de `Box`/`Vec` dans le beacon) |
+| `panic = "immediate-abort"` (feature cargo `panic-immediate-abort`) | sans lui, une seule borne de slice liée entraîne `core::panicking` + la machinerie de formatage (chaînes, libm tirée par les builtins) dans le blob |
+| Zéro référence à `compiler_builtins` depuis le code du blob | l'archive est un objet LTO-fusionné : une référence (`___chkstk_ms`, `memcpy`, `memset`) tire ~50 KiB ; le beacon embarque son propre `___chkstk_ms` naked et copie/init manuellement |
 
-**Phase 2 — Evasion core** : port des stubs syscalls en `#[naked]` (Hell's
-Gate / Tartarus / Hall), HWBP + VEH, retspoof (NASM conservé), Ekko/Astral
-(sleepmask NASM conservé, embedding via `include_bytes!`).
+**Phase 2 — Evasion core** : en cours — itération 1 livrée : moteur de
+syscalls indirects complet (extraction SSN Hell's Gate, détection de hooks,
+interpolation Tartarus' Gate, scan de gadgets `0F 05 C3` cap 64, rotation
+Hell's Hall par cycle, tout testé sur mock ntdll), sommeil via
+`NtDelayExecution` indirect, sortie silencieuse `RtlExitUserThread(0)`.
+Blob : 2 448 octets, **zéro compiler_builtins lié** (voir règles), gardes
+vertes, PIC prouvé. Reste phase 2 : HWBP + VEH, ETW/AMSI, retspoof,
+masque de sommeil chiffré (Ekko/Astral).
+
+Nouvelles règles de pipeline découvertes en phase 2 (ajoutées à la liste
+ci-dessus) :
+
+- **`panic = "immediate-abort"`** : les bornes de slices et les panics
+  deviennent des pièges `ud2` inline — sinon `core::panicking` + 4 Ko de
+  chaînes et la machinerie de formatage entrent dans le blob.
+- **Zéro référence à `compiler_builtins`** : une seule référence
+  (`___chkstk_ms` des grandes frames, `memcpy` des copies) tire l'objet
+  LTO-fusionné entier (~50 KiB) — le beacon embarque son propre
+  `___chkstk_ms` (naked asm) et toutes les copies/init sont manuelles.
+- Les hashes de noms sont des `const` de crate (pliés) ; les littéraux
+  runtime légitimes (ex. `.text`) sont déclarés dans le manifeste de
+  chaînes du build script.
 
 **Phase 3 — Fonctionnel** : wire typé, HTTP (WinHTTP par hash), SMB pipe,
 tasks (fs, ps, tokens, socks, portfwd), COFF loader — les tests unitaires

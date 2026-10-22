@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-22** (phase 1, itération 2).
+Dernière mise à jour : **2026-10-22** (phase 2, itération 1).
 
 ---
 
@@ -39,7 +39,7 @@ Dernière mise à jour : **2026-10-22** (phase 1, itération 2).
 | `Config.h` généré par le plugin avant build | JSON (décision 2026-10-22) → `build.rs` → constantes typées no_std | Fait | Validation stricte ; défaut = `profiles/default.json` comme les `#ifndef` originaux |
 | Clé AES-256 injectée au build | `AES_KEY` const générée | Fait | Décodage hex testé ; consommation chiffrement à venir (wire, phase 3) |
 | Killswitch (epoch compilé, vérifié au bootstrap et après chaque sommeil) | `KILL_EPOCH` const + conversion FILETIME→epoch testée + contrôle dans le cycle | Fait | Sortie = boucle silencieuse (placeholder) ; `RtlExitUserThread(0)` en phase 2 |
-| Sleep + jitter configurables | Cycle runtime : `sleep_with_jitter(SLEEP_MS, JITTER_MS, rng)` → `Sleep()` | Fait | Hypothèse documentée : jitter symétrique ± ms, à réconcilier avec le dialogue du plugin en phase 4 ; `Sleep` plain remplacé par le masque obfusqué en phase 2 |
+| Sleep + jitter configurables | Cycle runtime : `sleep_with_jitter(SLEEP_MS, JITTER_MS, rng)` → `NtDelayExecution` **indirect** (gadget ntdll tournant) | Fait | Hypothèse documentée : jitter symétrique ± ms, à réconcilier avec le dialogue du plugin en phase 4 ; le masque de sommeil chiffré (Ekko/Astral) reste à faire |
 | Profils malleables v2 embarqués (GET/POST, métadonnées, wrapping serveur) | Typés en const (`Profile` : rotation, hosts, UA, URIs, headers, placements…) | Partiel | Parsing/validation/faux défauts : fait ; consommation par le transport : phase 3 |
 | Watermark listener | `WATERMARK` const générée, lue par l'instance | Fait | — |
 | Debug checkbox → `specter.log` | — | À faire | Phase 3 (log mémoire + dump fichier optionnel) |
@@ -57,15 +57,15 @@ Dernière mise à jour : **2026-10-22** (phase 1, itération 2).
 | Résolution d'exports par hash | `specter_core::peb::find_export` | Fait | Testé avec images PE mock ; scan borné |
 | Bootstrap (PEB → modules → instance) | `runtime::bootstrap::main` | Fait | Résout ntdll/kernel32, stocke l'instance TEB |
 | Heap custom / allocation | `specter_core::heap::Heap` (handle + pointeurs résolus), méthodes Instance-scoped | Fait | Pas de `GlobalAlloc` global (philosophie no-globals) ; testé avec mocks WinAPI |
-| Sortie silencieuse `RtlExitUserThread(0)` | — | À faire | Phase 2 (résolution par hash) |
+| Sortie silencieuse `RtlExitUserThread(0)` | Résolu par hash depuis ntdll, appelé au killswitch et en échec de bootstrap | Fait | Résolu en premier au bootstrap : toute défaillance ultérieure doit pouvoir partir sans trace |
 | Watchdog | — | À faire | Phase 2/3 |
 
 ## 4. Évasion
 
 | Fonctionnalité (specter) | Implémentation specter-rs | Statut | Notes |
 |---|---|---|---|
-| Syscalls indirects (Hell's Gate / Tartarus' Gate) : extraction SSN | — | À faire | Phase 2 : port en `core::arch::asm!` / `#[naked]` |
-| Rotation de gadgets `syscall; ret` (Hell's Hall, 64 gadgets, re-randomisé chaque sommeil) | — | À faire | Phase 2 |
+| Syscalls indirects (Hell's Gate / Tartarus' Gate) : extraction SSN | `syscalls.rs` : extraction depuis le stub (`mov eax,<SSN>`), détection de hook (`E9`), interpolation depuis les voisins non hookés (SSN séquentiels) | Fait | Testé sur mock ntdll (stubs hookés/non hookés, bords, tout-hooké) ; l'appel lui-même est en `asm!` dans le beacon (`mov r10,rcx ; mov eax,SSN ; call gadget`) |
+| Rotation de gadgets `syscall; ret` (Hell's Hall, 64 gadgets, re-randomisé chaque sommeil) | Scan `.text` de ntdll pour `0F 05 C3`, cap 64, gadget re-tiré du RNG à chaque cycle de sommeil | Fait | Le `syscall` ne s'exécute jamais depuis la mémoire du beacon |
 | Hooks HWBP Dr0-Dr3 + VEH | — | À faire | Phase 2 ; à co-vérifier avec `panic=abort` |
 | Aveuglement ETW (`EtwEventWrite` & co) | — | À faire | Phase 2 |
 | Bypass AMSI (`AmsiScanBuffer`) | — | À faire | Phase 2 |
@@ -130,8 +130,8 @@ Dernière mise à jour : **2026-10-22** (phase 1, itération 2).
 |---|---|---|---|---|
 | Invariants philosophie | 9 | 0 | 0 | 1 |
 | Build / config | 6 | 1 | 1 | 4 |
-| Runtime | 5 | 0 | 2 | 0 |
-| Évasion | 0 | 0 | 9 | 0 |
+| Runtime | 6 | 0 | 1 | 0 |
+| Évasion | 2 | 0 | 7 | 0 |
 | Transports | 0 | 1 | 2 | 0 |
 | Commandes | 0 | 0 | 10 | 0 |
 | Wire | 0 | 0 | 1 | 0 |

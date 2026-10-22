@@ -41,7 +41,14 @@ fn main() {
         Ok(p) => std::path::PathBuf::from(p),
         Err(_) => std::path::Path::new(&out_dir).join("config_strings.json"),
     };
-    let manifest = serde_json::to_string(&gen.strings_manifest).expect("manifest serialize");
+    // Beacon runtime literals (not config): strings the beacon legitimately
+    // needs at runtime, beyond the malleable profile. Adding one is a
+    // conscious act — the anti-strings guardrail fails the build otherwise.
+    let mut manifest = gen.strings_manifest;
+    manifest.push(".text".to_string()); // find_section's section name probe
+    manifest.sort();
+    manifest.dedup();
+    let manifest = serde_json::to_string(&manifest).expect("manifest serialize");
     if let Some(parent) = manifest_path.parent() {
         std::fs::create_dir_all(parent).expect("cannot create the manifest directory");
     }

@@ -16,6 +16,10 @@
 //! Phase 1 of the roadmap (docs/ETUDE-DE-FAISABILITE.md, section 8).
 
 #![no_std]
+// Blob-code discipline: unwrap/expect in the beacon pull panic paths and
+// hide logic errors; non-test code uses explicit matches. Tests and the
+// build script are out of scope.
+#![cfg_attr(not(test), warn(clippy::unwrap_used, clippy::expect_used))]
 
 #[cfg(test)]
 extern crate std;
@@ -39,4 +43,5 @@ pub mod heap;
 pub mod peb;
 pub mod rng;
 pub mod sleep;
+pub mod syscalls;
 pub mod time;

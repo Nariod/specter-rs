@@ -14,6 +14,8 @@
 //! - no formatting, no logging, no unwinding
 
 #![no_std]
+// Blob-code discipline (see specter-core for the rationale).
+#![warn(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod coff;
 pub mod entry;
