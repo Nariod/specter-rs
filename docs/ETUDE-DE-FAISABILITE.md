@@ -266,11 +266,13 @@ de hooks, interpolation Tartarus' Gate, scan de gadgets `0F 05 C3` cap 64,
 rotation Hell's Hall par cycle, tout testé sur mock ntdll), sommeil via
 `NtDelayExecution` indirect, sortie silencieuse `RtlExitUserThread(0)`,
 hooks HWBP Dr0-Dr3 + VEH (CONTEXT x64 épinglé, neutralisation par contexte
-testée sur host, armement via NtGet/NtSetContextThread indirects) et
-aveuglement ETW (EtwEventWrite, EtwEventWriteFull, NtTraceEvent).
-Blob : 3 326 octets, **zéro compiler_builtins lié** (voir règles), gardes
-vertes, PIC prouvé. Reste phase 2 : AMSI (via dll-notify), retspoof,
-masque de sommeil chiffré (Ekko/Astral), ré-armement HWBP multi-threads.
+testée sur host, armement via NtGet/NtSetContextThread indirects),
+aveuglement ETW (EtwEventWrite, EtwEventWriteFull, NtTraceEvent) et bypass
+AMSI (Dr3, hook immédiat si amsi.dll est mappé, sinon différé par
+`LdrRegisterDllNotification`, retour `E_INVALIDARG` synthétisé).
+Blob : 3 835 octets, **zéro compiler_builtins lié** (voir règles), gardes
+vertes, PIC prouvé. Reste phase 2 : retspoof, masque de sommeil chiffré
+(Ekko/Astral), ré-armement HWBP multi-threads.
 
 Nouvelles règles de pipeline découvertes en phase 2 (ajoutées à la liste
 ci-dessus) :

@@ -37,6 +37,7 @@ fn spt_panic(_info: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+pub mod amsi;
 pub mod config;
 pub mod fnv;
 pub mod heap;

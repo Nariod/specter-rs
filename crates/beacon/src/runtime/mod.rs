@@ -5,6 +5,7 @@
 //!
 //! Phase 1 of the roadmap (docs/ETUDE-DE-FAISABILITE.md, section 8).
 
+pub mod amsi;
 pub mod bootstrap;
 pub mod hwbp;
 pub mod stack;
