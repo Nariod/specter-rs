@@ -214,6 +214,7 @@ unsafe fn now_epoch(instance: &Instance) -> u64 {
         crate::runtime::retspoof::spt_spoof_call2(
             instance.get_system_time_as_file_time as *const () as usize,
             instance.retspoof_gadget,
+            crate::runtime::retspoof::spt_retspoof_continue as *const () as usize,
             core::ptr::addr_of_mut!(filetime) as usize,
             0,
         );
