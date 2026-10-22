@@ -43,6 +43,7 @@ pub mod fnv;
 pub mod heap;
 pub mod hwbp;
 pub mod peb;
+pub mod retspoof;
 pub mod rng;
 pub mod sleep;
 pub mod syscalls;

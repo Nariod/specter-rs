@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-22** (phase 2 it. 3 + plugin intégration v1.2).
+Dernière mise à jour : **2026-10-22** (phase 2, itération 4).
 
 ---
 
@@ -69,7 +69,7 @@ Dernière mise à jour : **2026-10-22** (phase 2 it. 3 + plugin intégration v1.
 | Hooks HWBP Dr0-Dr3 + VEH | `specter_core::hwbp` : CONTEXT x64 épinglé (offsets `offset_of!`), bits Dr7, neutralisation par réécriture du contexte (retour propre synthétisé, zéro octet modifié) ; beacon : VEH `extern "system"`, armement via `NtGet/NtSetContextThread` **indirects** (pseudo-handle thread courant) | Fait | Armé sur le thread du beacon ; le ré-armement des threads du pool async attend la phase 3 (BOFs) ; cible inconnue → hooks désactivés sans échec |
 | Aveuglement ETW (`EtwEventWrite` & co) | Hooks HWBP sur `EtwEventWrite`, `EtwEventWriteFull`, `NtTraceEvent` (Dr0-Dr2, Dr3 libre pour AMSI) | Fait | Variante HWBP par défaut (modules byte-clean) ; la variante patch `ret` (sans HWBP) n'est pas portée — documented |
 | Bypass AMSI (`AmsiScanBuffer`) | Dr3 (laissé libre par ETW) : hook immédiat si amsi.dll est mappé, sinon différé par `LdrRegisterDllNotification` ; retour synthétisé `E_INVALIDARG`, zéro octet modifié | Fait | Test de décision host (notification mock, casse insensible, raisons/absence) ; la callback ignore les threads étrangers (instance via `gs`) |
-| Return-address spoofing (gadget `FF 23` dans DLL signée) | — | À faire | Phase 2 |
+| Return-address spoofing (gadget `FF 23` dans DLL signée) | Scan `FF 23` pur testé (core) + harness naked `spt_spoof_call2` : gadget poussé comme fausse adresse de retour, continuation via `jmp [rbx]` (RBX callee-saved survit à l'appel), alignement win64 respecté ; premier consommateur : lecture horloge du killswitch | Partiel | Le fallback `ADD RSP, imm8; RET` et le scan étendu aux 7 modules signés de l'original restent à faire ; l'asm est revu instruction par instruction mais non exécutable en test host |
 | Thread stack spoofing (TIB) | — | À faire | Phase 2/3 |
 | Sleep obfuscation Ekko / Astral Projection (+ sleepmask) | — | À faire | Phase 2 ; sleepmask réutilisable tel quel (NASM) ou réécrit |
 | `dll-notify` (unhook des callbacks de chargement) | — | À faire | Phase 2/3 |
@@ -131,7 +131,7 @@ Dernière mise à jour : **2026-10-22** (phase 2 it. 3 + plugin intégration v1.
 | Invariants philosophie | 9 | 0 | 0 | 1 |
 | Build / config | 6 | 1 | 1 | 4 |
 | Runtime | 6 | 0 | 1 | 0 |
-| Évasion | 5 | 0 | 4 | 0 |
+| Évasion | 5 | 1 | 3 | 0 |
 | Transports | 0 | 1 | 2 | 0 |
 | Commandes | 0 | 0 | 10 | 0 |
 | Wire | 0 | 0 | 1 | 0 |

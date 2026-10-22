@@ -8,5 +8,6 @@
 pub mod amsi;
 pub mod bootstrap;
 pub mod hwbp;
+pub mod retspoof;
 pub mod stack;
 pub mod syscalls;
