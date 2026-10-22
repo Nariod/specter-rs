@@ -5,7 +5,7 @@
 #   1. source discipline: rustfmt + clippy (-D warnings)
 #   2. host-side unit tests: pure logic runs under the std test harness
 #   3. build invariants: the blob must build, pass layout verification,
-#      contain no text strings, stay under the size budget, and be
+#      contain no undeclared strings, stay under the size budget, and be
 #      position-independent (double image base)
 #   4. tooling tests: the Python verification pipeline is itself tested
 name: CI
@@ -25,8 +25,18 @@ jobs:
       - name: Install pinned toolchain
         run: rustup show
 
+      # Diagnostics surfaced through annotations (readable via the public
+      # API when the logs are not).
+      - name: Diagnostics
+        run: echo "::notice::toolchain=$(rustup show active-toolchain 2>&1 | tr '\n' ' ') cargo=$(cargo --version 2>&1) rustfmt=$(rustfmt --version 2>&1)"
+
       - name: Format
-        run: cargo fmt --all --check
+        run: |
+          set -o pipefail
+          cargo fmt --all --check 2>&1 | tee /tmp/fmt.log || {
+            echo "::error title=fmt-failed::$(tr '\n' ' ' < /tmp/fmt.log | head -c 700)"
+            exit 1
+          }
 
       - name: Clippy
         run: cargo clippy --release -Z build-std=core -- -D warnings
