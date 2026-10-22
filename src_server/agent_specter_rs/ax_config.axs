@@ -19,6 +19,20 @@ function RegisterCommands(listenerType)
     let cmd_cat = ax.create_command("cat", "Read first 2048 bytes of the specified file", "cat C:\\file.txt", "Task: read file");
     cmd_cat.addArgString("path", true);
 
+    let cmd_mkdir = ax.create_command("mkdir", "Create a directory", "mkdir C:\\Temp\\specter", "Task: create directory");
+    cmd_mkdir.addArgString("path", true);
+
+    let cmd_rm = ax.create_command("rm", "Delete a file or an empty directory", "rm C:\\Temp\\specter\\file.txt", "Task: delete");
+    cmd_rm.addArgString("path", true);
+
+    let cmd_cp = ax.create_command("cp", "Copy a file", "cp C:\\src.txt C:\\dst.txt", "Task: copy file");
+    cmd_cp.addArgString("src", true);
+    cmd_cp.addArgString("dst", true);
+
+    let cmd_mv = ax.create_command("mv", "Move a file", "mv C:\\src.txt C:\\dst.txt", "Task: move file");
+    cmd_mv.addArgString("src", true);
+    cmd_mv.addArgString("dst", true);
+
     let cmd_sleep = ax.create_command("sleep", "Sets sleep time", "sleep 30m5s 10", "Task: sleep");
     cmd_sleep.addArgString("sleep", true, "Time in '%h%m%s' format or number of seconds");
     cmd_sleep.addArgInt("jitter", false, "Max random amount of time in % added to sleep");
@@ -29,7 +43,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 

@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-22** (phase 3, itération 10 : commandes fichiers pwd/cd/ls/cat).
+Dernière mise à jour : **2026-10-22** (phase 3, itération 11 : mkdir/rm/cp/mv).
 
 ---
 
@@ -89,7 +89,8 @@ Dernière mise à jour : **2026-10-22** (phase 3, itération 10 : commandes fich
 |---|---|---|---|
 | `sleep` — le **cycle** est fait (voir §2) ; la **commande opérateur** (changement à runtime) | Beacon : `COMMAND_PROFILE` subop 1 parsé, profil runtime mis à jour, accusé renvoyé au cycle suivant ; plugin Go : `ProcessData` gère l'accusé (`TsAgentUpdateData`) ; dialogue opérateur déclaré (ax_config.axs : `sleep`, `terminate`) et `CreateCommand` porté | Fait* | Itération 7 : round-trip complet vérifié contre le serveur réel (rejeu) — tâche `sleep 45 5` créée par l'API opérateur, reçue par les octets du beacon, accusée, marquée complétée (« Sleep time has been changed »), profil session mis à jour. *L'exécution sur l'implant Windows réel reste la démonstration du MVP |
 | Fichiers : `cat` `ls` `cd` `pwd` | Beacon : handlers `runtime::tasks` (APIs par hash : GetCurrentDirectoryA, SetCurrentDirectoryA, FindFirstFileA/Next/Close, CreateFileA/ReadFile/CloseHandle ; échec Win32 → record COMMAND_ERROR avec GetLastError) ; plugin Go : CreateCommand + ProcessData portés du natif (rendu listing + synchro navigateur fichiers), dialogues ax déclarés | Fait* | Itération 10 : round-trip complet vérifié contre le serveur réel (rejeu : pwd/ls/cat accusés, sorties rendues par le plugin porté). *L'exécution Win32 réelle = démo sur la VM |
-| Fichiers : `mkdir` `rm` `cp` `mv` `upload` `download` | — | À faire | Phase 3 |
+| Fichiers : `mkdir` `rm` `cp` `mv` | Beacon : `CreateDirectoryA`, `GetFileAttributesA`+`RemoveDirectoryA`/`DeleteFileA` (le byte de résultat dit fichier/répertoire), `CopyFileA` (écrasement), `MoveFileA` ; plugin Go : CreateCommand + ProcessData portés, dialogues ax | Fait* | Itération 11 : round-trip réel vérifié (rejeu). Correctif au passage : `Task::path()` couvrait mal les nouveaux variants (chemin vide — test de couverture épinglé). *Exécution Win32 réelle = démo VM |
+| Fichiers : `upload` `download` | — | À faire | Phase 3 ; nécessite le chunking EXFIL |
 | Process : `ps` (list/kill/run + PPID spoofing), `whoami` | — | À faire | Phase 3 |
 | `shell` (cmd.exe/PowerShell interactif) | — | À faire | Phase 3 |
 | `bof` (loader COFF, sync + async thread pool) | — | À faire | Phase 3 ; candidat n°1 du gain Rust (parsing non fiable) |
@@ -134,6 +135,6 @@ Dernière mise à jour : **2026-10-22** (phase 3, itération 10 : commandes fich
 | Runtime | 6 | 0 | 1 | 0 |
 | Évasion | 5 | 2 | 2 | 0 |
 | Transports | 0 | 3 | 1 | 0 |
-| Commandes | 2 | 0 | 8 | 0 |
+| Commandes | 3 | 0 | 7 | 0 |
 | Wire | 0 | 1 | 0 | 0 |
 | Serveur Go | 0 | 2 | 0 | 3 |

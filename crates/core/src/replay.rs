@@ -226,6 +226,34 @@ fn replay_check_in_against_real_listener() {
                 ));
                 handled += 1;
             }
+            Some((task @ transport::Task::Mkdir { .. }, id)) => {
+                println!("[replay] task {id:08x}: mkdir (fabricated)");
+                assert!(transport::push_mkdir_result(&mut w, id, task.path()));
+                handled += 1;
+            }
+            Some((transport::Task::Rm { .. }, id)) => {
+                println!("[replay] task {id:08x}: rm (fabricated)");
+                assert!(transport::push_rm_result(&mut w, id, false));
+                handled += 1;
+            }
+            Some((transport::Task::Cp { .. }, id)) => {
+                println!("[replay] task {id:08x}: cp (fabricated)");
+                assert!(transport::push_plain_result(
+                    &mut w,
+                    id,
+                    transport::COMMAND_COPY
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::Mv { .. }, id)) => {
+                println!("[replay] task {id:08x}: mv (fabricated)");
+                assert!(transport::push_plain_result(
+                    &mut w,
+                    id,
+                    transport::COMMAND_MV
+                ));
+                handled += 1;
+            }
             Some((transport::Task::Terminate, id)) => {
                 println!("[replay] task {id:08x}: terminate");
                 return; // the real beacon exits here

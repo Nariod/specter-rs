@@ -111,6 +111,10 @@ const (
 	COMMAND_CD        = 8
 	COMMAND_LS        = 14
 	COMMAND_CAT       = 24
+	COMMAND_MKDIR     = 27
+	COMMAND_RM        = 17
+	COMMAND_COPY      = 12
+	COMMAND_MV        = 18
 	COMMAND_ERROR     = 0x1111ffff
 )
 
@@ -671,6 +675,48 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 		}
 		array = []interface{}{COMMAND_CAT, Ts.TsConvertUTF8toCp(path, agentData.ACP)}
 
+	case "mkdir":
+		var path string
+		path, err = getStringArg(args, "path")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_MKDIR, Ts.TsConvertUTF8toCp(path, agentData.ACP)}
+
+	case "rm":
+		var path string
+		path, err = getStringArg(args, "path")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_RM, Ts.TsConvertUTF8toCp(path, agentData.ACP)}
+
+	case "cp":
+		var src string
+		var dst string
+		src, err = getStringArg(args, "src")
+		if err != nil {
+			goto RET
+		}
+		dst, err = getStringArg(args, "dst")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_COPY, Ts.TsConvertUTF8toCp(src, agentData.ACP), Ts.TsConvertUTF8toCp(dst, agentData.ACP)}
+
+	case "mv":
+		var src string
+		var dst string
+		src, err = getStringArg(args, "src")
+		if err != nil {
+			goto RET
+		}
+		dst, err = getStringArg(args, "dst")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_MV, Ts.TsConvertUTF8toCp(src, agentData.ACP), Ts.TsConvertUTF8toCp(dst, agentData.ACP)}
+
 	case "terminate":
 		if subcommand == "thread" {
 			array = []interface{}{COMMAND_TERMINATE, 1}
@@ -852,6 +898,30 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 				}
 			}
 			Ts.TsClientGuiFilesWindows(task, rootPath, items)
+
+		case COMMAND_MKDIR:
+			if false == packer.CheckPacker([]string{"array"}) {
+				goto HANDLER
+			}
+			path := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+			task.Message = fmt.Sprintf("Directory '%v' created successfully", path)
+
+		case COMMAND_RM:
+			if false == packer.CheckPacker([]string{"byte"}) {
+				goto HANDLER
+			}
+			result := packer.ParseInt8()
+			if result == 0 {
+				task.Message = "File deleted successfully"
+			} else {
+				task.Message = "Directory deleted successfully"
+			}
+
+		case COMMAND_COPY:
+			task.Message = "File copied successfully"
+
+		case COMMAND_MV:
+			task.Message = "File moved successfully"
 
 		case COMMAND_PROFILE:
 			if false == packer.CheckPacker([]string{"int", "int", "int"}) {

@@ -36,8 +36,11 @@ PRINTABLE = range(0x20, 0x7F)
 # Raised 12288 -> 16384 for the iteration 8+9 growth: the restored (and
 # functional) transaction chain after the -Oz dead-path fix (~1.8 KiB)
 # plus the identity completion (internal IP, joined domain, elevation
-# via iphlpapi/netapi32/advapi32). The command set comes next.
-DEFAULT_MAX_SIZE = 16384
+# via iphlpapi/netapi32/advapi32).
+# Raised 16384 -> 20480 for the operator command set: the file commands
+# (pwd/cd/ls/cat at 15.4 KiB, mkdir/rm/cp/mv at 16.8 KiB) — process,
+# shell, bof, tokens and forwarding come next.
+DEFAULT_MAX_SIZE = 20480
 
 
 def find_strings(blob):

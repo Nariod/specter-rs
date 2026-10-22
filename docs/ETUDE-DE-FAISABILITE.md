@@ -382,6 +382,17 @@ Formats épinglés par vecteurs Go (PackArray int/string pour les tâches,
 enregistrements BE pour les résultats). Blob : 15 388/16 384 — la marge
 est quasi consommée, la prochaine commande demandera une relance.
 
+Itération 11 (2026-10-22) — suite fichiers : `mkdir`, `rm`, `cp`, `mv`
+de bout en bout (même gabarit que l'itération 10 : CreateCommand/ProcessData
+portés, handlers par hash, échecs en COMMAND_ERROR). Budget relevé
+16 384 → 20 480 en commit dédié (blob à 16 780). Correctif attrapé par
+le test réel : `Task::path()` ne couvrait pas les nouveaux variants —
+le rejeu fabriquait des résultats à chemin vide (`Directory '' created`)
+et les handlers beacon auraient appelé les APIs avec des chaînes vides ;
+test de couverture des accesseurs épinglé (tout variant doit exposer son
+argument). Round-trip réel re-vérifié (`mkdir` → `Directory 'C:\vm-demo'
+created successfully`).
+
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B
 détection en labo vs le beacon C, docs.

