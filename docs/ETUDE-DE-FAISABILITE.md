@@ -355,9 +355,18 @@ mort et supprimé, voir les règles ci-dessus). Corrigé (`[u16; 5]`) ;
 l'extraction du gabarit passe en boucles manuelles (`memcmp` interdit) ;
 le blob opérateur régénéré embarque et prouve toutes les chaînes du
 listener (clé 16 o, hosts, URIs, hb_header, gabarit de page, alphabet
-base64) — 11 796/12 288 octets, PIC prouvé. La marge de budget est
-désormais mince (~500 o) : la prochaine fonctionnalité dépassera et
-nécessitera une relance dédiée.
+base64) — 11 796/12 288 octets, PIC prouvé.
+
+Itération 9 (2026-10-22) — garde anti-blob-mort + identité complète :
+le plugin vérifie à la génération que le blob embarque chaque paramètre
+du listener (clé, hosts, URIs, hb_header, gabarit) — le détecteur fiable
+de la classe de bug de l'itération 8 ; le beat collecte désormais l'IP
+interne (GetIpAddrTable via iphlpapi chargé à la demande), le domaine
+rejoint (NetGetJoinInformation via netapi32, converti ACP) et l'élévation
+(OpenProcessToken/GetTokenInformation via advapi32) — restent workingtime
+et le bit server. Budget relevé 12 288 → 16 384 (commit dédié) : blob à
+12 660 octets, PIC prouvé ; flux opérateur réel re-vérifié de bout en
+bout (génération 12 692 octets, tous paramètres présents).
 
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B

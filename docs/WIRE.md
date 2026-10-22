@@ -109,9 +109,12 @@ array   Username (code page OEM/ACP d'origine)
 array   Process
 ```
 
-MVP specter-rs (documenté au PARITE) : `internalIp` = 0, `Domain` vide,
-`workingtime` = 0, bits elevated/server à 0. Le reste est collecté
-(`runtime::sysinfo`).
+MVP specter-rs (itération 9) : tout est collecté (`runtime::sysinfo`)
+sauf `workingtime` (0) et le bit server (0) — l'élévation vient de
+`TokenElevation`, l'IP interne de `GetIpAddrTable` (première IPv4 non
+loopback, `dwAddr` brut : les octets en mémoire, que le serveur rend en
+quadrique pointée), le domaine de `NetGetJoinInformation` (vide en
+workgroup).
 
 ## Chiffrement de session — RC4
 

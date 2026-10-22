@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-22** (phase 3, itération 7 : rejeu du check-in contre le listener réel).
+Dernière mise à jour : **2026-10-22** (phase 3, itération 9 : garde anti-blob-mort + identité beat complète).
 
 ---
 
