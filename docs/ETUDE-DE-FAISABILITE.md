@@ -260,14 +260,17 @@ garder le pipeline vert) :
 | `panic = "immediate-abort"` (feature cargo `panic-immediate-abort`) | sans lui, une seule borne de slice liée entraîne `core::panicking` + la machinerie de formatage (chaînes, libm tirée par les builtins) dans le blob |
 | Zéro référence à `compiler_builtins` depuis le code du blob | l'archive est un objet LTO-fusionné : une référence (`___chkstk_ms`, `memcpy`, `memset`) tire ~50 KiB ; le beacon embarque son propre `___chkstk_ms` naked et copie/init manuellement |
 
-**Phase 2 — Evasion core** : en cours — itération 1 livrée : moteur de
-syscalls indirects complet (extraction SSN Hell's Gate, détection de hooks,
-interpolation Tartarus' Gate, scan de gadgets `0F 05 C3` cap 64, rotation
-Hell's Hall par cycle, tout testé sur mock ntdll), sommeil via
-`NtDelayExecution` indirect, sortie silencieuse `RtlExitUserThread(0)`.
-Blob : 2 448 octets, **zéro compiler_builtins lié** (voir règles), gardes
-vertes, PIC prouvé. Reste phase 2 : HWBP + VEH, ETW/AMSI, retspoof,
-masque de sommeil chiffré (Ekko/Astral).
+**Phase 2 — Evasion core** : en cours — itérations 1 et 2 livrées :
+moteur de syscalls indirects complet (extraction SSN Hell's Gate, détection
+de hooks, interpolation Tartarus' Gate, scan de gadgets `0F 05 C3` cap 64,
+rotation Hell's Hall par cycle, tout testé sur mock ntdll), sommeil via
+`NtDelayExecution` indirect, sortie silencieuse `RtlExitUserThread(0)`,
+hooks HWBP Dr0-Dr3 + VEH (CONTEXT x64 épinglé, neutralisation par contexte
+testée sur host, armement via NtGet/NtSetContextThread indirects) et
+aveuglement ETW (EtwEventWrite, EtwEventWriteFull, NtTraceEvent).
+Blob : 3 326 octets, **zéro compiler_builtins lié** (voir règles), gardes
+vertes, PIC prouvé. Reste phase 2 : AMSI (via dll-notify), retspoof,
+masque de sommeil chiffré (Ekko/Astral), ré-armement HWBP multi-threads.
 
 Nouvelles règles de pipeline découvertes en phase 2 (ajoutées à la liste
 ci-dessus) :

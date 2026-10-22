@@ -87,8 +87,11 @@ killswitch. Phase 2 (evasion) — **in progress**: indirect syscall engine
 (Hell's Gate SSN extraction, Tartarus' Gate interpolation, Hell's Hall
 gadget rotation — host-tested against a mock ntdll), sleep through
 NtDelayExecution via a rotating ntdll gadget, silent exit through
-RtlExitUserThread. 2448-byte blob, zero compiler_builtins linked, all
-guardrails green. Next: HWBP hooks, ETW/AMSI, obfuscated sleep. See the
+RtlExitUserThread, hardware-breakpoint hooks (Dr0-Dr3 + VEH, context
+rewriting — offsets pinned and host-tested) blinding EtwEventWrite,
+EtwEventWriteFull and NtTraceEvent. 3326-byte blob, zero
+compiler_builtins linked, all guardrails green. Next: AMSI via
+dll-notify, return-address spoofing, encrypted sleep mask. See the
 [feasibility study](docs/ETUDE-DE-FAISABILITE.md) and the
 [parity tracking](docs/PARITE.md).
 

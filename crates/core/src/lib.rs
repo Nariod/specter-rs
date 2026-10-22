@@ -40,6 +40,7 @@ fn spt_panic(_info: &core::panic::PanicInfo) -> ! {
 pub mod config;
 pub mod fnv;
 pub mod heap;
+pub mod hwbp;
 pub mod peb;
 pub mod rng;
 pub mod sleep;
