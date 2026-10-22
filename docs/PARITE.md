@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-22** (phase 3, itération 6 : transport HTTP + check-in).
+Dernière mise à jour : **2026-10-22** (phase 3, itération 7 : rejeu du check-in contre le listener réel).
 
 ---
 
@@ -78,7 +78,7 @@ Dernière mise à jour : **2026-10-22** (phase 3, itération 6 : transport HTTP 
 
 | Fonctionnalité (specter) | Implémentation specter-rs | Statut | Notes |
 |---|---|---|---|
-| HTTP/S (WinHTTP résolu par hash), GET heartbeat / POST tâches | `runtime::winhttp` : winhttp.dll chargé à la demande (`LoadLibraryA` par hash), 9 exports résolus par FNV-64, transaction POST complète (session/connect/request/send/read/close) par cycle ; échec = sommeil + retry, jamais fatal | Partiel | Itération 6 : POST uniquement (le listener BeaconHTTP v1.2 ne connaît qu'une méthode) ; HTTPS automatique sur port 443, non testé en labo |
+| HTTP/S (WinHTTP résolu par hash), GET heartbeat / POST tâches | `runtime::winhttp` : winhttp.dll chargé à la demande (`LoadLibraryA` par hash), 9 exports résolus par FNV-64, transaction POST complète (session/connect/request/send/read/close) par cycle ; échec = sommeil + retry, jamais fatal | Partiel | Itérations 6-7 : les octets exacts du beacon sont acceptés par le listener réel — rejeu host via le harnais `core::replay` (session créée, tâche sleep reçue/accusée) ; l'exécution WinHTTP sur l'implant Windows reste à démontrer en démo ; HTTPS automatique sur port 443, non testé en labo |
 | Profils malleables appliqués des deux côtés | Côté beacon : façonnage consommé (`core::transport`) — en-tête beat RC4+base64 (clé listener), headers/UA/URI du profil, gabarit de page en réponse ; côté plugin : le profil du listener override le profil malleable au build (le listener est l'autorité) | Partiel | Le placement/format/mask du profil (cookies specter v2) restent non consommés : le listener BeaconHTTP n'en a pas |
 | Proxy-aware transport | `WinHttpOpen(ACCESS_DEFAULT_PROXY)` | Partiel | Comportement système par défaut, non testé |
 | Pivot SMB named pipe (`link`/`unlink`) | — | À faire | Phase 3 ; listener SMB Go inchangé |
@@ -87,7 +87,7 @@ Dernière mise à jour : **2026-10-22** (phase 3, itération 6 : transport HTTP 
 
 | Commande (specter) | Implémentation specter-rs | Statut | Notes |
 |---|---|---|---|
-| `sleep` — le **cycle** est fait (voir §2) ; la **commande opérateur** (changement à runtime) | Beacon : `COMMAND_PROFILE` subop 1 parsé, profil runtime mis à jour, accusé renvoyé au cycle suivant ; plugin Go : `ProcessData` gère l'accusé (`TsAgentUpdateData`) | Partiel | Itération 6 ; le dialogue de commande opérateur (ax_config.axs) reste à déclarer — l'accusé round-trip est prouvé par les vecteurs Go épinglés, pas encore contre le listener réel |
+| `sleep` — le **cycle** est fait (voir §2) ; la **commande opérateur** (changement à runtime) | Beacon : `COMMAND_PROFILE` subop 1 parsé, profil runtime mis à jour, accusé renvoyé au cycle suivant ; plugin Go : `ProcessData` gère l'accusé (`TsAgentUpdateData`) ; dialogue opérateur déclaré (ax_config.axs : `sleep`, `terminate`) et `CreateCommand` porté | Fait* | Itération 7 : round-trip complet vérifié contre le serveur réel (rejeu) — tâche `sleep 45 5` créée par l'API opérateur, reçue par les octets du beacon, accusée, marquée complétée (« Sleep time has been changed »), profil session mis à jour. *L'exécution sur l'implant Windows réel reste la démonstration du MVP |
 | Fichiers : `cat` `ls` `cd` `pwd` `mkdir` `rm` `cp` `mv` `upload` `download` | — | À faire | Phase 3 |
 | Process : `ps` (list/kill/run + PPID spoofing), `whoami` | — | À faire | Phase 3 |
 | `shell` (cmd.exe/PowerShell interactif) | — | À faire | Phase 3 |
@@ -107,7 +107,7 @@ Dernière mise à jour : **2026-10-22** (phase 3, itération 6 : transport HTTP 
 
 | Composant (specter) | Statut | Notes |
 |---|---|---|
-| `agent_specter` (génération payloads, dialogue, build du beacon) | `src_server/agent_specter_rs` (Go, ABI AdaptixC2 **v1.2** — le serveur installé ; l'original vise 2.0) : dialogue de génération, `BuildPayload` pilotant le pipeline cargo via `SPT_CONFIG` (avec `listener_key` + override du profil par le listener réel), `CreateAgent`/`Encrypt`/`Decrypt`/`PackTasks`/`ProcessData` portés du natif (RC4 session, packer,COMMAND_PROFILE/TERMINATE), chargé et vérifié sur le serveur réel (test négatif : le serveur logge l'échec si le .so manque) | Partiel | Itération 6 : le check-in doit maintenant être rejoué contre le listener réel (étape suivante) ; `CreateCommand`/dialogues de commandes : itération suivante ; pivots : `PivotPackData` en stub explicite |
+| `agent_specter` (génération payloads, dialogue, build du beacon) | `src_server/agent_specter_rs` (Go, ABI AdaptixC2 **v1.2** — le serveur installé ; l'original vise 2.0) : dialogue de génération, `BuildPayload` pilotant le pipeline cargo via `SPT_CONFIG` (avec `listener_key` + override du profil par le listener réel), `CreateAgent`/`Encrypt`/`Decrypt`/`PackTasks`/`ProcessData` portés du natif (RC4 session, packer,COMMAND_PROFILE/TERMINATE), chargé et vérifié sur le serveur réel (test négatif : le serveur logge l'échec si le .so manque) | Partiel | Itération 7 : rejeu du check-in contre le listener réel vérifié — session `specter-rs` créée sur le serveur (identité complète), tâche `sleep` round-trip complet via l'API opérateur (harnais `core::replay`, `#[ignore]`, piloté par env) ; `CreateCommand` + dialogues ax (`sleep`, `terminate`) livrés ; reste : commandes fichiers/process/shell, pivots (`PivotPackData` stub explicite) |
 | `listener_specter_http` | Hors périmètre | Inchangé |
 | `listener_specter_smb` | Hors périmètre | Inchangé |
 | `specter_refs` | Hors périmètre | Inchangé |
@@ -133,6 +133,6 @@ Dernière mise à jour : **2026-10-22** (phase 3, itération 6 : transport HTTP 
 | Runtime | 6 | 0 | 1 | 0 |
 | Évasion | 5 | 2 | 2 | 0 |
 | Transports | 0 | 3 | 1 | 0 |
-| Commandes | 0 | 1 | 9 | 0 |
+| Commandes | 1 | 0 | 9 | 0 |
 | Wire | 0 | 1 | 0 | 0 |
 | Serveur Go | 0 | 2 | 0 | 3 |

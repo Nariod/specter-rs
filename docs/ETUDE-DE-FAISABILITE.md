@@ -329,9 +329,22 @@ dans `bootstrap::main` (clé de session 32 octets, agentId RNG, beat
 sysinfo, tâches sleep/terminate, accusés différés d'un cycle) ; plugin
 Go : `CreateAgent`/`Encrypt`/`Decrypt`/`PackTasks`/`ProcessData` portés
 du natif + `listener_key` et override du profil par le listener réel au
-build. Budget blob relevé 8192 → 12288 (commit dédié). Reste : rejeu du
-check-in contre le listener réel, dialogues de commandes, IP interne,
-élévation, domaine, SMB.
+build. Budget blob relevé 8192 → 12288 (commit dédié).
+
+Itération 7 (2026-10-22) — check-in prouvé contre le serveur réel : un
+listener `BeaconHTTP` est créé par l'API teamserver (login, listener/create,
+agent/command/execute — le protocole opérateur est scriptable) ; le harnais
+`core::replay` (test `#[ignore]` piloté par variables d'environnement,
+`SPT_REPLAY_*`) rejoue les octets exacts du beacon à travers le même code
+pur que l'implant. Résultat : la session `specter-rs` apparaît côté serveur
+(identité complète, OS « Win 11 x64 » via la table native), une tâche
+`sleep 45 5` créée par l'API opérateur traverse le cycle complet —
+`CreateCommand` (dialogues ax `sleep`/`terminate` livrés) → `PackTasks` →
+parse beacon → accusé → `ProcessData` → tâche complétée, profil de session
+mis à jour. Correctif au passage : le parse beacon de `COMMAND_TERMINATE`
+consomme l'exit method (1 thread / 2 process) avant le taskId, comme le
+natif. Reste : exécution de l'implant Windows (démo MVP), commandes
+fichiers/process/shell, IP interne, élévation, domaine, SMB.
 
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B

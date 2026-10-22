@@ -53,3 +53,8 @@ pub mod syscalls;
 pub mod time;
 pub mod transport;
 pub mod wire;
+
+/// Check-in replay harness against a live listener (`#[ignore]`d test,
+/// phase 3 step 4) — see the module documentation for the env contract.
+#[cfg(test)]
+mod replay;

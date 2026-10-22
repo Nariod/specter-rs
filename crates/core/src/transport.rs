@@ -127,7 +127,12 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             let jitter_pct = r.u32_le()?;
             Task::Sleep { sec, jitter_pct }
         }
-        COMMAND_TERMINATE => Task::Terminate,
+        // COMMAND_TERMINATE carries the exit method (1 = kill thread,
+        // 2 = kill process) before the task id.
+        COMMAND_TERMINATE => {
+            let _exit_method = r.u32_le()?;
+            Task::Terminate
+        }
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -314,8 +319,9 @@ mod tests {
 
     #[test]
     fn parse_task_terminate() {
-        // COMMAND_TERMINATE (10), no args, taskId 1.
-        let bytes = [10u8, 0, 0, 0, 1, 0, 0, 0];
+        // COMMAND_TERMINATE (10), exit method 1 (kill thread), taskId 1 —
+        // the layout the server's CreateCommand emits for "terminate thread".
+        let bytes = [10u8, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0];
         let mut r = Reader::new(&bytes);
         assert_eq!(parse_task(&mut r), Some((Task::Terminate, 1)));
         assert_eq!(r.remaining(), 0);

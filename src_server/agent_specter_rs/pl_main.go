@@ -72,6 +72,21 @@ func RC4Crypt(data []byte, key []byte) ([]byte, error) {
 	return out, nil
 }
 
+// Dialog argument helpers (native beacon_agent semantics).
+func getStringArg(args map[string]any, key string) (string, error) {
+	if value, ok := args[key].(string); ok {
+		return value, nil
+	}
+	return "", fmt.Errorf("parameter '%s' must be set", key)
+}
+
+func getFloatArg(args map[string]any, key string) (float64, error) {
+	if value, ok := args[key].(float64); ok {
+		return value, nil
+	}
+	return 0, fmt.Errorf("parameter '%s' must be a number", key)
+}
+
 // Command ids on the wire (native beacon_agent, pl_utils.go).
 const (
 	COMMAND_TERMINATE = 10
@@ -513,11 +528,86 @@ func (e *ExtenderAgent) PivotPackData(pivotId string, data []byte) (adaptix.Task
 	return adaptix.TaskData{}, errors.New("specter-rs pivots land with the SMB transport (phase 3+)")
 }
 
-// CreateCommand: the operator command surface — sleep/terminate land with
-// the command dialogs (next iteration); the beacon already parses their
-// wire records.
+// CreateCommand: the operator command surface (native beacon_agent
+// semantics): sleep -> COMMAND_PROFILE subop 1, terminate ->
+// COMMAND_TERMINATE with the exit method. The beacon parses exactly
+// these records (crates/core/src/transport.rs).
 func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[string]any) (adaptix.TaskData, adaptix.ConsoleMessageData, error) {
-	return adaptix.TaskData{}, adaptix.ConsoleMessageData{}, errors.New("specter-rs command dialogs land with the next iteration")
+	var (
+		taskData    adaptix.TaskData
+		messageData adaptix.ConsoleMessageData
+		err         error
+	)
+
+	command, ok := args["command"].(string)
+	if !ok {
+		return taskData, messageData, errors.New("'command' must be set")
+	}
+	subcommand, _ := args["subcommand"].(string)
+
+	taskData = adaptix.TaskData{
+		Type: adaptix.TASK_TYPE_TASK,
+		Sync: true,
+	}
+
+	var array []interface{}
+
+	switch command {
+
+	case "sleep":
+		var sleepTime int
+		sleep, err := getStringArg(args, "sleep")
+		if err != nil {
+			goto RET
+		}
+		jitter, _ := getFloatArg(args, "jitter")
+		jitterTime := int(jitter)
+
+		sleepInt, err := strconv.Atoi(sleep)
+		if err == nil {
+			sleepTime = sleepInt
+		} else {
+			var t time.Duration
+			t, err = time.ParseDuration(sleep)
+			if err != nil {
+				err = errors.New("sleep must be in '%h%m%s' format or number of seconds")
+				goto RET
+			}
+			sleepTime = int(t.Seconds())
+		}
+		if jitterTime < 0 || jitterTime > 100 {
+			err = errors.New("jitter must be from 0 to 100")
+			goto RET
+		}
+		if jitterTime > 0 {
+			messageData.Message = fmt.Sprintf("Task: sleep to %v with %v%% jitter", sleep, jitterTime)
+		} else {
+			messageData.Message = fmt.Sprintf("Task: sleep to %v", sleep)
+		}
+
+		array = []interface{}{COMMAND_PROFILE, 1, sleepTime, jitterTime}
+
+	case "terminate":
+		if subcommand == "thread" {
+			array = []interface{}{COMMAND_TERMINATE, 1}
+			messageData.Message = "Task: terminate agent thread"
+		} else if subcommand == "process" {
+			array = []interface{}{COMMAND_TERMINATE, 2}
+			messageData.Message = "Task: terminate agent process"
+		} else {
+			err = errors.New("subcommand must be 'thread' or 'process'")
+			goto RET
+		}
+
+	default:
+		err = fmt.Errorf("Command '%v' not found", command)
+		goto RET
+	}
+
+	taskData.Data, err = PackArray(array)
+
+RET:
+	return taskData, messageData, err
 }
 
 // ProcessData: beacon results — the listener frame (flags 0, u32 LE
