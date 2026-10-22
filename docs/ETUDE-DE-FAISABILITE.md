@@ -346,6 +346,19 @@ consomme l'exit method (1 thread / 2 process) avant le taskId, comme le
 natif. Reste : exécution de l'implant Windows (démo MVP), commandes
 fichiers/process/shell, IP interne, élévation, domaine, SMB.
 
+Itération 8 (2026-10-22) — génération vérifiée bout en bout + bug
+critique attrapé : la génération par le flux opérateur réel
+(`/agent/generate` → plugin → cargo → blob) livrait un blob dont TOUTE la
+transaction HTTP avait été éliminée par `-Oz` (tampon du verbe HTTP trop
+court — échec de capacité prouvable au compile-time ⇒ le code aval est
+mort et supprimé, voir les règles ci-dessus). Corrigé (`[u16; 5]`) ;
+l'extraction du gabarit passe en boucles manuelles (`memcmp` interdit) ;
+le blob opérateur régénéré embarque et prouve toutes les chaînes du
+listener (clé 16 o, hosts, URIs, hb_header, gabarit de page, alphabet
+base64) — 11 796/12 288 octets, PIC prouvé. La marge de budget est
+désormais mince (~500 o) : la prochaine fonctionnalité dépassera et
+nécessitera une relance dédiée.
+
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B
 détection en labo vs le beacon C, docs.

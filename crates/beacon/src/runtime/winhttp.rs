@@ -140,7 +140,10 @@ struct WideRequest {
     ua: [u16; 256],
     host: [u16; 256],
     path: [u16; 512],
-    verb: [u16; 4],
+    // "POST" = 4 chars + NUL = 5 u16. At 4 the wide() fit check ALWAYS
+    // failed and -Oz legally eliminated the whole transaction (a dead
+    // branch through a const buffer size is deleted, silently).
+    verb: [u16; 5],
     headers: [u16; 2048],
 }
 
@@ -156,7 +159,7 @@ pub unsafe fn post(wh: &WinHttp, req: &Request, resp: &mut [u8]) -> Option<usize
         ua: [0; 256],
         host: [0; 256],
         path: [0; 512],
-        verb: [0; 4],
+        verb: [0; 5],
         headers: [0; 2048],
     };
 

@@ -77,12 +77,27 @@ pub fn beat_header(
 
 /// Byte range of the encrypted payload inside a response page (see
 /// `extract_payload`); the range form lets the caller decrypt in place.
+///
+/// Manual comparisons (never `starts_with`/`ends_with`: they lower to a
+/// `memcmp` reference, and one reference pulls the whole LTO-fused
+/// compiler_builtins object into the blob — the same rule as manual copies).
 pub fn extract_payload_range(page: &[u8], prepend: &[u8], append: &[u8]) -> Option<(usize, usize)> {
-    if !page.starts_with(prepend)
-        || !page.ends_with(append)
-        || page.len() < prepend.len() + append.len()
-    {
+    if page.len() < prepend.len() + append.len() {
         return None;
+    }
+    let mut i = 0usize;
+    while i < prepend.len() {
+        if page[i] != prepend[i] {
+            return None;
+        }
+        i += 1;
+    }
+    let mut i = 0usize;
+    while i < append.len() {
+        if page[page.len() - append.len() + i] != append[i] {
+            return None;
+        }
+        i += 1;
     }
     Some((prepend.len(), page.len() - append.len()))
 }
