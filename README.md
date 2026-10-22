@@ -36,6 +36,8 @@ beacon (`src_beacon` in the original).
 - **[Feasibility study](docs/ETUDE-DE-FAISABILITE.md)** (french) — architecture,
   per-invariant analysis, risks, phased roadmap. Verdict: **GO conditionnel**,
   pending a phase 0 toolchain spike.
+- **[Parity tracking](docs/PARITE.md)** (french) — feature-by-feature mapping
+  between specter and this rewrite, updated at every iteration.
 
 ## Layout
 
