@@ -104,6 +104,12 @@ function GenerateUI(listeners_type)
 
     let checkDebug = form.create_check("Debug (specter.log next to the implant)");
 
+    let checkSleepMask = form.create_check("Sleep mask (encrypted sleep)");
+    checkSleepMask.setChecked(true);
+
+    let checkHooks = form.create_check("Evasion hooks (ETW/AMSI)");
+    checkHooks.setChecked(true);
+
     let layout = form.create_gridlayout();
     layout.addWidget(labelFormat,   0, 0, 1, 1);
     layout.addWidget(comboFormat,   0, 1, 1, 1);
@@ -115,6 +121,8 @@ function GenerateUI(listeners_type)
     layout.addWidget(dateKill,     3, 1, 1, 1);
     layout.addWidget(timeKill,     4, 1, 1, 1);
     layout.addWidget(checkDebug,    5, 0, 1, 1);
+    layout.addWidget(checkSleepMask, 6, 0, 1, 1);
+    layout.addWidget(checkHooks,    7, 0, 1, 1);
 
     let container = form.create_container();
     container.put("format",     comboFormat);
@@ -124,6 +132,8 @@ function GenerateUI(listeners_type)
     container.put("kill_date",  dateKill);
     container.put("kill_time",  timeKill);
     container.put("debug",       checkDebug);
+    container.put("sleep_mask",  checkSleepMask);
+    container.put("hooks",       checkHooks);
 
     let panel = form.create_panel();
     panel.setLayout(layout);
@@ -131,7 +141,7 @@ function GenerateUI(listeners_type)
     return {
         ui_panel: panel,
         ui_container: container,
-        ui_height: 240,
+        ui_height: 270,
         ui_width: 420
     }
 }

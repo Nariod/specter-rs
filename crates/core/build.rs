@@ -59,6 +59,25 @@ fn main() {
     // const-folds every site away, and absence is fine for the guard).
     manifest.push("specter.log".to_string());
     manifest.push("specter-rs: bootstrap ok".to_string());
+    // Bootstrap stage trace (iteration 15): names the failing stage when a
+    // real-Windows bootstrap dies before the instance exists.
+    manifest.push("bs: log open".to_string());
+    manifest.push("bs: modules ok".to_string());
+    manifest.push("bs: exit ok".to_string());
+    manifest.push("bs: syscalls ok".to_string());
+    manifest.push("bs: clock ok".to_string());
+    manifest.push("bs: etw ok".to_string());
+    manifest.push("bs: gadget ok".to_string());
+    manifest.push("bs: sleepmask ok".to_string());
+    manifest.push("bs: amsi ok".to_string());
+    manifest.push("bs: heap ok".to_string());
+    manifest.push("bs: winhttp ok".to_string());
+    manifest.push("bs: sysinfo ok".to_string());
+    manifest.push("bs: instance ok".to_string());
+    manifest.push("bs: FAIL modules".to_string());
+    manifest.push("bs: FAIL exit".to_string());
+    manifest.push("bs: FAIL syscalls".to_string());
+    manifest.push("bs: FAIL clock".to_string());
     manifest.push("check-in: begin".to_string());
     manifest.push("check-in: ok".to_string());
     manifest.push("bof: exec".to_string());

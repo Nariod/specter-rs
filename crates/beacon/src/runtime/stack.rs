@@ -16,7 +16,16 @@
 
 use core::arch::naked_asm;
 
-/// Probe loop, page by page (x64 page = 0x1000).
+/// Probe loop, page by page (x64 page = 0x1000). MSVC contract: RAX holds
+/// the frame size on entry and MUST come back unchanged (the caller does
+/// `sub rsp, rax` with the full size and addresses the frame from the
+/// original offsets). The walk counter lives in R10.
+///
+/// The iteration-15 bug this replaced: an unbalanced epilogue (`push rcx`
+/// then `pop rax; pop rcx`) made the final `ret` pop a caller stack value
+/// instead of the return address — every frame over one page returned into
+/// garbage, which is what killed the real-Windows beacon from its first
+/// instruction on a large frame.
 ///
 /// # Safety
 ///
@@ -26,20 +35,22 @@ use core::arch::naked_asm;
 pub unsafe extern "C" fn ___chkstk_ms() {
     naked_asm!(
         "push rcx",
-        "cmp rax, 0x1000",
-        "lea rcx, [rsp + 8]", // rcx = top of the probed region
-        "jb 1f",              // smaller than a page: single probe below
+        "push r10",
+        "mov r10, rax",
+        "lea rcx, [rsp + 24]", // above the return address and both pushes
+        "cmp r10, 0x1000",
+        "jb 1f", // smaller than a page: single probe below
         "2:",
         "sub rcx, 0x1000",
         "test qword ptr [rcx], rcx", // touch the page (grows the stack)
-        "sub rax, 0x1000",
-        "cmp rax, 0x1000",
+        "sub r10, 0x1000",
+        "cmp r10, 0x1000",
         "ja 2b", // keep probing while > 1 page remains
         "1:",
-        "sub rcx, rax",
+        "sub rcx, r10",
         "test qword ptr [rcx], rcx", // final probe at the exact bottom
-        "pop rax",
+        "pop r10",
         "pop rcx",
-        "ret",
+        "ret", // RAX = frame size, untouched
     );
 }

