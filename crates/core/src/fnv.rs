@@ -67,7 +67,14 @@ pub const fn fnv1a64_utf16_ci(units: &[u16]) -> u64 {
 /// The input must be lowercase ASCII (module names are).
 #[inline]
 pub const fn fnv1a64_wide_ascii_ci(s: &str) -> u64 {
-    let bytes = s.as_bytes();
+    fnv1a64_bytes_wide_ci(s.as_bytes())
+}
+
+/// FNV-1a 64 over ASCII bytes widened to UTF-16 LE code units with case
+/// folding — the runtime form of [`fnv1a64_wide_ascii_ci`] when the module
+/// name comes as raw bytes (the BOF import table, not a `&str` literal).
+#[inline]
+pub const fn fnv1a64_bytes_wide_ci(bytes: &[u8]) -> u64 {
     let mut hash = FNV_OFFSET;
     let mut i = 0;
     while i < bytes.len() {

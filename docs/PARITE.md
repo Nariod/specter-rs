@@ -95,7 +95,7 @@ Dernière mise à jour : **2026-10-27** (phase 3, itération 13 : download/uploa
 | Process : `ps run` (lancement + PPID spoofing) | — | À faire | Nécessite l'infrastructure jobs (TASK_TYPE_JOB) |
 | `disks` (lecteurs montés) | Beacon : `GetLogicalDrives` + `GetDriveTypeA` ; plugin Go : rendu + synchro GUI lecteurs | Fait* | Itération 12 : round-trip réel vérifié (rejeu). *Exécution Win32 = démo VM |
 | `shell` (cmd.exe/PowerShell interactif) | — | À faire | Phase 3 |
-| `bof` (loader COFF, sync + async thread pool) | — | À faire | Phase 3 ; candidat n°1 du gain Rust (parsing non fiable) |
+| `bof` (loader COFF) — l'intérêt central du C2 | Beacon : `core::coff` (parse COFF x64 pur, borné — 512 symboles, relocations 10 octets) + chargeur `beacon::coff` (port de runner.c : layout data→mapFuncs→code, `VirtualAlloc` RWX, relocations additives ADDR64/ADDR32NB/REL32..REL32_5 exactes, ADDR32 non patché comme l'original, imports `__imp_MODULE$Func` par hash via PEB puis LoadLibraryA, table Beacon API par hash — Output/Printf/DataParse/Int/Short/Length/Extract/Ptr, `BeaconPrintf` C-variadic natif → formateur pur borné `%s %d %u %x %X %c %p` sans flottants, .pdata enregistré via RtlAddFunctionTable pour les BOFs SEH, erreur SYMBOL = nom du symbole) ; records : lifecycle EXEC_BOF (état 1/2) dans la file de cycle, outputs EXEC_BOF_OUT dans une file heap drainée au POST par records entiers (fin en dernier — l'ordre natif) ; plugin Go : CreateCommand `execute bof` (base64 + fallback brut+NUL), ProcessData EXEC_BOF/EXEC_BOF_OUT portés (map bof_output), dialogues ax natifs | Fait* | Itération 14. Écarts documentés : async séquentiel (state 1 puis exécution inline — pas de pool de threads), une région RWX au lieu du split data/code RX, sous-ensemble de l'API Beacon (tokens/format/KV à suivre), pas de wrapper CreateThread pour les BOFs qui spawnent leurs threads. *Exécution Win32 = démo VM ; parsing/relocations pinnés par tests host (COFF synthétique) |
 | `tkn` (steal/make/impersonate/revert/list/remove/getuid/privs) | — | À faire | Phase 3 |
 | `socks` (SOCKS5), `lportfwd`, `rportfwd` | — | À faire | Phase 3 |
 | `screenshot` | — | À faire | Phase 3 |
@@ -121,6 +121,10 @@ Dernière mise à jour : **2026-10-27** (phase 3, itération 13 : download/uploa
 
 | Apport | Statut |
 |---|---|
+| Canal debug à la génération (case `debug` → `specter.log` : bootstrap, check-in begin/ok, bof exec/done/error ; replié hors du blob par -Oz quand désactivé) | Fait (itération 14) |
+
+| Apport | Statut |
+|---|---|
 | CI 4 couches (fmt, clippy `-D warnings`, tests host, gardes blob + preuve PIC par double base) | Fait |
 | Tests host avec PEB/images PE mock (le C n'a pas d'équivalent) | Fait |
 | Manifeste de chaînes + garde anti-strings automatisée | Fait |
@@ -137,6 +141,6 @@ Dernière mise à jour : **2026-10-27** (phase 3, itération 13 : download/uploa
 | Runtime | 6 | 0 | 1 | 0 |
 | Évasion | 5 | 2 | 2 | 0 |
 | Transports | 0 | 3 | 1 | 0 |
-| Commandes | 5 | 0 | 5 | 0 |
+| Commandes | 6 | 0 | 4 | 0 |
 | Wire | 0 | 1 | 0 | 0 |
 | Serveur Go | 0 | 2 | 0 | 3 |

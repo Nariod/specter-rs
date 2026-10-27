@@ -166,6 +166,43 @@ fn replay_check_in_against_real_listener() {
     assert!(transport::begin_results(&mut w));
     let mut handled = 0usize;
     while r.remaining() >= 8 {
+        // `execute bof` tasks (inline parse, like SAVEMEMORY): the replay
+        // fabricates the full record sequence the loader produces —
+        // started (async), one output callback, finished.
+        if r.peek_u32_le() == Some(transport::COMMAND_EXEC_BOF) {
+            match transport::parse_exec_bof(&mut r) {
+                Some(task) => {
+                    println!(
+                        "[replay] task {:08x}: execute bof ({} bytes, entry '{}', async={})",
+                        task.task_id,
+                        task.bof.len(),
+                        std::string::String::from_utf8_lossy(task.entry_name()),
+                        task.async_flag
+                    );
+                    if task.async_flag {
+                        assert!(transport::push_bof_lifecycle(
+                            &mut w,
+                            task.task_id,
+                            transport::BOF_STATE_STARTED
+                        ));
+                    }
+                    assert!(transport::push_bof_output(
+                        &mut w,
+                        task.task_id,
+                        transport::CALLBACK_OUTPUT_UTF8,
+                        b"[replay] BOF output (fabricated: the Windows loader runs the COFF)"
+                    ));
+                    assert!(transport::push_bof_lifecycle(
+                        &mut w,
+                        task.task_id,
+                        transport::BOF_STATE_FINISHED
+                    ));
+                    handled += 1;
+                }
+                None => break,
+            }
+            continue;
+        }
         // SAVEMEMORY chunks (upload content): consumed inline, no ack.
         if r.peek_u32_le() == Some(transport::COMMAND_SAVEMEMORY) {
             match transport::parse_save_memory(&mut r) {

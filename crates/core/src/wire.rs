@@ -80,6 +80,12 @@ impl<'a> Writer<'a> {
     pub fn u32_le(&mut self, v: u32) -> bool {
         self.push(&v.to_le_bytes())
     }
+
+    /// Bytes still fitting in the buffer.
+    #[inline]
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
 }
 
 /// Bounded reader (the Go Packer semantics).

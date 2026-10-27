@@ -55,6 +55,30 @@ fn main() {
     manifest.push("winhttp.dll".to_string());
     manifest.push("iphlpapi.dll".to_string());
     manifest.push("netapi32.dll".to_string());
+    // Debug-channel literals (config::DEBUG builds only; a false build
+    // const-folds every site away, and absence is fine for the guard).
+    manifest.push("specter.log".to_string());
+    manifest.push("specter-rs: bootstrap ok".to_string());
+    manifest.push("check-in: begin".to_string());
+    manifest.push("check-in: ok".to_string());
+    manifest.push("bof: exec".to_string());
+    manifest.push("bof: done".to_string());
+    manifest.push("bof: error".to_string());
+    // BOF loader literals: Beacon API names (hash dispatch), the import
+    // naming convention of runner.c, the .pdata SEH registration probe,
+    // and the append-seek of the debug log.
+    manifest.push("BeaconOutput".to_string());
+    manifest.push("BeaconPrintf".to_string());
+    manifest.push("BeaconDataParse".to_string());
+    manifest.push("BeaconDataInt".to_string());
+    manifest.push("BeaconDataShort".to_string());
+    manifest.push("BeaconDataLength".to_string());
+    manifest.push("BeaconDataExtract".to_string());
+    manifest.push("BeaconDataPtr".to_string());
+    manifest.push("__imp_".to_string());
+    manifest.push("BEACON".to_string());
+    manifest.push(".pdata".to_string());
+    manifest.push("SetFilePointer".to_string());
     manifest.sort();
     manifest.dedup();
     let manifest = serde_json::to_string(&manifest).expect("manifest serialize");

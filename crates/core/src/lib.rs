@@ -39,6 +39,7 @@ fn spt_panic(_info: &core::panic::PanicInfo) -> ! {
 
 pub mod amsi;
 pub mod beat;
+pub mod coff;
 pub mod config;
 pub mod fnv;
 pub mod heap;

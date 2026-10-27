@@ -17,6 +17,7 @@
 //!   "jitter_ms": 2000,
 //!   "watermark": 305419896,
 //!   "kill_epoch": 0,
+//!   "debug": false,
 //!   "profile": { ...malleable profile v2... }
 //! }
 //! ```
@@ -114,6 +115,10 @@ pub struct ConfigModel {
     pub jitter_ms: u32,
     pub watermark: u32,
     pub kill_epoch: u64,
+    /// Debug channel (generation dialog `debug` checkbox): the beacon logs
+    /// its lifecycle to `specter.log` next to the implant. Off by default;
+    /// every debug literal folds out of the blob under -Oz when false.
+    pub debug: bool,
     pub profile: ProfileModel,
 }
 
@@ -321,6 +326,7 @@ pub fn parse_config(json: &str) -> Result<ConfigModel, String> {
         jitter_ms: u64_of(&v, "jitter_ms")? as u32,
         watermark: u64_of(&v, "watermark")? as u32,
         kill_epoch: u64_of(&v, "kill_epoch")?,
+        debug: v.get("debug").and_then(|b| b.as_bool()).unwrap_or(false),
         profile: profile_of(field(&v, "profile")?)?,
     })
 }
@@ -489,11 +495,13 @@ pub fn render(model: &ConfigModel) -> String {
          pub const SLEEP_MS: u32 = {sleep};\n\
          pub const JITTER_MS: u32 = {jitter};\n\
          pub const WATERMARK: u32 = {wm};\n\
-         pub const KILL_EPOCH: u64 = {kill};\n\n",
+         pub const KILL_EPOCH: u64 = {kill};\n\
+         pub const DEBUG: bool = {dbg};\n\n",
         sleep = model.sleep_ms,
         jitter = model.jitter_ms,
         wm = model.watermark,
         kill = model.kill_epoch,
+        dbg = model.debug,
     ));
     out.push_str(&format!(
         "pub const ROTATION: Rotation = {rot};\n\
@@ -571,6 +579,7 @@ pub fn default_config_json() -> String {
         "jitter_ms": 2000,
         "watermark": 0,
         "kill_epoch": 0,
+        "debug": false,
         "profile": model,
     });
     serde_json::to_string(&wrapper).expect("serializing default config")

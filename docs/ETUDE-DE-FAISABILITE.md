@@ -427,6 +427,30 @@ sauvé côté serveur), upload complet (chunk consommé + tâche accusée,
 « File successfully uploaded »), exfil stop accusé. Budget relevé
 20 480 → 24 576 en commit dédié (blob 22 052).
 
+Itération 14 (2026-10-27) — le cœur du C2 : loader **BOF** + canal
+**debug**. Côté beacon : `core::coff` (parse COFF x64 pur et borné —
+l'original fait tout à la main dans un process où un segfault coûte le
+beacon ; relocation COFF = **10 octets** (rva 4 + index 4 + type 2), pas
+8 : attrapé en écrivant le parseur puis confirmé sur le runner.c natif,
+qui a aussi révélé que les patchs sont **additifs** (`*P += S`, pas
+`*P = S`) et que ADDR32 n'est jamais patché). Chargeur `beacon::coff` :
+port fidèle de runner.c (layout data→mapFuncs→code, trampoline des
+externals, `__imp_MODULE$Func` par hash, .pdata/RtlAddFunctionTable pour
+les BOFs SEH). `BeaconPrintf` sans CRT : **C-variadic natif** (`extern "C"
+fn(..., args: ...)`, stable sur la toolchain épinglée — `next_arg::<u64>`
+lit le flux d'entiers win64) vers le formateur pur borné (pas de
+`_vsnprintf` ntdll, pas de trampoline naked : plus simple et plus sûr).
+Canal debug : case `debug` → `specter.log` (CreateFileA OPEN_ALWAYS +
+SetFilePointer END), points de log repliés hors du blob par -Oz quand
+désactivé. Plugin Go : CreateCommand `execute bof` + ProcessData
+EXEC_BOF/EXEC_BOF_OUT (map bof_output) portés, dialogues ax natifs.
+Règle pipeline nouvelle : **`==` sur des tranches d'octets dans le beacon
+génère un `memcmp`** (reference compiler_builtins) — comparaisons
+manuelles partout (déjà la règle pour starts_with, maintenant pour `==`).
+Budget relevé 24 576 → 32 768 en commit dédié (blob 29 598 ; harnais Go :
+29 673). Écarts documentés dans PARITE.md : async séquentiel, région RWX
+unique, sous-ensemble API Beacon.
+
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B
 détection en labo vs le beacon C, docs.

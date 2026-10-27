@@ -155,6 +155,33 @@ RC4(session, frame(flags=0, u32 LE origLen,
   u32 BE sleepSec || u32 BE jitterPct` → « Sleep time has been changed ».
 - terminate : le beacon sort silencieusement ; pas d'accusé.
 
+## BOF — `execute bof` (itération 14, pinné sur beacon_agent pl_main.go/pl_utils.go)
+
+Tâche (`PackArray` : bool = 1 octet, bytes = brut, string = u32 LE len+NUL,
+int = u32 LE) :
+
+```
+u32 LE 50 || u8 async || pack_string "go" || u32 LE bofLen || bof (COFF)
+    || u32 LE paramsLen || params || u32 LE taskId
+```
+
+Résultats du beacon (ordre natif ; le lifecycle started va dans la file de
+cycle, les outputs dans la file heap drainée par records entiers) :
+
+- `COMMAND_EXEC_BOF` (50) : `u32 BE taskId || u32 BE 50 || u8 état`
+  (1 = async started, Completed=false ; 2 = finished, Completed=true).
+- `COMMAND_EXEC_BOF_OUT` (51) : `u32 BE taskId || u32 BE 51 || u32 BE
+  outputType || array output`. Types : erreurs de chargement 0x101-0x105
+  (PARSE/SYMBOL/MAX_FUNCS/ENTRY/ALLOC — SYMBOL porte le nom du symbole),
+  callbacks BOF 0x0d (error), 0x1e (OEM), 0x20 (UTF8). Côté serveur, la
+  map `bof_output` (par ProcessData) n'étiquette « BOF output » que le
+  premier record de la tâche.
+
+Semantics loader : relocations additives (`ADDR64 += S`, `ADDR32NB += S -
+base`, `REL32_k += S - P - (4+k)`, ADDR32 jamais patché — runner.c),
+externals résolus dans une page trampoline `mapFuncs` (les REL32 pointent
+le slot), entry `go(args, argslen)`.
+
 ## Écart avec la version précédente de ce document
 
 La relecture de la source serveur (2026-10-22, itération 6) a remplacé la

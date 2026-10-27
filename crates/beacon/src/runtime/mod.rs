@@ -7,6 +7,7 @@
 
 pub mod amsi;
 pub mod bootstrap;
+pub mod debug;
 pub mod hwbp;
 pub mod retspoof;
 pub mod sleepmask;
