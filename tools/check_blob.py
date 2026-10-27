@@ -42,7 +42,9 @@ PRINTABLE = range(0x20, 0x7F)
 # shell, bof, tokens and forwarding come next.
 # Raised 20480 -> 24576 for the transfer commands (download/upload/exfil:
 # streaming download state, heap upload accumulation, chunk plumbing).
-DEFAULT_MAX_SIZE = 24576
+# Raised 24576 -> 32768 for the BOF loader (COFF parse, relocations, Beacon
+# API shims, the pending output queue) and the debug channel: 29.6 KiB.
+DEFAULT_MAX_SIZE = 32768
 
 
 def find_strings(blob):
