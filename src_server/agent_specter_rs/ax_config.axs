@@ -33,6 +33,16 @@ function RegisterCommands(listenerType)
     cmd_mv.addArgString("src", true);
     cmd_mv.addArgString("dst", true);
 
+    let cmd_getuid = ax.create_command("getuid", "Prints the User ID associated with the current token", "getuid", "Task: get username of current token");
+
+    let cmd_disks = ax.create_command("disks", "Lists mounted drives on current system", "disks", "Task: show mounted disks");
+
+    let _cmd_ps_list = ax.create_command("list", "List of processes", "ps list", "Task: show process list");
+    let _cmd_ps_kill = ax.create_command("kill", "Kill a process", "ps kill 1234", "Task: kill process");
+    _cmd_ps_kill.addArgInt("pid", true);
+    let cmd_ps = ax.create_command("ps", "Process manager");
+    cmd_ps.addSubCommands([_cmd_ps_list, _cmd_ps_kill]);
+
     let cmd_sleep = ax.create_command("sleep", "Sets sleep time", "sleep 30m5s 10", "Task: sleep");
     cmd_sleep.addArgString("sleep", true, "Time in '%h%m%s' format or number of seconds");
     cmd_sleep.addArgInt("jitter", false, "Max random amount of time in % added to sleep");
@@ -43,7 +53,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_ps, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 

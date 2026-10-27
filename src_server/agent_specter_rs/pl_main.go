@@ -14,6 +14,7 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"sort"
 	"crypto/rc4"
 	"encoding/binary"
 	"encoding/hex"
@@ -59,6 +60,8 @@ type Teamserver interface {
 	TsAgentConsoleOutput(agentId string, messageType int, message string, clearText string, store bool)
 	TsWin32Error(errorCode uint) string
 	TsClientGuiFilesWindows(taskData adaptix.TaskData, path string, files []adaptix.ListingFileDataWin)
+	TsClientGuiDisksWindows(taskData adaptix.TaskData, drives []adaptix.ListingDrivesDataWin)
+	TsClientGuiProcessWindows(taskData adaptix.TaskData, process []adaptix.ListingProcessDataWin)
 	TsConvertUTF8toCp(data string, cp int) string
 }
 
@@ -115,6 +118,10 @@ const (
 	COMMAND_RM        = 17
 	COMMAND_COPY      = 12
 	COMMAND_MV        = 18
+	COMMAND_GETUID     = 22
+	COMMAND_DISKS      = 15
+	COMMAND_PS_LIST    = 41
+	COMMAND_PS_KILL    = 42
 	COMMAND_ERROR     = 0x1111ffff
 )
 
@@ -648,6 +655,27 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 
 		array = []interface{}{COMMAND_PROFILE, 1, sleepTime, jitterTime}
 
+	case "getuid":
+		array = []interface{}{COMMAND_GETUID}
+
+	case "disks":
+		array = []interface{}{COMMAND_DISKS}
+
+	case "ps":
+		if subcommand == "list" {
+			array = []interface{}{COMMAND_PS_LIST}
+		} else if subcommand == "kill" {
+			var pid float64
+			pid, err = getFloatArg(args, "pid")
+			if err != nil {
+				goto RET
+			}
+			array = []interface{}{COMMAND_PS_KILL, int(pid)}
+		} else {
+			err = errors.New("subcommand must be 'list' or 'kill'")
+			goto RET
+		}
+
 	case "pwd":
 		array = []interface{}{COMMAND_PWD}
 
@@ -898,6 +926,225 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 				}
 			}
 			Ts.TsClientGuiFilesWindows(task, rootPath, items)
+
+		case COMMAND_GETUID:
+			if false == packer.CheckPacker([]string{"byte", "array", "array"}) {
+				goto HANDLER
+			}
+			high := packer.ParseInt8()
+			domain := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+			username := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+			message := ""
+			if username != "" {
+				if domain != "" {
+					username = domain + "\\" + username
+				}
+				message = fmt.Sprintf("You are '%v'", username)
+				if high > 0 {
+					message += " (elevated)"
+				}
+			}
+			task.Message = message
+
+		case COMMAND_DISKS:
+			if false == packer.CheckPacker([]string{"byte", "int"}) {
+				goto HANDLER
+			}
+			result := packer.ParseInt8()
+			var drives []adaptix.ListingDrivesDataWin
+
+			if result == 0 {
+				errorCode := packer.ParseInt32()
+				task.Message = fmt.Sprintf("Error [%d]: %s", errorCode, Ts.TsWin32Error(errorCode))
+				task.MessageType = adaptix.MESSAGE_ERROR
+
+			} else {
+				drivesCount := int(packer.ParseInt32())
+
+				for i := 0; i < drivesCount; i++ {
+					if false == packer.CheckPacker([]string{"byte", "int"}) {
+						goto HANDLER
+					}
+					var driveData adaptix.ListingDrivesDataWin
+					driveCode := packer.ParseInt8()
+					driveType := packer.ParseInt32()
+
+					driveData.Name = fmt.Sprintf("%c:", driveCode)
+					if driveType == 2 {
+						driveData.Type = "USB"
+					} else if driveType == 3 {
+						driveData.Type = "Hard Drive"
+					} else if driveType == 4 {
+						driveData.Type = "Network Drive"
+					} else if driveType == 5 {
+						driveData.Type = "CD-ROM"
+					} else {
+						driveData.Type = "Unknown"
+					}
+
+					drives = append(drives, driveData)
+				}
+
+				OutputText := fmt.Sprintf(" %-5s  %s\n", "Drive", "Type")
+				OutputText += fmt.Sprintf(" %-5s  %s", "-----", "-----")
+				for _, item := range drives {
+					OutputText += fmt.Sprintf("\n %-5s  %s", item.Name, item.Type)
+				}
+				task.Message = "List of mounted drives:"
+				task.ClearText = OutputText
+			}
+			Ts.TsClientGuiDisksWindows(task, drives)
+
+		case COMMAND_PS_LIST:
+			if false == packer.CheckPacker([]string{"byte", "int"}) {
+				goto HANDLER
+			}
+			result := packer.ParseInt8()
+
+			var proclist []adaptix.ListingProcessDataWin
+
+			if result == 0 {
+				errorCode := packer.ParseInt32()
+				task.Message = fmt.Sprintf("Error [%d]: %s", errorCode, Ts.TsWin32Error(errorCode))
+				task.MessageType = adaptix.MESSAGE_ERROR
+
+			} else {
+				processCount := int(packer.ParseInt32())
+
+				if processCount == 0 {
+					task.Message = "Failed to get process list"
+					task.MessageType = adaptix.MESSAGE_ERROR
+					break
+				}
+
+				contextMaxSize := 10
+
+				for i := 0; i < processCount; i++ {
+					if false == packer.CheckPacker([]string{"word", "word", "word", "byte", "byte", "array", "array", "array"}) {
+						goto HANDLER
+					}
+					procData := adaptix.ListingProcessDataWin{
+						Pid:       uint(packer.ParseInt16()),
+						Ppid:      uint(packer.ParseInt16()),
+						SessionId: uint(packer.ParseInt16()),
+						Arch:      "",
+					}
+
+					isArch64 := packer.ParseInt8()
+					if isArch64 == 0 {
+						procData.Arch = "x32"
+					} else if isArch64 == 1 {
+						procData.Arch = "x64"
+					}
+
+					elevated := packer.ParseInt8()
+					domain := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+					username := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+
+					if username != "" {
+						procData.Context = username
+						if domain != "" {
+							procData.Context = domain + "\\" + username
+						}
+						if elevated > 0 {
+							procData.Context += " *"
+						}
+
+						if len(procData.Context) > contextMaxSize {
+							contextMaxSize = len(procData.Context)
+						}
+					}
+
+					procData.ProcessName = Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+					proclist = append(proclist, procData)
+				}
+
+				type TreeProc struct {
+					Data     adaptix.ListingProcessDataWin
+					Children []*TreeProc
+				}
+
+				procMap := make(map[uint]*TreeProc)
+				var roots []*TreeProc
+
+				for _, proc := range proclist {
+					node := &TreeProc{Data: proc}
+					procMap[proc.Pid] = node
+				}
+
+				for _, node := range procMap {
+					if node.Data.Ppid == 0 || node.Data.Pid == node.Data.Ppid {
+						roots = append(roots, node)
+					} else if parent, ok := procMap[node.Data.Ppid]; ok {
+						parent.Children = append(parent.Children, node)
+					} else {
+						roots = append(roots, node) // orphaned node
+					}
+				}
+
+				sort.Slice(roots, func(i, j int) bool {
+					return roots[i].Data.Pid < roots[j].Data.Pid
+				})
+
+				var sortChildren func(node *TreeProc)
+				sortChildren = func(node *TreeProc) {
+					sort.Slice(node.Children, func(i, j int) bool {
+						return node.Children[i].Data.Pid < node.Children[j].Data.Pid
+					})
+					for _, child := range node.Children {
+						sortChildren(child)
+					}
+				}
+				for _, root := range roots {
+					sortChildren(root)
+				}
+
+				format := fmt.Sprintf(" %%-5v   %%-5v   %%-7v   %%-5v   %%-%vv   %%v", contextMaxSize)
+				OutputText := fmt.Sprintf(format, "PID", "PPID", "Session", "Arch", "Context", "Process")
+				OutputText += fmt.Sprintf("\n"+format, "---", "----", "-------", "----", "-------", "-------")
+
+				var lines []string
+
+				var formatTree func(node *TreeProc, prefix string, isLast bool)
+				formatTree = func(node *TreeProc, prefix string, isLast bool) {
+					branch := "\u251C\u2500 "
+					if isLast {
+						branch = "\u2514\u2500 "
+					}
+					treePrefix := prefix + branch
+					data := node.Data
+
+					line := fmt.Sprintf(format, data.Pid, data.Ppid, data.SessionId, data.Arch, data.Context, treePrefix+data.ProcessName)
+					lines = append(lines, line)
+
+					childPrefix := prefix
+					if isLast {
+						childPrefix += "    "
+					} else {
+						childPrefix += "\u2502   "
+					}
+
+					for i, child := range node.Children {
+						formatTree(child, childPrefix, i == len(node.Children)-1)
+					}
+				}
+
+				for i, root := range roots {
+					formatTree(root, "", i == len(roots)-1)
+				}
+
+				OutputText += "\n" + strings.Join(lines, "\n")
+				task.Message = "Process list:"
+				task.ClearText = OutputText
+			}
+			Ts.TsClientGuiProcessWindows(task, proclist)
+
+		case COMMAND_PS_KILL:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			pid := packer.ParseInt32()
+			task.Message = fmt.Sprintf("Process %d killed", pid)
 
 		case COMMAND_MKDIR:
 			if false == packer.CheckPacker([]string{"array"}) {

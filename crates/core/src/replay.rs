@@ -254,6 +254,56 @@ fn replay_check_in_against_real_listener() {
                 ));
                 handled += 1;
             }
+            Some((transport::Task::Getuid, id)) => {
+                println!("[replay] task {id:08x}: getuid (fabricated)");
+                assert!(transport::push_getuid_result(
+                    &mut w,
+                    id,
+                    false,
+                    b"MEGACORP",
+                    b"nariod"
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::Disks, id)) => {
+                println!("[replay] task {id:08x}: disks (fabricated)");
+                assert!(transport::push_disks_header(&mut w, id, 2));
+                assert!(transport::push_disks_entry(&mut w, b'C', 3));
+                assert!(transport::push_disks_entry(&mut w, b'D', 5));
+                handled += 1;
+            }
+            Some((transport::Task::PsList, id)) => {
+                println!("[replay] task {id:08x}: ps list (fabricated)");
+                assert!(transport::push_ps_list_header(&mut w, id, 2));
+                let root = transport::PsEntry {
+                    pid: 4,
+                    ppid: 0,
+                    session: 0,
+                    arch: 1,
+                    elevated: false,
+                    domain: b"",
+                    username: b"SYSTEM",
+                    name: b"System",
+                };
+                let child = transport::PsEntry {
+                    pid: 1234,
+                    ppid: 4,
+                    session: 1,
+                    arch: 1,
+                    elevated: false,
+                    domain: b"",
+                    username: b"nariod",
+                    name: b"testhost.exe",
+                };
+                assert!(transport::push_ps_entry(&mut w, &root));
+                assert!(transport::push_ps_entry(&mut w, &child));
+                handled += 1;
+            }
+            Some((transport::Task::PsKill { pid }, id)) => {
+                println!("[replay] task {id:08x}: ps kill {pid} (fabricated)");
+                assert!(transport::push_ps_kill_result(&mut w, id, pid));
+                handled += 1;
+            }
             Some((transport::Task::Terminate, id)) => {
                 println!("[replay] task {id:08x}: terminate");
                 return; // the real beacon exits here
