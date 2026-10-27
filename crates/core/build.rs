@@ -80,6 +80,11 @@ fn main() {
     manifest.push("si: join ok".to_string());
     manifest.push("si: elev ok".to_string());
     manifest.push("si: os ok".to_string());
+    manifest.push("sm: bounds".to_string());
+    manifest.push("sm: ssn".to_string());
+    manifest.push("sm: probe".to_string());
+    manifest.push("sm: probe1".to_string());
+    manifest.push("sm: probe2".to_string());
     manifest.push("bs: instance ok".to_string());
     manifest.push("bs: FAIL modules".to_string());
     manifest.push("bs: FAIL exit".to_string());

