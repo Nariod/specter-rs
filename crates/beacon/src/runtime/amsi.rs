@@ -110,7 +110,9 @@ pub unsafe fn install(peb: *mut Peb, ntdll: *mut c_void, sys: &Syscalls, hooks: 
     if register.is_null() {
         return; // no notifications: the already-mapped path still applies
     }
-    let register = *(register as *const LdrRegisterDllNotificationFn);
+    let register = core::mem::transmute::<*const core::ffi::c_void, LdrRegisterDllNotificationFn>(
+        register as *const core::ffi::c_void,
+    );
     let mut cookie: usize = 0;
     register(
         0,

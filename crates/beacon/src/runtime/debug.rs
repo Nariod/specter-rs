@@ -8,7 +8,7 @@
 //! anti-strings manifest regardless (absence is fine for the guardrail).
 
 use specter_core::config;
-use specter_core::fnv::fnv1a64;
+use specter_core::fnv::{fnv1a64, fnv1a64_bytes_wide_ci};
 use specter_core::peb;
 
 use crate::runtime::bootstrap::Instance;
@@ -31,28 +31,43 @@ pub fn enabled() -> bool {
     config::DEBUG
 }
 
-/// Open (or create) the log file and seek to its end. Failures leave the
-/// handle at 0: every log call is then a no-op — the beacon never behaves
+/// Open the log file with nothing but the PEB (kernel32 resolved on the
+/// spot): usable from the very first instruction of the bootstrap, long
+/// before an instance exists. Returns the handle (0/-1 = disabled).
+///
+/// # Safety
+///
+/// Windows x64 with a valid TEB/PEB.
+pub unsafe fn open_handle() -> isize {
+    if !enabled() {
+        return 0;
+    }
+    let kernel32 = peb::find_module(
+        crate::runtime::bootstrap::get_peb(),
+        fnv1a64_bytes_wide_ci(b"kernel32.dll"),
+    );
+    if kernel32.is_null() {
+        return 0;
+    }
+    open_in(kernel32)
+}
+
+/// Open (or create) the log file against a resolved kernel32. Failures
+/// return -1: every log call is then a no-op — the beacon never behaves
 /// differently because of the debug channel.
 ///
 /// # Safety
 ///
-/// Beacon thread; kernel32 resolved on the instance.
-pub unsafe fn open(instance: &mut Instance) {
-    if !enabled() {
-        return;
-    }
-    let kernel32 = instance.kernel32;
-    if kernel32.is_null() {
-        return;
-    }
+/// `kernel32` must be a mapped module base with intact headers.
+unsafe fn open_in(kernel32: *mut core::ffi::c_void) -> isize {
     let create = peb::find_export(kernel32, H_CREATE_FILE_A);
     let tell = peb::find_export(kernel32, H_SET_FILE_POINTER);
     if create.is_null() || tell.is_null() {
-        return;
+        return -1;
     }
-    let create = *(create
-        as *const unsafe extern "system" fn(
+    let create = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(
             *const u8,
             u32,
             u32,
@@ -60,7 +75,8 @@ pub unsafe fn open(instance: &mut Instance) {
             u32,
             u32,
             *const core::ffi::c_void,
-        ) -> isize);
+        ) -> isize,
+    >(create as *const core::ffi::c_void);
     let handle = create(
         LOG_PATH.as_ptr(),
         GENERIC_WRITE,
@@ -71,11 +87,64 @@ pub unsafe fn open(instance: &mut Instance) {
         core::ptr::null(),
     );
     if handle == -1 {
+        return -1;
+    }
+    let tell = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, i32, *mut i32, u32) -> u32,
+    >(tell as *const core::ffi::c_void);
+    let _ = tell(handle, 0, core::ptr::null_mut(), FILE_END);
+    handle
+}
+
+/// Open (or create) the log file, store the handle on the instance.
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 resolved on the instance.
+pub unsafe fn open(instance: &mut Instance) {
+    if !enabled() {
         return;
     }
-    let tell = *(tell as *const unsafe extern "system" fn(isize, i32, *mut i32, u32) -> u32);
-    let _ = tell(handle, 0, core::ptr::null_mut(), FILE_END);
-    instance.debug_handle = handle;
+    if instance.kernel32.is_null() {
+        return;
+    }
+    instance.debug_handle = open_in(instance.kernel32);
+}
+
+/// Append one line through an explicit handle (the bootstrap stages,
+/// before the instance exists).
+///
+/// # Safety
+///
+/// `handle` must come from `open_handle`/`open_in` (or 0/-1: no-op).
+pub unsafe fn log_handle(handle: isize, msg: &[u8]) {
+    if !enabled() || handle == 0 || handle == -1 {
+        return;
+    }
+    let kernel32 = peb::find_module(
+        crate::runtime::bootstrap::get_peb(),
+        fnv1a64_bytes_wide_ci(b"kernel32.dll"),
+    );
+    if kernel32.is_null() {
+        return;
+    }
+    let write = peb::find_export(kernel32, H_WRITE_FILE);
+    if write.is_null() {
+        return;
+    }
+    let write = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, *const u8, u32, *mut u32, *const core::ffi::c_void) -> i32,
+    >(write as *const core::ffi::c_void);
+    let mut written: u32 = 0;
+    let _ = write(
+        handle,
+        msg.as_ptr(),
+        msg.len() as u32,
+        &mut written,
+        core::ptr::null(),
+    );
 }
 
 /// Append one line to the log. Static strings only — the beacon has no
@@ -100,14 +169,10 @@ pub unsafe fn log(instance: &Instance, msg: &[u8]) {
     if write.is_null() {
         return;
     }
-    let write = *(write
-        as *const unsafe extern "system" fn(
-            isize,
-            *const u8,
-            u32,
-            *mut u32,
-            *const core::ffi::c_void,
-        ) -> i32);
+    let write = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, *const u8, u32, *mut u32, *const core::ffi::c_void) -> i32,
+    >(write as *const core::ffi::c_void);
     let mut written: u32 = 0;
     let _ = write(
         handle,
@@ -136,6 +201,8 @@ pub unsafe fn close(instance: &mut Instance) {
     if close.is_null() {
         return;
     }
-    (*(close as *const unsafe extern "system" fn(isize) -> i32))(handle);
+    (core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn(isize) -> i32>(
+        close as *const core::ffi::c_void,
+    ))(handle);
     instance.debug_handle = 0;
 }

