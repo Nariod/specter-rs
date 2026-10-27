@@ -43,6 +43,22 @@ function RegisterCommands(listenerType)
     let cmd_ps = ax.create_command("ps", "Process manager");
     cmd_ps.addSubCommands([_cmd_ps_list, _cmd_ps_kill]);
 
+    let cmd_download = ax.create_command("download", "Download a file", "download C:\\Temp\\file.txt", "Task: download file");
+    cmd_download.addArgString("file", true);
+
+    let cmd_upload = ax.create_command("upload", "Upload a file", "upload /tmp/file.txt C:\\Temp\\file.txt", "Task: upload file");
+    cmd_upload.addArgFile("local_file", true);
+    cmd_upload.addArgString("remote_path", false);
+
+    let _cmd_exfil_start = ax.create_command("start", "Resumes a download that's has been stoped", "exfil start 1a2b3c4d", "Task: resume download");
+    _cmd_exfil_start.addArgString("file_id", true);
+    let _cmd_exfil_stop = ax.create_command("stop", "Stops a download that's in-progress", "exfil stop 1a2b3c4d", "Task: stop download");
+    _cmd_exfil_stop.addArgString("file_id", true);
+    let _cmd_exfil_cancel = ax.create_command("cancel", "Cancels a download", "exfil cancel 1a2b3c4d", "Task: cancel download");
+    _cmd_exfil_cancel.addArgString("file_id", true);
+    let cmd_exfil = ax.create_command("exfil", "Manage current downloads");
+    cmd_exfil.addSubCommands([_cmd_exfil_start, _cmd_exfil_stop, _cmd_exfil_cancel]);
+
     let cmd_sleep = ax.create_command("sleep", "Sets sleep time", "sleep 30m5s 10", "Task: sleep");
     cmd_sleep.addArgString("sleep", true, "Time in '%h%m%s' format or number of seconds");
     cmd_sleep.addArgInt("jitter", false, "Max random amount of time in % added to sleep");
@@ -53,7 +69,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_ps, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_ps, cmd_download, cmd_upload, cmd_exfil, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 

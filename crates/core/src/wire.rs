@@ -118,6 +118,19 @@ impl<'a> Reader<'a> {
         self.take(4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     }
+
+    /// Look at the next `u32 LE` without consuming it (task command peek).
+    pub fn peek_u32_le(&self) -> Option<u32> {
+        if self.buf.len() - self.pos < 4 {
+            return None;
+        }
+        Some(u32::from_le_bytes([
+            self.buf[self.pos],
+            self.buf[self.pos + 1],
+            self.buf[self.pos + 2],
+            self.buf[self.pos + 3],
+        ]))
+    }
     pub fn u64(&mut self) -> Option<u64> {
         self.take(8)
             .map(|b| u64::from_be_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]))

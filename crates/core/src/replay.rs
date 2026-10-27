@@ -166,6 +166,20 @@ fn replay_check_in_against_real_listener() {
     assert!(transport::begin_results(&mut w));
     let mut handled = 0usize;
     while r.remaining() >= 8 {
+        // SAVEMEMORY chunks (upload content): consumed inline, no ack.
+        if r.peek_u32_le() == Some(transport::COMMAND_SAVEMEMORY) {
+            match transport::parse_save_memory(&mut r) {
+                Some((memory_id, expected, chunk)) => {
+                    println!(
+                        "[replay] save-memory {memory_id:08x}: chunk {}/{} bytes",
+                        chunk.len(),
+                        expected
+                    );
+                }
+                None => break,
+            }
+            continue;
+        }
         match transport::parse_task(&mut r) {
             Some((transport::Task::Sleep { sec, jitter_pct }, id)) => {
                 println!("[replay] task {id:08x}: sleep {sec}s, jitter {jitter_pct}%");
@@ -302,6 +316,34 @@ fn replay_check_in_against_real_listener() {
             Some((transport::Task::PsKill { pid }, id)) => {
                 println!("[replay] task {id:08x}: ps kill {pid} (fabricated)");
                 assert!(transport::push_ps_kill_result(&mut w, id, pid));
+                handled += 1;
+            }
+            Some((transport::Task::Download { .. }, id)) => {
+                println!("[replay] task {id:08x}: download (fabricated)");
+                assert!(transport::push_download_start(
+                    &mut w,
+                    id,
+                    0x0AABB_CCD,
+                    11,
+                    b"C:\\flag.txt"
+                ));
+                assert!(transport::push_download_continue(
+                    &mut w,
+                    id,
+                    0x0AABB_CCD,
+                    b"flag-data\n"
+                ));
+                assert!(transport::push_download_finish(&mut w, id, 0x0AABB_CCD));
+                handled += 1;
+            }
+            Some((transport::Task::Upload { .. }, id)) => {
+                println!("[replay] task {id:08x}: upload (fabricated)");
+                assert!(transport::push_upload_result(&mut w, id));
+                handled += 1;
+            }
+            Some((transport::Task::Exfil { action, file_id }, id)) => {
+                println!("[replay] task {id:08x}: exfil {action} (fabricated)");
+                assert!(transport::push_exfil_result(&mut w, id, file_id, action));
                 handled += 1;
             }
             Some((transport::Task::Terminate, id)) => {

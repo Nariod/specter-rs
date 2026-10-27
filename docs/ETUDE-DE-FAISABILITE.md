@@ -403,8 +403,29 @@ natif — y compris le rendu arborescent du `ps list` (boîtes dessinées,
 tri par pid) et les synchronisations GUI (processus, lecteurs). Rejeu réel
 : les quatre commandes rendues correctement par le serveur (« You are
 'MEGACORP\nariod' », table des lecteurs, arborescence, « Process 4321
-killed »). Blob : 19 244/20 480 — relance à prévoir dès le prochain
-chantier. `ps run` reste à faire (nécessite l'infrastructure jobs).
+killed »). Blob : 19 244/20 480.
+
+Itération 13 (2026-10-27) — transferts : `download`, `upload`, `exfil`
+de bout en bout. Download en streaming : handle ouvert à travers les
+cycles (état dans l'instance), un chunk 64 KiB par POST, records
+START/CONTINUE/FINISH avec fileId RNG (server-side : TsDownloadAdd/
+Update/Close, la tâche reste ouverte jusqu'au FINISH). Upload par
+chunks SAVEMEMORY (le plugin découpe en 8 KiB — notre contrat beacon,
+le natif utilise 1 MiB mais le format wire est identique), accumulation
+dans un buffer heap (cap 8 Mo, HEAP_ZERO_MEMORY) puis écriture au
+COMMAND_UPLOAD. Exfil stop/cancel ferme le handle et accuse ; resume
+accusé sans effet (le beacon ne se met jamais en pause de lui-même).
+Deux bugs attrapés par le test réel : `Task::path()` ne couvrait pas
+Download/Upload (chemins vides — le test de couverture des accesseurs,
+ajouté en itération 11, les a attrapés immédiatement) ; et surtout
+`parse_save_memory` ne consommait pas le `u32 LE taskId` qui suit
+chaque enregistrement de tâche — le parse lisait l'id comme la
+commande suivante et abandonnait silencieusement le reste du pack
+(découvert en hex-dumpant le pack réel depuis un rejeu Python).
+Rejeu réel : download complet (fid 0aabbccd, état FINISHED, fichier
+sauvé côté serveur), upload complet (chunk consommé + tâche accusée,
+« File successfully uploaded »), exfil stop accusé. Budget relevé
+20 480 → 24 576 en commit dédié (blob 22 052).
 
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B
