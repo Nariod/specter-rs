@@ -182,6 +182,23 @@ base`, `REL32_k += S - P - (4+k)`, ADDR32 jamais patché — runner.c),
 externals résolus dans une page trampoline `mapFuncs` (les REL32 pointent
 le slot), entry `go(args, argslen)`.
 
+### Convention d'appel pour un BOF (validée en VM réelle, itération 16)
+
+Un BOF n'appelle **jamais** une API Beacon directement : un `call/jmp
+rel32` vers l'extern saute dans les 8 octets du slot `mapFuncs` (le
+comportement est identique dans l'original — runner.c). La référence doit
+être indirecte :
+
+- en C (specter/beacon.h) : `DECLSPEC_IMPORT` (dllimport) — le compilateur
+  émet `call qword ptr [rip+disp32]` vers le slot ;
+- en Rust : un **extern static de type pointeur**, pas un extern `fn`.
+  LLVM génère un `refptr` (section `.rdata$.refptr.SYM` avec relocation
+  `ADDR64` vers l'extern) : le code charge l'adresse du slot depuis son
+  propre `refptr`, puis déréférence le slot pour obtenir le pointeur de
+  fonction (`mov reg, [refptr]; mov reg, [reg]; call reg`). Source de
+  référence : `tools/bof/hello.rs` (build :
+  `rustc --target x86_64-pc-windows-gnu --emit=obj -C opt-level=z`).
+
 ## Écart avec la version précédente de ce document
 
 La relecture de la source serveur (2026-10-22, itération 6) a remplacé la
