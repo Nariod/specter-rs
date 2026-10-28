@@ -44,7 +44,10 @@ PRINTABLE = range(0x20, 0x7F)
 # streaming download state, heap upload accumulation, chunk plumbing).
 # Raised 24576 -> 32768 for the BOF loader (COFF parse, relocations, Beacon
 # API shims, the pending output queue) and the debug channel: 29.6 KiB.
-DEFAULT_MAX_SIZE = 32768
+# Raised 32768 -> 40960 for the job infrastructure (ps run: pipe + hidden
+# CreateProcessA + STARTUPINFOA layout, per-cycle stdout drain, jobs
+# list/kill): 33.3 KiB. Deliberate raise, its own commit.
+DEFAULT_MAX_SIZE = 40960
 
 
 def find_strings(blob):
