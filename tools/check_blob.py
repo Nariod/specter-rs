@@ -47,7 +47,11 @@ PRINTABLE = range(0x20, 0x7F)
 # Raised 32768 -> 40960 for the job infrastructure (ps run: pipe + hidden
 # CreateProcessA + STARTUPINFOA layout, per-cycle stdout drain, jobs
 # list/kill): 33.3 KiB. Deliberate raise, its own commit.
-DEFAULT_MAX_SIZE = 40960
+# Raised 40960 -> 49152 for the screenshot + token modules (GDI capture and
+# BMP building at 36.4 KiB, tkn steal/make/impersonate/revert/list/remove/
+# getuid/privs at 41.3 KiB): headroom for the remaining portage (shell,
+# socks/portfwd, TIB spoof, pivot SMB). Deliberate raise, its own commit.
+DEFAULT_MAX_SIZE = 49152
 
 
 def find_strings(blob):

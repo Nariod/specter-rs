@@ -44,7 +44,9 @@ AdaptixC2, never the other way around.
   `ps kill`, **`ps run`** (hidden window, stdout captured through an
   anonymous pipe, output streamed across cycles), **`jobs list` /
   `jobs kill`**, `disks`, **`screenshot`** (GDI capture by hash, BMP
-  streamed across cycles and reassembled server-side), and the
+  streamed across cycles and reassembled server-side), **`tkn`**
+  (steal/make/impersonate/revert/list/remove/getuid/privs — token
+  store in the instance, thread-level impersonation), and the
   **COFF/BOF loader** (`execute bof`,
   full relocation set, subset of the Beacon API, `.pdata` registration,
   variadic `BeaconPrintf`) — BOFs compile with plain `rustc` or MSVC C.

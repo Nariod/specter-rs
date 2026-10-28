@@ -427,6 +427,84 @@ fn replay_check_in_against_real_listener() {
                 assert!(transport::push_screenshot_finish(&mut w, id));
                 handled += 1;
             }
+            Some((transport::Task::TokenSteal { pid }, id)) => {
+                println!("[replay] task {id:08x}: tkn steal {pid} (fabricated)");
+                assert!(transport::push_token_steal_result(
+                    &mut w,
+                    id,
+                    1,
+                    pid,
+                    b"MEGACORP",
+                    b"nariod"
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::TokenMake { .. }, id)) => {
+                println!("[replay] task {id:08x}: tkn make (fabricated)");
+                assert!(transport::push_token_make_result(&mut w, id, 2));
+                handled += 1;
+            }
+            Some((transport::Task::TokenImpersonate { token_id }, id)) => {
+                println!("[replay] task {id:08x}: tkn impersonate {token_id} (fabricated)");
+                assert!(transport::push_token_ack(
+                    &mut w,
+                    id,
+                    transport::COMMAND_TOKEN_IMPRS,
+                    true
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::TokenRevert, id)) => {
+                println!("[replay] task {id:08x}: tkn revert (fabricated)");
+                assert!(transport::push_token_ack(
+                    &mut w,
+                    id,
+                    transport::COMMAND_TOKEN_REVERT,
+                    true
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::TokenList, id)) => {
+                println!("[replay] task {id:08x}: tkn list (fabricated)");
+                assert!(transport::push_token_list_header(&mut w, id, 1));
+                assert!(transport::push_token_list_entry(
+                    &mut w,
+                    1,
+                    1234,
+                    b"MEGACORP",
+                    b"nariod"
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::TokenRemove { token_id }, id)) => {
+                println!("[replay] task {id:08x}: tkn remove {token_id} (fabricated)");
+                assert!(transport::push_token_ack(
+                    &mut w,
+                    id,
+                    transport::COMMAND_TOKEN_REMOVE,
+                    true
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::TokenGetuid, id)) => {
+                println!("[replay] task {id:08x}: tkn getuid (fabricated)");
+                assert!(transport::push_token_getuid_result(
+                    &mut w,
+                    id,
+                    b"MEGACORP\\nariod"
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::TokenPrivs, id)) => {
+                println!("[replay] task {id:08x}: tkn privs (fabricated)");
+                assert!(transport::push_token_privs_header(&mut w, id, 1));
+                assert!(transport::push_token_privs_entry(
+                    &mut w,
+                    true,
+                    b"SeDebugPrivilege"
+                ));
+                handled += 1;
+            }
             None => break,
         }
     }

@@ -226,6 +226,58 @@ BMP complet (« Screenshot captured »).
 Validé sur l'implant réel (itération 17) : 1920x1122 24bpp, 6 462 774 o,
 START→FINISH en 276 s à sleep 2s (~132 cycles), BMP valide côté serveur.
 
+## tkn — manipulation de tokens (itération 18, port du natif token.c)
+
+Ids libres de la numérotation native (48-61 ; 50/51 = BOF). Tâches
+(`PackArray` : int = u32 LE, string = u32 LE len-incl-NUL) :
+
+```
+tkn steal <pid>        u32 LE 52 || u32 LE pid || u32 LE taskId
+tkn make               u32 LE 53 || u32 LE 2 (logonType interactif)
+                        || str domain || str user || str pass || taskId
+tkn impersonate <id>    u32 LE 54 || u32 LE tokenId || taskId
+tkn revert             u32 LE 55 || taskId
+tkn list               u32 LE 56 || taskId
+tkn remove <id>         u32 LE 57 || u32 LE tokenId || taskId
+tkn getuid             u32 LE 58 || taskId
+tkn privs              u32 LE 59 || taskId
+```
+
+Le beacon stocke jusqu'à 8 tokens dans l'instance (tableau, pattern
+jobs — le natif utilise une liste chaînée heap). steal = OpenProcess
+(0x0400) → OpenProcessToken (TOKEN_DUPLICATE|TOKEN_QUERY) →
+DuplicateTokenEx (TOKEN_ALL_ACCESS, SecurityImpersonation, TokenPrimary)
+→ GetTokenInformation(TokenUser) + LookupAccountSidA pour l'identité.
+make = LogonUserA (logon type par défaut 2 ; le mot de passe est
+zéroïté du tampon après l'appel, comportement natif). impersonate =
+ImpersonateLoggedOnUser sur le thread du beacon ; revert =
+RevertToSelf. getuid lit le **token de thread** d'abord
+(OpenThreadToken, GetCurrentThread), token de process sinon (contraire
+du `getuid` historique qui montre toujours l'identité process). privs =
+GetTokenInformation(TokenPrivileges) puis LookupPrivilegeNameA par
+entrée (layout TOKEN_PRIVILEGES : count u32 à +0, entrées LUID u64 +
+attrs u32 stride 12 à +4). remove ferme le handle et revert
+automatiquement si le token était actif.
+
+Résultats (BE, un record par tâche) :
+
+- steal : `u32 BE tokenId || u32 BE pid || array domain || array user`
+  → « Token [id] stolen from pid (DOMAIN\user) ».
+- make : `u32 BE tokenId` → « Token [id] created ».
+- impersonate/revert/remove : `u8 ok` (échec = message d'erreur).
+- list : `u32 BE count`, puis par entrée
+  `u32 BE tokenId || u32 BE pid || array domain || array user` (tableau
+  rendu côté plugin).
+- getuid : `array "DOMAIN\User"`.
+- privs : `u32 BE count`, puis par entrée `u8 enabled || array name`.
+- Échec Win32 = record COMMAND_ERROR (GetLastError).
+
+Validé sur l'implant réel (itération 18) : steal depuis explorer.exe,
+list, impersonate, getuid à travers le token de thread (GNOME\doria),
+revert, privs (5 privilèges avec états), remove + « not found » sur un
+id inexistant. `tkn make` non testé en live (pas de second compte sur la
+VM de test).
+
 ## BOF — `execute bof` (itération 14, pinné sur beacon_agent pl_main.go/pl_utils.go)
 
 Tâche (`PackArray` : bool = 1 octet, bytes = brut, string = u32 LE len+NUL,

