@@ -560,13 +560,16 @@ unsafe fn proc_identity(
                             let mut dsize: u32 = 32;
                             let mut usize_: u32 = 32;
                             let mut use_: u32 = 0;
+                            // LookupAccountSidA(lpSystem, pSid,
+                            //   Name=&username, &cbName,
+                            //   ReferencedDomainName=&domain, &cbDomain, &use)
                             if lookup(
                                 core::ptr::null(),
                                 sid,
-                                domain.as_mut_ptr(),
-                                &mut dsize,
                                 username.as_mut_ptr(),
                                 &mut usize_,
+                                domain.as_mut_ptr(),
+                                &mut dsize,
                                 &mut use_,
                             ) != 0
                             {
@@ -660,11 +663,13 @@ unsafe fn disks(kernel32: *mut c_void, id: u32, results: &mut Writer) {
 }
 
 /// PROCESSENTRY32W offsets (x64): dwSize +0, pid +8, ppid +0x20,
-/// szExeFile (wide) +0x30 — struct size 0x238.
+/// szExeFile (wide) +0x2C — struct size 0x238. Pinned empirically on the
+/// real VM (BOF dump of the filled entry): reading the name at +0x30
+/// dropped the first 2 wchars of every process name.
 const PE32W_SIZE: usize = 0x238;
 const PE32W_OFF_PID: usize = 0x08;
 const PE32W_OFF_PPID: usize = 0x20;
-const PE32W_OFF_NAME: usize = 0x30;
+const PE32W_OFF_NAME: usize = 0x2C;
 const PE32W_NAME_WCAP: usize = 64;
 const PS_MAX_ENTRIES: u32 = 256;
 

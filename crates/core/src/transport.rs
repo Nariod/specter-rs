@@ -358,7 +358,11 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             }
         }
         COMMAND_EXFIL => {
-            let action = r.u8()?;
+            // The server (native PackArray) writes the state as a full
+            // int (u32 LE) - reading it as a byte desynchronized the
+            // parse by 3 bytes and the download id never matched (the
+            // exfil stop was silently lost, observed live in iteration 16).
+            let action = r.u32_le()? as u8;
             let file_id = r.u32_le()?;
             Task::Exfil { action, file_id }
         }
