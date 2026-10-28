@@ -229,6 +229,12 @@ unsafe extern "system" fn veh_crash_logger(pev: *mut core::ffi::c_void) -> i32 {
     let code = *(rec as *const u32);
     // EXCEPTION_RECORD: code +0, flags +4, nested +8, ExceptionAddress +0x10
     let addr = *(rec as *const *const u8).add(2);
+    // Hardware-breakpoint exceptions (0x80000004 SINGLE_STEP,
+    // 0x80000003 BREAKPOINT) are the hooks' normal interception flow -
+    // dozens per minute on a live host. Only abnormal codes are logged.
+    if code == 0x8000_0004 || code == 0x8000_0003 {
+        return 1;
+    }
     let rip = if ctx.is_null() {
         0
     } else {
