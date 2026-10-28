@@ -3073,7 +3073,7 @@ const TUNNEL_STATE_READY: u8 = 1;
 const TUNNEL_STATE_LISTEN: u8 = 2;
 /// Marked by a send/recv failure — the CLOSE record is emitted at the
 /// next tick, then the tunnel is reaped.
-const TUNNEL_STATE_CLOSING: u8 = 3;
+pub const TUNNEL_STATE_CLOSING: u8 = 3;
 /// Per-tunnel read chunk per cycle.
 const TUNNEL_READ_BUF: usize = 4 * 1024;
 /// fd_set (Windows): `u_int fd_count; SOCKET fd_array[64]`.

