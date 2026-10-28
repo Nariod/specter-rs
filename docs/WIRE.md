@@ -278,6 +278,61 @@ revert, privs (5 privilèges avec états), remove + « not found » sur un
 id inexistant. `tkn make` non testé en live (pas de second compte sur la
 VM de test).
 
+## Shell interactif (itération 18bis, pinné sur beacon_agent v1.2 TerminalCallbacks)
+
+Le client AdaptixC2 ouvre un terminal (menu session « Remote Shell »,
+`ax.open_remote_shell`) : le canal websocket crée le terminal côté
+serveur et appelle les `TerminalCallbacks` du plugin. Le terminalId est
+généré par le client et sert à la fois d'id de tâche et de clé du job
+shell beacon — `jobs kill <terminalId>` ferme le terminal.
+
+Tâches (ids numérotation native 71/72 ; les tâches terminal sont de
+type PROXY_DATA, livrées dans le même pack) :
+
+```
+shell start  u32 LE 71 || u32 LE terminalId || string program (ACP, NUL)
+              (programme vide = cmd.exe)
+shell write   u32 LE 72 || u32 LE terminalId || u32 LE len || len octets bruts
+              (PackArray : []byte s'ajoute SANS préfixe — le int len est
+              redondant mais fait partie du contrat natif)
+shell close   jobs kill (47) avec le terminalId
+```
+
+Résultats : records COMMAND_JOB (0x8437) avec jobType = 4 (SHELL) :
+
+```
+STARTING  u32 BE terminalId || u32 BE 0x8437 || u8 4 || u8 0
+          (réveille la connexion terminal côté serveur)
+RUNNING   ... || u8 4 || u8 1 || array data (sortie du shell, OEM côté
+          plugin TsConvertCpToUTF8)
+KILLED    ... || u8 4 || u8 3 (jobs kill)
+FINISHED  ... || u8 4 || u8 2 || u32 BE exitCode (cmd quitté — le
+          terminal se ferme avec le statut)
+```
+
+Le beacon fait tourner le shell comme un job type 4 de la table jobs
+existante : pipes stdin+stdout héritables, STARTUPINFOA (hStdInput
++0x50), CreateProcessA CREATE_NO_WINDOW. cmd.exe n'échoe pas l'entrée
+pipée (l'écho console est une fonctionnalité conhost) : le beacon
+échoe les caractères tapés (queue 512 o, backspace 0x08 géré) et
+filtre l'écho de ligne de cmd en tête de sortie (port de
+SptShellFilterEcho) ; PowerShell est détecté par nom de programme et
+l'écho est désactivé (il échoe seul). **L'entrée doit être terminée
+par CRLF** — cmd.exe en mode pipe ne consomme pas un CR isolé (le
+client natif convertit 
+ en 
+ côté plugin).
+
+Le plugin rend les records vers le canal terminal
+(TsTerminalConnResume/Data/Close) ; sans terminal vivant (session
+restaurée, commandes de test API) le rendu bascule sur la console
+(TsAgentConsoleOutput persistant). Commandes de diagnostic API :
+`shelltest start` / `shelltest write` (clé fixe 0x0000BEEF, sortie en
+console).
+
+Validé sur l'implant réel : banner cmd, écho de la saisie, sortie
+`whoami` + prompt, exit (job récolté, FINISHED), jobs kill (KILLED).
+
 ## BOF — `execute bof` (itération 14, pinné sur beacon_agent pl_main.go/pl_utils.go)
 
 Tâche (`PackArray` : bool = 1 octet, bytes = brut, string = u32 LE len+NUL,

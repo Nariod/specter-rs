@@ -505,6 +505,27 @@ fn replay_check_in_against_real_listener() {
                 ));
                 handled += 1;
             }
+            Some((transport::Task::ShellStart { terminal_id, .. }, id)) => {
+                println!("[replay] task {id:08x}: shell start {terminal_id:08x} (fabricated)");
+                assert!(transport::push_job_end(
+                    &mut w,
+                    terminal_id,
+                    transport::JOB_TYPE_SHELL,
+                    transport::JOB_STATE_STARTING
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::ShellWrite { terminal_id, .. }, id)) => {
+                println!("[replay] task {id:08x}: shell write {terminal_id:08x} (fabricated)");
+                assert!(transport::push_job_output(
+                    &mut w,
+                    terminal_id,
+                    transport::JOB_TYPE_SHELL,
+                    transport::JOB_STATE_RUNNING,
+                    b"echo from shell\r\n"
+                ));
+                handled += 1;
+            }
             None => break,
         }
     }

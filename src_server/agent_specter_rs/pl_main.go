@@ -13,6 +13,7 @@ package main
 
 import (
 	"bytes"
+	"io"
 	"crypto/rand"
 	"encoding/base64"
 	mrand "math/rand"
@@ -72,6 +73,11 @@ type Teamserver interface {
 	TsDownloadUpdate(fileId string, state int, data []byte) error
 	TsDownloadClose(fileId string, reason int) error
 	TsScreenshotAdd(agentId string, Note string, Content []byte) error
+	TsTerminalConnExists(terminalId string) bool
+	TsTerminalGetPipe(AgentId string, terminalId string) (*io.PipeReader, *io.PipeWriter, error)
+	TsTerminalConnResume(agentId string, terminalId string, ioDirect bool)
+	TsTerminalConnData(terminalId string, data []byte)
+	TsTerminalConnClose(terminalId string, status string) error
 }
 
 var Ts Teamserver
@@ -179,6 +185,8 @@ const (
 	COMMAND_JOB_LIST   = 46
 	COMMAND_JOBS_KILL  = 47
 	JOB_TYPE_PROCESS   = 0x3
+	JOB_TYPE_SHELL     = 0x4
+	JOB_STATE_STARTING = 0x0
 	JOB_STATE_RUNNING  = 0x1
 	JOB_STATE_FINISHED = 0x2
 	JOB_STATE_KILLED   = 0x3
@@ -195,6 +203,11 @@ const (
 	SCREENSHOT_START    = 0x1
 	SCREENSHOT_CONTINUE = 0x2
 	SCREENSHOT_FINISH   = 0x3
+
+	// Interactive shell (native numbering): the client's Remote Shell
+	// drives Start/Write through TerminalCallbacks, close rides jobs kill.
+	COMMAND_SHELL_START = 71
+	COMMAND_SHELL_WRITE = 72
 
 	// Token manipulation (free ids in the native 48-61 range): port of the
 	// native token.c against our wire.
@@ -1098,6 +1111,28 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 			goto RET
 		}
 
+	case "shelltest":
+		// Diagnostic: drive the interactive shell without the client
+		// terminal (the terminal channel needs a connected GUI). The
+		// shell job is keyed by a fixed test id; the output renders to
+		// the console (the terminal branch handles missing terminals).
+		if subcommand == "start" {
+			array = []interface{}{COMMAND_SHELL_START, 0x0000BEEF, "cmd.exe"}
+			messageData.Message = "Task: shell test start (cmd.exe)"
+		} else if subcommand == "write" {
+			var text string
+			text, err = getStringArg(args, "text")
+			if err != nil {
+				goto RET
+			}
+			dataEncode := Ts.TsConvertUTF8toCp(text, agentData.ACP)
+			array = []interface{}{COMMAND_SHELL_WRITE, 0x0000BEEF, len(dataEncode), []byte(dataEncode)}
+			messageData.Message = fmt.Sprintf("Task: shell test write (%v bytes)", len(dataEncode))
+		} else {
+			err = errors.New("subcommand must be 'start' or 'write'")
+			goto RET
+		}
+
 	default:
 		err = fmt.Errorf("Command '%v' not found", command)
 		goto RET
@@ -1531,6 +1566,41 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 				} else if state == JOB_STATE_FINISHED {
 					task.Completed = true
 					task.Message = fmt.Sprintf("Job [%v] finished", task.TaskId)
+				}
+			} else if jobType == JOB_TYPE_SHELL {
+				terminalId := task.TaskId
+				if !Ts.TsTerminalConnExists(terminalId) {
+					// No live terminal (restored session, or a shell started
+					// through the API test commands): render to the console
+					// instead of the terminal channel.
+					if state == JOB_STATE_RUNNING {
+						if false == packer.CheckPacker([]string{"array"}) {
+							goto HANDLER
+						}
+						data := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.OemCP)
+						Ts.TsAgentConsoleOutput(agentData.Id, adaptix.MESSAGE_SUCCESS, "shell:", data, true)
+					} else if state == JOB_STATE_FINISHED {
+						task.Message = fmt.Sprintf("Shell [%v] exited", terminalId)
+					} else if state == JOB_STATE_KILLED {
+						task.Message = fmt.Sprintf("Shell [%v] stopped", terminalId)
+					}
+				} else if state == JOB_STATE_STARTING {
+					Ts.TsTerminalConnResume(agentData.Id, terminalId, false)
+				} else if state == JOB_STATE_RUNNING {
+					if false == packer.CheckPacker([]string{"array"}) {
+						goto HANDLER
+					}
+					data := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.OemCP)
+					Ts.TsTerminalConnData(terminalId, []byte(data))
+				} else if state == JOB_STATE_KILLED {
+					_ = Ts.TsTerminalConnClose(terminalId, "Terminal stopped")
+				} else if state == JOB_STATE_FINISHED {
+					if false == packer.CheckPacker([]string{"int"}) {
+						goto HANDLER
+					}
+					errorCode := packer.ParseInt32()
+					status := fmt.Sprintf("Error [%d]: %s", errorCode, Ts.TsWin32Error(uint(errorCode)))
+					_ = Ts.TsTerminalConnClose(terminalId, status)
 				}
 			}
 
@@ -1979,5 +2049,45 @@ func (e *ExtenderAgent) TunnelCallbacks() adaptix.TunnelCallbacks {
 }
 
 func (e *ExtenderAgent) TerminalCallbacks() adaptix.TerminalCallbacks {
-	return adaptix.TerminalCallbacks{}
+	return adaptix.TerminalCallbacks{
+		Start: TerminalMessageStart,
+		Write: TerminalMessageWrite,
+		Close: TerminalMessageClose,
+	}
+}
+
+// TerminalMessageStart: the client opened a Remote Shell — pack the
+// SHELL_START task (terminalId is the task id the server assigned; the
+// beacon keys its shell job by it, and `jobs kill` closes the terminal).
+func TerminalMessageStart(terminalId int, program string, sizeH int, sizeW int, oemCP int) adaptix.TaskData {
+	programArgs := Ts.TsConvertUTF8toCp(program, oemCP)
+	array := []interface{}{COMMAND_SHELL_START, terminalId, programArgs}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
+}
+
+// TerminalMessageWrite: typed input. The native wire is
+// `int len || raw bytes` ([]byte appends without a prefix in PackArray);
+// the beacon caps writes at 512 bytes.
+func TerminalMessageWrite(terminalId int, oemCP int, data []byte) adaptix.TaskData {
+	dataEncode := Ts.TsConvertUTF8toCp(string(data), oemCP)
+	if oemCP > 0 {
+		dataEncode = strings.ReplaceAll(dataEncode, "\n", "\r\n")
+	}
+	array := []interface{}{COMMAND_SHELL_WRITE, terminalId, len(dataEncode), []byte(dataEncode)}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
+}
+
+// TerminalMessageClose: rides `jobs kill` on the beacon's job table.
+func TerminalMessageClose(terminalId int) adaptix.TaskData {
+	array := []interface{}{COMMAND_JOBS_KILL, terminalId}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
+}
+
+// makeProxyTask: terminal tasks are delivered as-is (no dialog, no ack
+// rendering — the shell output rides COMMAND_JOB records).
+func makeProxyTask(packData []byte) adaptix.TaskData {
+	return adaptix.TaskData{Type: adaptix.TASK_TYPE_PROXY_DATA, Data: packData, Sync: false}
 }

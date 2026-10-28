@@ -6,6 +6,15 @@
 /// (COMMAND_PROFILE subop 1) and terminate (COMMAND_TERMINATE). The rest
 /// of the native command set lands with the phase 3 task handlers.
 
+// RegisterMenu: the session right-click menu. "Remote Shell" opens the
+// client's interactive terminal (TerminalCallbacks in pl_main.go drive
+// the SHELL_START/WRITE tasks, output rides the jobs records).
+function RegisterMenu(menu)
+{
+    let shell_action = menu.create_action("Remote Shell", function(value) { value.forEach(v => ax.open_remote_shell(v)) });
+    menu.add_session_agent(shell_action, ["specter-rs"]);
+}
+
 function RegisterCommands(listenerType)
 {
     let cmd_pwd = ax.create_command("pwd", "Print current working directory", "pwd", "Task: show working directory");

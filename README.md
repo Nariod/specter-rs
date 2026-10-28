@@ -46,7 +46,9 @@ AdaptixC2, never the other way around.
   `jobs kill`**, `disks`, **`screenshot`** (GDI capture by hash, BMP
   streamed across cycles and reassembled server-side), **`tkn`**
   (steal/make/impersonate/revert/list/remove/getuid/privs — token
-  store in the instance, thread-level impersonation), and the
+  store in the instance, thread-level impersonation), the
+  **interactive shell** (Remote Shell terminal, cmd.exe/PowerShell
+  with input echo and line-echo filtering), and the
   **COFF/BOF loader** (`execute bof`,
   full relocation set, subset of the Beacon API, `.pdata` registration,
   variadic `BeaconPrintf`) — BOFs compile with plain `rustc` or MSVC C.
