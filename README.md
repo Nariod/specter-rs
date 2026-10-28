@@ -48,10 +48,13 @@ AdaptixC2, never the other way around.
   (steal/make/impersonate/revert/list/remove/getuid/privs — token
   store in the instance, thread-level impersonation), the
   **interactive shell** (Remote Shell terminal, cmd.exe/PowerShell
-  with input echo and line-echo filtering), and the
+  with input echo and line-echo filtering), the
   **COFF/BOF loader** (`execute bof`,
   full relocation set, subset of the Beacon API, `.pdata` registration,
-  variadic `BeaconPrintf`) — BOFs compile with plain `rustc` or MSVC C.
+  variadic `BeaconPrintf`) — BOFs compile with plain `rustc` or MSVC C,
+  and **tunnels** — `socks` (SOCKS5), `lportfwd`, `rportfwd`, all
+  relayed through the check-in cycle and validated byte-exact against
+  a live implant.
 - **Server plugin (Go, ABI v1.2)** — real agent generation dialog driving
   the beacon's own cargo pipeline, RC4 Encrypt/Decrypt, PackTasks /
   ProcessData for every command above, native-style task rendering.
@@ -59,7 +62,7 @@ AdaptixC2, never the other way around.
 Position-independent, single `.text` section, no CRT, no globals (the
 instance lives in `TEB->NtTib.ArbitraryUserPointer`), per-build
 encryption and build-time injected configuration, malleable profiles
-(`profiles/`). Blob currently ~34 KiB (budget 40 KiB, see guardrails).
+(`profiles/`). Blob currently ~47 KiB (budget 48 KiB, see guardrails).
 
 ## Documentation
 

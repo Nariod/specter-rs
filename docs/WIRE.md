@@ -333,6 +333,66 @@ console).
 Validé sur l'implant réel : banner cmd, écho de la saisie, sortie
 `whoami` + prompt, exit (job récolté, FINISHED), jobs kill (KILLED).
 
+## Tunnels — socks / lportfwd / rportfwd (itération 19, pinné sur ts_tunnels.go + beacon_agent v1.2)
+
+Trois types de tunnels, tous relayés par les cycles check-in du beacon
+(pas de canal latéral : le débit est borné par le sleep, ~4 Ko/cycle en
+lecture côté beacon).
+
+### Tâches serveur → beacon (`PackArray`, côté pl_main.go `TunnelMessage*`)
+
+- `COMMAND_TUNNEL_START_TCP` (62) : `u32 LE 62 || u32 LE channelId ||
+  u32 LE tunnelType || string addr || u32 LE port || u32 LE taskId` —
+  le beacon connecte `addr:port` (inet_addr, repli gethostbyname),
+  passe la socket en non-bloquant. Résultat 0 = prêt, 1 = refus local,
+  10061+ = code WSA (mappé SOCKS5 côté serveur).
+- `COMMAND_TUNNEL_WRITE_TCP` (64) : `u32 LE 64 || u32 LE channelId ||
+  u32 LE len || octets || u32 LE taskId` — données serveur → socket.
+  Parse **en ligne** dans le dispatch (les octets empruntent le tampon
+  de réponse, jamais inline dans l'enum `Task` : un gros variant `Copy`
+  étouffe le codegen et tout le module part en ICF au build propre).
+- `COMMAND_TUNNEL_CLOSE` (66) : `u32 LE 66 || u32 LE channelId ||
+  u32 LE taskId`.
+- `COMMAND_TUNNEL_PAUSE` (69) / `COMMAND_TUNNEL_RESUME` (70) : contrôle
+  de flux (le serveur pausse la lecture si sa file d'entrée s'emplit).
+- `COMMAND_TUNNEL_REVERSE` (67) : `u32 LE 67 || u32 LE tunnelId ||
+  u32 LE port || u32 LE taskId` — rportfwd : le beacon bind
+  `127.0.0.1:port` et accepte ; chaque accept génère un résultat
+  TUNNEL_ACCEPT et la connexion acceptée devient un tunnel READY.
+
+### Réponses beacon → serveur (packer BE, records `ProcessData`)
+
+- start : `u32 BE channel || u32 BE 62 || u32 BE sub(0) || u32 BE result`
+  — le format à **deux** u32 suit beacon_agent (le premier est ignoré
+  par le parse). result 0 → `TsTunnelConnectionResume` (réponse SOCKS5
+  + démarrage du relais), 1 → close, WSA → halt mappé SOCKS5.
+- write : `u32 BE channel || u32 BE 64 || array data` — octets lus sur
+  la socket (tunnel_tick : select timeout 0, recv 4 Ko/cycle/socket).
+- close : `u32 BE channel || u32 BE 66 || u32 BE 0 || u32 BE 0` — le
+  pair a fermé ; le serveur ferme son côté.
+- accept : `u32 BE tunnelId || u32 BE 68 || u32 BE newChannelId` — le
+  serveur dials alors `fwdhost:fwdport` (rportfwd).
+- reverse : `u32 BE tunnelId || u32 BE 67 || u32 BE sub(0) || u32 BE result`.
+- pause/resume : ack = header seul.
+
+### Règles de cycle (leçons des bugs corrigés)
+
+- La file de résultats différés est **consommée au POST réussi** : sans
+  ça, un cycle à réponse vide (retour précoce avant le dispatch) renvoie
+  les mêmes records au cycle suivant — le serveur agit deux fois (start
+  record dupliqué → double `TsTunnelConnectionResume` → réponse SOCKS5
+  envoyée deux fois au client).
+- Les commandes `socks`/`lportfwd`/`rportfwd` sont des tâches serveur
+  (`TASK_TYPE_TUNNEL`, jamais livrées au beacon) : une `TASK_TYPE_TASK`
+  vide empoisonne le parse du pack côté beacon (record inconnu →
+  abandon du reste du pack, les proxy tasks tunnel qui suivent sont
+  perdues).
+
+Validé sur l'implant réel (session specter-th, serveur AdaptixC2 v1.2) :
+lportfwd, socks (SOCKS5 curl `--socks5-hostname`), rportfwd — chacun
+transfère 20 Ko **byte-exact** (md5 identique) à travers le cycle
+check-in ; stops propres (`socks stop`, `lportfwd stop`, `rportfwd stop`).
+
 ## BOF — `execute bof` (itération 14, pinné sur beacon_agent pl_main.go/pl_utils.go)
 
 Tâche (`PackArray` : bool = 1 octet, bytes = brut, string = u32 LE len+NUL,

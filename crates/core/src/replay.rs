@@ -526,6 +526,39 @@ fn replay_check_in_against_real_listener() {
                 ));
                 handled += 1;
             }
+            Some((transport::Task::TunnelStartTcp { channel_id, .. }, id)) => {
+                println!("[replay] task {id:08x}: tunnel start {channel_id:08x} (fabricated)");
+                assert!(transport::push_tunnel_start_result(&mut w, channel_id, 0));
+                handled += 1;
+            }
+            Some((transport::Task::TunnelClose { channel_id }, id)) => {
+                println!("[replay] task {id:08x}: tunnel close {channel_id:08x} (fabricated)");
+                assert!(transport::push_tunnel_close_result(&mut w, channel_id));
+                handled += 1;
+            }
+            Some((transport::Task::TunnelPause { channel_id }, id)) => {
+                println!("[replay] task {id:08x}: tunnel pause {channel_id:08x} (fabricated)");
+                assert!(transport::push_tunnel_flag_result(
+                    &mut w,
+                    channel_id,
+                    transport::COMMAND_TUNNEL_PAUSE
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::TunnelResume { channel_id }, id)) => {
+                println!("[replay] task {id:08x}: tunnel resume {channel_id:08x} (fabricated)");
+                assert!(transport::push_tunnel_flag_result(
+                    &mut w,
+                    channel_id,
+                    transport::COMMAND_TUNNEL_RESUME
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::TunnelReverse { tunnel_id, .. }, id)) => {
+                println!("[replay] task {id:08x}: tunnel reverse {tunnel_id:08x} (fabricated)");
+                assert!(transport::push_tunnel_reverse_result(&mut w, tunnel_id, 1));
+                handled += 1;
+            }
             None => break,
         }
     }

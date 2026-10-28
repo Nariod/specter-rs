@@ -78,6 +78,23 @@ type Teamserver interface {
 	TsTerminalConnResume(agentId string, terminalId string, ioDirect bool)
 	TsTerminalConnData(terminalId string, data []byte)
 	TsTerminalConnClose(terminalId string, status string) error
+
+	TsTunnelStart(TunnelId string) (string, error)
+	TsTunnelCreateSocks4(AgentId string, Info string, Lhost string, Lport int) (string, error)
+	TsTunnelCreateSocks5(AgentId string, Info string, Lhost string, Lport int, UseAuth bool, Username string, Password string) (string, error)
+	TsTunnelCreateLportfwd(AgentId string, Info string, Lhost string, Lport int, Thost string, Tport int) (string, error)
+	TsTunnelCreateRportfwd(AgentId string, Info string, Lport int, Thost string, Tport int) (string, error)
+	TsTunnelUpdateRportfwd(tunnelId int, result bool) (string, string, error)
+	TsTunnelStopSocks(AgentId string, Port int)
+	TsTunnelStopLportfwd(AgentId string, Port int)
+	TsTunnelStopRportfwd(AgentId string, Port int)
+	TsTunnelConnectionClose(channelId int, writeOnly bool)
+	TsTunnelConnectionHalt(channelId int, errorCode byte)
+	TsTunnelConnectionResume(AgentId string, channelId int, ioDirect bool)
+	TsTunnelConnectionData(channelId int, data []byte)
+	TsTunnelConnectionAccept(tunnelId int, channelId int)
+	TsTunnelPause(channelId int)
+	TsTunnelResume(channelId int)
 }
 
 var Ts Teamserver
@@ -208,6 +225,17 @@ const (
 	// drives Start/Write through TerminalCallbacks, close rides jobs kill.
 	COMMAND_SHELL_START = 71
 	COMMAND_SHELL_WRITE = 72
+
+	// Tunnels (native numbering; TCP only — the original specter's
+	// tunnel.c is TCP-only too). Tasks ride TunnelCallbacks (PROXY_DATA),
+	// per-connection I/O rides TUNNEL_START/WRITE/CLOSE/ACCEPT records.
+	COMMAND_TUNNEL_START_TCP = 62
+	COMMAND_TUNNEL_WRITE_TCP = 64
+	COMMAND_TUNNEL_CLOSE     = 66
+	COMMAND_TUNNEL_REVERSE   = 67
+	COMMAND_TUNNEL_ACCEPT    = 68
+	COMMAND_TUNNEL_PAUSE     = 69
+	COMMAND_TUNNEL_RESUME    = 70
 
 	// Token manipulation (free ids in the native 48-61 range): port of the
 	// native token.c against our wire.
@@ -1133,6 +1161,148 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 			goto RET
 		}
 
+	case "socks":
+		// Server-side bookkeeping task: TASK_TYPE_TUNNEL is completed by
+		// the teamserver's TunnelTaskHandler and never delivered to the
+		// beacon (an empty TASK_TYPE_TASK poisons the beacon's task-pack
+		// parse — it breaks on the unknown record and drops the tunnel
+		// proxy tasks packed after it).
+		taskData.Type = adaptix.TASK_TYPE_TUNNEL
+
+		var portNumber float64
+		portNumber, err = getFloatArg(args, "port")
+		if err != nil {
+			goto RET
+		}
+		port := int(portNumber)
+		if port < 1 || port > 65535 {
+			err = errors.New("port must be from 1 to 65535")
+			goto RET
+		}
+
+		if subcommand == "start" {
+			var address string
+			address, err = getStringArg(args, "address")
+			if err != nil {
+				goto RET
+			}
+			var tunnelId string
+			tunnelId, err = Ts.TsTunnelCreateSocks5(agentData.Id, "", address, port, false, "", "")
+			if err != nil {
+				goto RET
+			}
+			taskData.TaskId, err = Ts.TsTunnelStart(tunnelId)
+			if err != nil {
+				goto RET
+			}
+			taskData.Message = fmt.Sprintf("Socks5 server running on port %d", port)
+			taskData.MessageType = adaptix.MESSAGE_SUCCESS
+			taskData.ClearText = "\n"
+		} else if subcommand == "stop" {
+			taskData.Completed = true
+			Ts.TsTunnelStopSocks(agentData.Id, port)
+			taskData.MessageType = adaptix.MESSAGE_SUCCESS
+			taskData.Message = "Socks5 server has been stopped"
+			taskData.ClearText = "\n"
+		} else {
+			err = errors.New("subcommand must be 'start' or 'stop'")
+			goto RET
+		}
+
+	case "lportfwd":
+		// Server-side bookkeeping task, never delivered to the beacon
+		// (see the socks case).
+		taskData.Type = adaptix.TASK_TYPE_TUNNEL
+
+		lportNumber, _ := getFloatArg(args, "lport")
+		lport := int(lportNumber)
+		if lport < 1 || lport > 65535 {
+			err = errors.New("port must be from 1 to 65535")
+			goto RET
+		}
+
+		if subcommand == "start" {
+			lhost, _ := getStringArg(args, "lhost")
+			fhost, ferr := getStringArg(args, "fwdhost")
+			if ferr != nil {
+				err = ferr
+				goto RET
+			}
+			fportNumber, _ := getFloatArg(args, "fwdport")
+			fport := int(fportNumber)
+			if fport < 1 || fport > 65535 {
+				err = errors.New("port must be from 1 to 65535")
+				goto RET
+			}
+			var tunnelId string
+			tunnelId, err = Ts.TsTunnelCreateLportfwd(agentData.Id, "", lhost, lport, fhost, fport)
+			if err != nil {
+				goto RET
+			}
+			taskData.TaskId, err = Ts.TsTunnelStart(tunnelId)
+			if err != nil {
+				goto RET
+			}
+			taskData.Message = fmt.Sprintf("Started local port forwarding on %s:%d to %s:%d", lhost, lport, fhost, fport)
+			taskData.MessageType = adaptix.MESSAGE_SUCCESS
+			taskData.ClearText = "\n"
+		} else if subcommand == "stop" {
+			taskData.Completed = true
+			Ts.TsTunnelStopLportfwd(agentData.Id, lport)
+			taskData.Message = fmt.Sprintf("Local port forwarding on %d stopped", lport)
+			taskData.MessageType = adaptix.MESSAGE_SUCCESS
+			taskData.ClearText = "\n"
+		} else {
+			err = errors.New("subcommand must be 'start' or 'stop'")
+			goto RET
+		}
+
+	case "rportfwd":
+		// Server-side bookkeeping task, never delivered to the beacon
+		// (see the socks case).
+		taskData.Type = adaptix.TASK_TYPE_TUNNEL
+
+		lportNumber, _ := getFloatArg(args, "lport")
+		lport := int(lportNumber)
+		if lport < 1 || lport > 65535 {
+			err = errors.New("port must be from 1 to 65535")
+			goto RET
+		}
+
+		if subcommand == "start" {
+			fhost, ferr := getStringArg(args, "fwdhost")
+			if ferr != nil {
+				err = ferr
+				goto RET
+			}
+			fportNumber, _ := getFloatArg(args, "fwdport")
+			fport := int(fportNumber)
+			if fport < 1 || fport > 65535 {
+				err = errors.New("port must be from 1 to 65535")
+				goto RET
+			}
+			var tunnelId string
+			tunnelId, err = Ts.TsTunnelCreateRportfwd(agentData.Id, "", lport, fhost, fport)
+			if err != nil {
+				goto RET
+			}
+			taskData.TaskId, err = Ts.TsTunnelStart(tunnelId)
+			if err != nil {
+				goto RET
+			}
+			messageData.Message = fmt.Sprintf("Starting reverse port forwarding %d to %s:%d", lport, fhost, fport)
+			messageData.Status = adaptix.MESSAGE_INFO
+		} else if subcommand == "stop" {
+			taskData.Completed = true
+			Ts.TsTunnelStopRportfwd(agentData.Id, lport)
+			taskData.MessageType = adaptix.MESSAGE_SUCCESS
+			taskData.Message = "Reverse port forwarding has been stopped"
+			taskData.ClearText = "\n"
+		} else {
+			err = errors.New("subcommand must be 'start' or 'stop'")
+			goto RET
+		}
+
 	default:
 		err = fmt.Errorf("Command '%v' not found", command)
 		goto RET
@@ -1678,6 +1848,73 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 				_ = Ts.TsDownloadClose(fileId, adaptix.DOWNLOAD_STATE_FINISHED)
 			}
 
+		case COMMAND_TUNNEL_START_TCP:
+			if false == packer.CheckPacker([]string{"int", "int"}) {
+				goto HANDLER
+			}
+			channelId := int(TaskId)
+			_ = packer.ParseInt32()
+			result := packer.ParseInt32()
+			if result == 0 {
+				Ts.TsTunnelConnectionResume(agentData.Id, channelId, false)
+			} else if result == 1 {
+				Ts.TsTunnelConnectionClose(channelId, true)
+			} else {
+				errorCode := adaptix.SOCKS5_HOST_UNREACHABLE
+				if result == 10061 { // WSAECONNREFUSED
+					errorCode = adaptix.SOCKS5_CONNECTION_REFUSED
+				}
+				Ts.TsTunnelConnectionHalt(channelId, errorCode)
+			}
+
+		case COMMAND_TUNNEL_WRITE_TCP:
+			if false == packer.CheckPacker([]string{"array"}) {
+				goto HANDLER
+			}
+			channelId := int(TaskId)
+			data := packer.ParseBytes()
+			Ts.TsTunnelConnectionData(channelId, data)
+
+		case COMMAND_TUNNEL_REVERSE:
+			if false == packer.CheckPacker([]string{"int", "int"}) {
+				goto HANDLER
+			}
+			tunnelId := int(TaskId)
+			_ = packer.ParseInt32()
+			result := packer.ParseInt32()
+			var uerr error
+			task.TaskId, task.Message, uerr = Ts.TsTunnelUpdateRportfwd(tunnelId, result != 0)
+			if uerr != nil {
+				task.MessageType = adaptix.MESSAGE_ERROR
+			} else {
+				task.MessageType = adaptix.MESSAGE_SUCCESS
+			}
+
+		case COMMAND_TUNNEL_ACCEPT:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			tunnelId := int(TaskId)
+			channelId := int(packer.ParseInt32())
+			Ts.TsTunnelConnectionAccept(tunnelId, channelId)
+
+		case COMMAND_TUNNEL_PAUSE:
+			channelId := int(TaskId)
+			Ts.TsTunnelPause(channelId)
+
+		case COMMAND_TUNNEL_RESUME:
+			channelId := int(TaskId)
+			Ts.TsTunnelResume(channelId)
+
+		case COMMAND_TUNNEL_CLOSE:
+			if false == packer.CheckPacker([]string{"int", "int"}) {
+				goto HANDLER
+			}
+			_ = packer.ParseInt32()
+			_ = packer.ParseInt32()
+			channelId := int(TaskId)
+			Ts.TsTunnelConnectionClose(channelId, false)
+
 		case COMMAND_SCREENSHOT:
 			if false == packer.CheckPacker([]string{"byte"}) {
 				goto HANDLER
@@ -2045,7 +2282,54 @@ HANDLER:
 }
 
 func (e *ExtenderAgent) TunnelCallbacks() adaptix.TunnelCallbacks {
-	return adaptix.TunnelCallbacks{}
+	return adaptix.TunnelCallbacks{
+		ConnectTCP: TunnelMessageConnectTCP,
+		WriteTCP:   TunnelMessageWriteTCP,
+		Pause:      TunnelMessagePause,
+		Resume:     TunnelMessageResume,
+		Close:      TunnelMessageClose,
+		Reverse:    TunnelMessageReverse,
+	}
+}
+
+// TunnelMessageConnectTCP: a connection should be established from the
+// beacon (socks client or lportfwd inbound).
+func TunnelMessageConnectTCP(channelId int, tunnelType int, addressType int, address string, port int) adaptix.TaskData {
+	array := []interface{}{COMMAND_TUNNEL_START_TCP, channelId, tunnelType, address, port}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
+}
+
+// TunnelMessageWriteTCP: server-side tunnel data to the beacon socket.
+func TunnelMessageWriteTCP(channelId int, data []byte) adaptix.TaskData {
+	array := []interface{}{COMMAND_TUNNEL_WRITE_TCP, channelId, len(data), data}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
+}
+
+func TunnelMessagePause(channelId int) adaptix.TaskData {
+	array := []interface{}{COMMAND_TUNNEL_PAUSE, channelId}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
+}
+
+func TunnelMessageResume(channelId int) adaptix.TaskData {
+	array := []interface{}{COMMAND_TUNNEL_RESUME, channelId}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
+}
+
+func TunnelMessageClose(channelId int) adaptix.TaskData {
+	array := []interface{}{COMMAND_TUNNEL_CLOSE, channelId}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
+}
+
+// TunnelMessageReverse (rportfwd): the beacon binds a loopback listener.
+func TunnelMessageReverse(tunnelId int, port int) adaptix.TaskData {
+	array := []interface{}{COMMAND_TUNNEL_REVERSE, tunnelId, port}
+	packData, _ := PackArray(array)
+	return makeProxyTask(packData)
 }
 
 func (e *ExtenderAgent) TerminalCallbacks() adaptix.TerminalCallbacks {

