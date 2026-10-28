@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-27** (phase 3, itération 13 : download/upload/exfil).
+Dernière mise à jour : **2026-10-28** (phase 3, itération 16 : ps run + jobs list/kill validés sur l'implant réel).
 
 ---
 
@@ -100,7 +100,7 @@ Dernière mise à jour : **2026-10-27** (phase 3, itération 13 : download/uploa
 | `tkn` (steal/make/impersonate/revert/list/remove/getuid/privs) | — | À faire | Phase 3 |
 | `socks` (SOCKS5), `lportfwd`, `rportfwd` | — | À faire | Phase 3 |
 | `screenshot` | — | À faire | Phase 3 |
-| `joblist` / `jobkill` | — | À faire | Phase 3 |
+| `joblist` / `jobkill` | Couvert par l'infrastructure jobs (ligne `Jobs` ci-dessus) : tableau de jobs de l'instance, list/kill par ID | Fait* | **16 : validés en live** (voir ligne Jobs) |
 
 ## 7. Protocole wire
 
@@ -143,6 +143,6 @@ Dernière mise à jour : **2026-10-27** (phase 3, itération 13 : download/uploa
 | Runtime | 7 | 0 | 1 | 0 |
 | Évasion | 5 | 2 | 2 | 0 |
 | Transports | 1 | 2 | 1 | 0 |
-| Commandes | 7 | 0 | 4 | 0 |
+| Commandes | 9 | 0 | 4 | 0 |
 | Wire | 1 | 0 | 0 | 0 |
 | Serveur Go | 0 | 2 | 0 | 3 |
