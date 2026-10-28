@@ -7,13 +7,13 @@
   <img src="https://github.com/Nariod/specter-rs/actions/workflows/ci.yml/badge.svg" alt="CI"/>
 </p>
 
-> [!WARNING]
-> **Work in progress.** Specter-rs is a Rust rewrite of
-> [Specter](https://github.com/0xC9H/specter). The core loop — check-in,
-> task execution, results — is functional and validated against a real
-> AdaptixC2 server on a live Windows implant, but the project is still
-> short of full feature parity with the original (see
-> [PARITE.md](docs/PARITE.md)).
+> [!NOTE]
+> **Release candidate (RC1).** The full C2 loop — check-in, task
+> execution, results, tunnels, encrypted sleep — is functional and
+> validated against a real AdaptixC2 server on a live Windows implant.
+> A few original features are still missing (see the open points in
+> [PARITE.md](docs/PARITE.md): SMB pivot, Astral Projection, hostile-pack
+> hardening).
 
 A Rust rewrite of the Specter beacon: an [AdaptixC2](https://github.com/nicecatch-cyber/AdaptixC2)
 Windows x64 agent focused on **EDR evasion**, preserving the original project's
@@ -36,7 +36,11 @@ AdaptixC2, never the other way around.
   Tartarus' Gate / Hell's Hall), hardware-breakpoint hooks (Dr0-Dr3 + VEH)
   blinding ETW and AMSI, return-address spoofing, **encrypted sleep mask**
   (flips `NtProtectVirtualMemory` on RX images + RWX probe, validated
-  over 15+ cycles on the real implant).
+  over 15+ cycles on the real implant), and **threadpool sleep with TIB
+  stack spoofing** — the beacon thread parks in `WaitForSingleObject`
+  while a threadpool worker runs the mask stub with the parked thread's
+  TEB bounds and saved Rsp lent from a donor thread (CFG-whitelisted
+  through `NtSetInformationVirtualMemory`, validated 43 cycles live).
 - **Operator commands** — `sleep`, `terminate` (thread/process), file set
   (`pwd`, `cd`, `ls`, `cat`, `mkdir`, `rm`, `cp`, `mv`), `upload` /
   `download` (streamed, 48 KiB / 8 KiB per cycle) with `exfil`
@@ -62,7 +66,7 @@ AdaptixC2, never the other way around.
 Position-independent, single `.text` section, no CRT, no globals (the
 instance lives in `TEB->NtTib.ArbitraryUserPointer`), per-build
 encryption and build-time injected configuration, malleable profiles
-(`profiles/`). Blob currently ~47 KiB (budget 48 KiB, see guardrails).
+(`profiles/`). Blob currently ~50 KiB (budget 52 KiB, see guardrails).
 
 ## Documentation
 
@@ -117,22 +121,24 @@ CI (`.github/workflows/ci.yml`) gates every push and PR through layers:
 3. **Blob invariants** — the blob must build, pass layout verification
    (`tools/pe_blob.py`: entry prologue at offset 0, call target in range,
    `SPT_END` marker last), contain **no text strings** and stay under the
-   **size budget** (`tools/check_blob.py`, 40 KiB — raise it deliberately,
-   in its own commit), and prove **position independence** by byte-identical
+   **size budget** (`tools/check_blob.py`, 52 KiB — every raise is its own
+   dedicated commit), and prove **position independence** by byte-identical
    double-base linking (`make pic-check`).
 4. **Tooling tests** — the Python verification pipeline is itself tested
    (`tools/test_pe_blob.py`, synthetic PEs, all failure modes).
 
 ## Status
 
-Phases 0-3 **done**: PIC pipeline with a proven position-independence
-check, syscall engine, HWBP hooks, sleep mask, HTTP check-in, wire
-contract, operator commands listed above, and the Go plugin — all
-validated against a live AdaptixC2 v1.2 server on a real Windows 11
-implant. Remaining for parity (see [PARITE.md](docs/PARITE.md)):
-interactive `shell`, token operations (`tkn`), `screenshot`, SOCKS5 and
-port forwarding, PPID spoofing, the extended Beacon API and async BOF
-pool.
+**Release candidate (RC1)** — phases 0-3 done: PIC pipeline with a proven
+position-independence check, syscall engine, HWBP hooks, encrypted sleep
+mask (threadpool + TIB spoof), HTTP check-in, wire contract, the full
+operator command set listed above, and the Go plugin — all validated
+against a live AdaptixC2 v1.2 server on a real Windows 11 implant.
+Open before the final release (see [PARITE.md](docs/PARITE.md) open
+points): hostile-pack hardening (the beacon must survive any server-side
+task state), Astral Projection (private heap encryption during sleep),
+SMB named-pipe pivot, watchdog, dll-notify, PPID spoofing, async BOF
+pool, `install.sh`.
 
 ---
 

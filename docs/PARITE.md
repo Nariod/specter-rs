@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-28** (phase 3, itération 20 : sommeil threadpool + TIB spoof validés sur l'implant réel — 43 cycles pool sans exception).
+Dernière mise à jour : **2026-10-28** — **release candidate (RC1)** : gel de l'état au terme de l'itération 20 (sommeil threadpool + TIB spoof validés sur l'implant réel, 43 cycles pool sans exception).
 
 ---
 
@@ -39,10 +39,10 @@ Dernière mise à jour : **2026-10-28** (phase 3, itération 20 : sommeil thread
 | `Config.h` généré par le plugin avant build | JSON (décision 2026-10-22) → `build.rs` → constantes typées no_std | Fait | Validation stricte ; défaut = `profiles/default.json` comme les `#ifndef` originaux |
 | Clé AES-256 injectée au build | `AES_KEY` const générée | Fait | Décodage hex testé ; consommation chiffrement à venir (wire, phase 3) |
 | Killswitch (epoch compilé, vérifié au bootstrap et après chaque sommeil) | `KILL_EPOCH` const + conversion FILETIME→epoch testée + contrôle dans le cycle | Fait | Sortie = boucle silencieuse (placeholder) ; `RtlExitUserThread(0)` en phase 2 |
-| Sleep + jitter configurables | Cycle runtime : `sleep_with_jitter(SLEEP_MS, JITTER_MS, rng)` → `NtDelayExecution` **indirect** (gadget ntdll tournant) | Fait | Hypothèse documentée : jitter symétrique ± ms, à réconcilier avec le dialogue du plugin en phase 4 ; le masque de sommeil chiffré (Ekko/Astral) reste à faire |
+| Sleep + jitter configurables | Cycle runtime : `sleep_with_jitter(SLEEP_MS, JITTER_MS, rng)` → `NtDelayExecution` **indirect** (gadget ntdll tournant) | Fait | Hypothèse documentée : jitter symétrique ± ms ; le masque de sommeil chiffré est validé depuis l'itération 15 (ligne dédiée ci-dessous) |
 | Profils malleables v2 embarqués (GET/POST, métadonnées, wrapping serveur) | Typés en const (`Profile` : rotation, hosts, UA, URIs, headers, placements…) | Partiel | Parsing/validation/faux défauts : fait ; consommation par le transport : phase 3 |
 | Watermark listener | `WATERMARK` const générée, lue par l'instance | Fait | — |
-| Debug checkbox → `specter.log` | — | À faire | Phase 3 (log mémoire + dump fichier optionnel) |
+| Debug checkbox → `specter.log` | Case du dialogue de génération → config `debug` → `specter.log` (bootstrap, check-in, bof, masque, worker ekko) ; replié hors du blob par -Oz quand désactivé | Fait | Itération 14 (détail ligne « Canal debug à la génération ») |
 | Formats de payloads `bin` | `beacon.x64.bin` brut | Fait | — |
 | Formats `exe` / `dll` / `svc` / `ps1` / downloader stagé | Génération PE côté plugin Go | Hors périmètre | Inchangé ; adaptation de l'appel au build (gcc → cargo) : phase 4 |
 | Rich header / EAT / overlay / donor cloning | Génération PE côté plugin Go | Hors périmètre | Inchangé |
@@ -71,7 +71,7 @@ Dernière mise à jour : **2026-10-28** (phase 3, itération 20 : sommeil thread
 | Bypass AMSI (`AmsiScanBuffer`) | Dr3 (laissé libre par ETW) : hook immédiat si amsi.dll est mappé, sinon différé par `LdrRegisterDllNotification` ; retour synthétisé `E_INVALIDARG`, zéro octet modifié | Fait | Test de décision host (notification mock, casse insensible, raisons/absence) ; la callback ignore les threads étrangers (instance via `gs`) |
 | Return-address spoofing (gadget `FF 23` dans DLL signée) | Scan des 6 modules signés de l'original (kernel32, kernelbase, bcrypt, advapi32, user32, iphlpapi — lookups PEB, absents = sautés) : `FF 23` d'abord, puis **fallback `ADD RSP, imm8; RET`** (`48 83 C4 xx C3`, imm ≡ 8 mod 16 — contrainte d'alignement structurelle : le slot d'atterrissage est l'adresse de retour originale, l'asm natif ne sert réellement que ce cas aussi) ; harness naked `spt_spoof_call2` (JMP [RBX] + continuation) et `spt_spoof_call2_addrsp` (`sub rsp, imm; push gadget` — RET chain directement vers l'appelant réel, pile restaurée à l'état post-call normal, zéro continuation) ; knob de génération `retspoof_force_addrsp` (case diagnostic du dialogue) force le harnais ADD RSP pour la validation ; log debug du type résolu (`bs: gadget ff23/addrsp/none`) ; consommateur : lecture horloge du killswitch à chaque cycle | Fait | Itération 17 : **validé sur l'implant réel en mode forcé** — session ADD RSP de 87 check-ins propres (175 s à sleep 2s) + cycle complet de tâche (pwd rendu), zéro crash — ~87 retours de l'harnais addrsp par le gadget. Confirmé par specter.log en mode forcé : `bs: gadget addrsp` (le gadget ADD RSP est résolu, le harnais tourne à chaque lecture d'horloge — zéro crash sur ~90 cycles cumulés). L'asm est revu instruction par instruction, non exécutable en test host |
 | Thread stack spoofing (TIB) | `runtime/ekko.rs` : port de sleep.c 160-560 — thread donneur (CreateThread, TIB StackBase/Limit capturés), worker threadpool (TpAllocWork/TpPostWork par hash ntdll, le thread beacon se parque dans WaitForSingleObject), swap TEB + Rsp (`spoof_stack_base - 0x200`) via NtSuspend/NtGet/NtSet/NtResumeThread indirects pendant la fenêtre chiffrée, restauration avant SetEvent (le spoof passe par une COPIE du CONTEXT — la restauration rejoue le Rsp d'origine verbatim) ; whitelist CFG (SptCfgAddTarget : NtSetInformationVirtualMemory/VmCfgCallTargetInformation, SSN Hell's Gate, syscall indirect 6 args `spt_syscall6`) ; async_active (SptAsyncActive : jobs ps run/shell ou tunnels actifs ⇒ pas de masque — corrige le crash latent d'un thread job sur pages chiffrées) | Fait | **20 : validé sur l'implant réel** — session specter-tx : 43 cycles `wk: enter → wk: stub → wk: back → sm: pool ok`, zéro exception, restauration propre (le crash RIP=0 du premier essai = le Rsp muté dans le CONTEXT d'origine, corrigé par la copie). Écart : le worker peut vivre n'importe où dans l'image (il ne s'exécute qu'avant chiffrement/après déchiffrement) là où le natif le place en .text$B |
-| Sleep obfuscation Ekko / Astral Projection (+ sleepmask) | Masque de sommeil chiffré : stub naked auto-suffisant (xorshift64 byte-stream, plages chiffrées hormis la page du stub, sleep `NtDelayExecution` indirect sur gadget Hell's Hall, déchiffrement par flux identique) ; bornes découvertes au bootstrap (prologue d'entrée, magiques de fin d'image et de stub) ; **plages chiffrées clampées aux frontières de pages excluant la page du stub** (NtProtectVirtualMemory agit par pages — le stub vit à l'offset 0x60, un flip naïf rendait sa page non-exécutive en pleine exécution) ; flips `NtProtectVirtualMemory` (SSN Hell's Gate) RW avant le flux et restauration de la protection d'origine après le déchiffrement (images RX des packers), statuts capturés, dégradation propre (sommeil clair) si un flip échoue ; graine chargée après tous les syscalls de flip (ils clobbent RAX, qui porte l'état du keystream) | Partiel | **Validé sur l'implant réel (itération 16)** : RustPacker ntapc (image PAGE_EXECUTE_READ), masque seul puis masque+hooks ETW/AMSI ensemble — 15 check-ins, image chiffrée pendant chaque sommeil, protections restaurées, hooks interceptant les événements de l'hôte pendant les fenêtres chiffrées, zéro crash. Écarts : chiffrement par le même thread (l'image est illisible pendant tout le sommeil) ; la première page (stub d'entree + fenêtre du masque) reste en clair pendant le sommeil — exposition documentée, à réduire en déplaçant le stub en fin d'image ; spoofing pile/tas (ThreadStackSpoofer) à faire ; fenêtre d'exposition VEH identique à l'original |
+| Sleep obfuscation Ekko / Astral Projection (+ sleepmask) | Masque de sommeil chiffré : stub naked auto-suffisant (xorshift64 byte-stream, plages chiffrées hormis la page du stub, sleep `NtDelayExecution` indirect sur gadget Hell's Hall, déchiffrement par flux identique) ; bornes découvertes au bootstrap (prologue d'entrée, magiques de fin d'image et de stub) ; **plages chiffrées clampées aux frontières de pages excluant la page du stub** (NtProtectVirtualMemory agit par pages — le stub vit à l'offset 0x60, un flip naïf rendait sa page non-exécutive en pleine exécution) ; flips `NtProtectVirtualMemory` (SSN Hell's Gate) RW avant le flux et restauration de la protection d'origine après le déchiffrement (images RX des packers), statuts capturés, dégradation propre (sommeil clair) si un flip échoue ; graine chargée après tous les syscalls de flip (ils clobbent RAX, qui porte l'état du keystream) | Partiel | **Validé sur l'implant réel (itération 16)** : RustPacker ntapc (image PAGE_EXECUTE_READ), masque seul puis masque+hooks ETW/AMSI ensemble — 15 check-ins, image chiffrée pendant chaque sommeil, protections restaurées, hooks interceptant les événements de l'hôte pendant les fenêtres chiffrées, zéro crash. Écarts restants : Astral Projection non portée (chiffrement du tas privé, SsnUnmap + backup de l'image) ; la première page (stub d'entrée + fenêtre du masque) reste en clair pendant le sommeil — exposition documentée, à réduire en déplaçant le stub en fin d'image ; fenêtre d'exposition VEH identique à l'original. Le sommeil tourne sur un worker threadpool avec TIB spoof depuis l'itération 20 (ligne dédiée) |
 | `dll-notify` (unhook des callbacks de chargement) | — | À faire | Phase 2/3 |
 
 ## 5. Transports et réseau
@@ -134,15 +134,32 @@ Dernière mise à jour : **2026-10-28** (phase 3, itération 20 : sommeil thread
 
 ---
 
-## Résumé
+## Résumé (RC1 — recompté ligne à ligne)
 
 | Domaine | Fait | Partiel | À faire | Hors périmètre |
 |---|---|---|---|---|
-| Invariants philosophie | 9 | 0 | 0 | 1 |
-| Build / config | 6 | 1 | 1 | 4 |
-| Runtime | 7 | 0 | 1 | 0 |
-| Évasion | 6 | 1 | 2 | 0 |
+| Invariants philosophie | 8 | 0 | 0 | 1 |
+| Build / config | 7 | 1 | 1 | 2 |
+| Runtime | 6 | 0 | 1 | 0 |
+| Évasion | 7 | 1 | 1 | 0 |
 | Transports | 1 | 2 | 1 | 0 |
-| Commandes | 12 | 0 | 1 | 0 |
+| Commandes | 14 | 0 | 0 | 0 |
 | Wire | 1 | 0 | 0 | 0 |
-| Serveur Go | 0 | 2 | 0 | 3 |
+| Serveur Go | 1 | 1 | 0 | 3 |
+
+**Points ouverts au gel RC1** (par ordre de risque) :
+
+1. **Pack hostile** : un serveur AdaptixC2 restauré avec une DB chargée
+   re-héberge des tâches aux nouveaux beacons ; une de ces tâches crashe
+   le beacon au sommeil suivant le dispatch (RIP=0, reproductible avec le
+   code d'avant l'itération 20). Le beacon doit survivre un pack hostile —
+   instrumentation du dispatch + durcissement du parse à faire avant la
+   release finale.
+2. **Astral Projection** (chiffrement du tas privé pendant le sommeil,
+   SsnUnmap + backup de l'image) : la partie restante du sleep.c natif.
+3. **Pivot SMB named pipe** (`link`/`unlink`) : la dernière grosse
+   fonctionnalité manquante.
+4. Petits utilitaires : watchdog, `dll-notify`, PPID spoofing, pool BOF
+   asynchrone, `install.sh`, stub du masque en fin d'image (première page
+   en clair), sous-ensemble étendu de l'API Beacon.
+

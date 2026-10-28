@@ -451,6 +451,78 @@ Budget relevé 24 576 → 32 768 en commit dédié (blob 29 598 ; harnais Go :
 29 673). Écarts documentés dans PARITE.md : async séquentiel, région RWX
 unique, sous-ensemble API Beacon.
 
+Itération 15 (2026-10-27) — **masque de sommeil chiffré validé sur implant
+réel** + 2 bugs critiques attrapés par le VM. Le stub flippe
+`NtProtectVirtualMemory` sur les images RX des packers (sonde RWX au
+bootstrap, dégradation propre si un flip échoue) ; les plages chiffrées
+sont **clampées aux frontières de pages excluant la page du stub**
+(NtProtect agit par pages — le stub vit à l'offset 0x60, un flip naïf
+rendait sa page non-exécutive en pleine exécution, constaté comme
+violation d'exécution à RIP=stub+0x63). VEH diagnostique (builds DEBUG) :
+capture code/RIP/addr de toute exception anormale avant de la laisser
+suivre — il a localisé le bug du masque là où le WER n'arrivait jamais
+dans le harnais. Correctif pipeline : file de résultats de cycle
+512 → 16 KiB + records atomiques multi-entrées.
+
+Itération 16 (2026-10-27) — **MVP : boucle réelle complète validée** sur
+la VM Windows (serveur AdaptixC2 réel, RustPacker ntapc, harnais
+`tools/harness`). Trois correctifs critiques découverts par la batterie :
+exports **forwardés** du PEB (les chaînes de recherche des forwarded
+exports ne sont pas celles des noms), check-in à **payload vide** (le
+serveur n'écrit rien entre prepend/append quand aucune tâche n'est
+hébergée), `___chkstk_ms` asymétrique (prologue push, épilogue double
+pop — règle §8bis « propre ___chkstk_ms »). Toutes les commandes
+fichiers/process/disks/download/exfil + `sleep`/`terminate` rendues en
+live ; `ps run` + `jobs` validés (correctif SECURITY_ATTRIBUTES x64 :
+`bInheritHandle` à +0x10, écrit à +4 il n'était jamais héritable —
+l'enfant n'écrivait jamais dans le pipe). Budget 32 768 → 40 960 en
+commit dédié.
+
+Itération 17 (2026-10-28) — **screenshot** (capture GDI par hash, BMP
+streameée comme un download, `TsScreenshotAdd` côté plugin) et **retspoof
+complet** : fallback `ADD RSP, imm8; RET` (imm ≡ 8 mod 16, contrainte
+d'alignement structurelle) quand aucun gadget `FF 23` n'est trouvé dans
+les 6 modules signés de l'original ; knob de génération `force_addrsp`
+pour la validation (87 check-ins propres en mode forcé sur l'implant).
+Budget 40 960 → 49 152 (commit dédié).
+
+Itération 18/18bis (2026-10-28) — **`tkn`** complet (port de token.c :
+steal/make/impersonate/revert/list/remove/getuid/privs, wire 52-59, store
+de tokens dans l'instance, impersonation au niveau thread) puis **shell
+interactif** (Remote Shell : jobs type 4 + TerminalCallbacks v1.2 —
+start/write/exit/kill validés en live, écho de la saisie car cmd.exe
+n'écho pas l'entrée pipée, filtrage du line-echo, \n→\r\n en mode pipe).
+
+Itération 19 (2026-10-28) — **tunnels socks/lportfwd/rportfwd validés
+byte-exact** (20 Ko md5-identiques à travers le cycle check-in, sur
+l'implant réel). Trois bugs racine corrigés : (1) les commandes tunnel
+doivent être des tâches serveur `TASK_TYPE_TUNNEL` — une `TASK_TYPE_TASK`
+vide empoisonne le parse du pack beacon (record inconnu → abandon du
+reste du pack, les proxy tasks qui suivent sont perdues) ; (2)
+`parse_tunnel_write` doit consommer le commandId ET le taskId final ;
+(3) la file de résultats différés est consommée au POST réussi — sinon un
+cycle à réponse vide renvoie les records (start record dupliqué →
+double resume → réponse SOCKS5 en double au client). Enseignement : le
+débit d'un tunnel beacon HTTP est borné par le sleep (~4 Ko/cycle/socket).
+
+Itération 20 (2026-10-28) — **sommeil threadpool + TIB spoof** (port de
+sleep.c 160-560 : worker TpAllocWork/TpPostWork, thread donneur, swap
+TEB+Rsp par NtSuspend/NtGet/NtSet/NtResumeThread indirects pendant la
+fenêtre chiffrée, restauration avant SetEvent) — validé sur l'implant
+réel : 43 cycles pool, zéro exception. Deux leçons : le spoof passe par
+une **COPIE du CONTEXT** (muter orig_ctx.rsp laissait le thread beacon
+sur la pile du donneur après SetEvent — crash RIP=0), et le packer Rust
+active CFG → whitelist obligatoire (port du SptCfgAddTarget natif :
+`NtSetInformationVirtualMemory`/VmCfgCallTargetInformation par syscall
+indirect 6 arguments, `spt_syscall6`). `async_active` (SptAsyncActive) :
+jobs/tunnels actifs ⇒ pas de masque (corrige le crash latent d'un thread
+job exécutant des pages chiffrées). Enseignement labo majeur : un serveur
+AdaptixC2 restauré avec une DB chargée re-heberge des tâches aux nouveaux
+beacons qui **crashent au sommeil suivant le dispatch** (RIP=0,
+reproductible même avec le code d'avant l'itération) — le beacon doit
+survivre un pack hostile (durcissement du parse : reste ouvert). Budget
+49 152 → 53 248 (commit dédié).
+
 **Phase 4 — Intégration & parité** : `agent_specter` invoque `cargo` au lieu de
 `gcc` (même dialogue), `install.sh` étendu, parité commandes complète, A/B
 détection en labo vs le beacon C, docs.

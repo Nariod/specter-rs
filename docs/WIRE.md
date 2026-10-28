@@ -393,6 +393,43 @@ lportfwd, socks (SOCKS5 curl `--socks5-hostname`), rportfwd — chacun
 transfère 20 Ko **byte-exact** (md5 identique) à travers le cycle
 check-in ; stops propres (`socks stop`, `lportfwd stop`, `rportfwd stop`).
 
+## Transferts — download / upload / exfil (itérations 13/16, pinné sur beacon_agent pl_utils.go)
+
+Trois commandes orchestrent les flux de fichiers ; toutes les données
+voyagent dans les records de cycle (le débit est borné par le sleep).
+
+### `download` (beacon → opérateur, 64 KiB par cycle)
+
+Tâche : `u32 LE 32 || string chemin || u32 LE taskId` (chemin converti
+UTF8→ACP côté plugin). Le beacon répond par une *séquence* de records
+`COMMAND_DOWNLOAD` portant le même taskId :
+
+- START : `u32 BE taskId || u32 BE 32 || u32 BE fileId || u8 1 ||
+  u64 BE taille || array nomFichier` → `TsDownloadAdd` (le plugin crée
+  l'entrée de téléchargement).
+- CONTINUE (un par cycle) : `… || u32 BE fileId || u8 2 || array chunk`
+  (64 KiB lus du handle ouvert) → `TsDownloadUpdate(RUNNING)` ; le
+  screenshot réutilise le même flux (BMP dans le buffer, 48 KiB/cycle).
+- FINISH : `… || u32 BE fileId || u8 3` → `TsDownloadClose(FINISHED)`.
+
+### `upload` (opérateur → beacon, chunks SAVEMEMORY + commande finale)
+
+- Chaque chunk : `u32 LE 0x2321 || u32 LE memoryId || u32 LE tailleAnnonce ||
+  u32 LE chunkLen || octets || u32 LE taskId` — parse **en ligne** (le
+  chunk emprunte le tampon de réponse, comme EXEC_BOF). Les chunks
+  s'accumulent dans un buffer tas (cap 8 MiB — le dépassement refuse
+  poliment la commande finale).
+- Commande finale : `u32 LE 33 || u32 LE memoryId || string destination ||
+  u32 LE taskId` — écrit le fichier accumulé.
+
+### `exfil` (contrôle serveur du download, clé = fileId)
+
+Tâche : `u32 LE 35 || u32 LE état || u32 LE fileId || u32 LE taskId`
+(états natifs DOWNLOAD_STATE_RUNNING/STOPPED/CANCELED). **Piège épinglé
+en itération 16** : le natif écrit l'état comme un `int` complet
+(u32 LE), pas un octet — lu comme u8 le parse désynchronisait de 3 octets
+et le stop d'exfiltration se perdait silencieusement.
+
 ## BOF — `execute bof` (itération 14, pinné sur beacon_agent pl_main.go/pl_utils.go)
 
 Tâche (`PackArray` : bool = 1 octet, bytes = brut, string = u32 LE len+NUL,
