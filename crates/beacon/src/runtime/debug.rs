@@ -206,3 +206,74 @@ pub unsafe fn close(instance: &mut Instance) {
     ))(handle);
     instance.debug_handle = 0;
 }
+
+// --- first-chance exception logger (diagnostic, DEBUG builds) -------------
+//
+// The iteration-16 sleep-mask crash on the real VM showed no WER event in
+// the harness window; this logger captures the exception in flight: the
+// handler writes the code, the faulting RIP and the fault address to
+// specter.log as raw little-endian bytes, then returns EXCEPTION_CONTINUE_SEARCH
+// — the exception proceeds exactly as it would have.
+
+/// `ntdll!RtlAddVectoredExceptionHandler(First=1, Handler)` by hash.
+const H_RTL_ADD_VEH: u64 = specter_core::fnv::fnv1a64(b"RtlAddVectoredExceptionHandler");
+
+/// The handler: never neutralizes anything, only writes.
+unsafe extern "system" fn veh_crash_logger(pev: *mut core::ffi::c_void) -> i32 {
+    // EXCEPTION_POINTERS { PEXCEPTION_RECORD ExceptionRecord; PCONTEXT Context }
+    let rec = *(pev as *const *const u8);
+    if rec.is_null() {
+        return 1; // EXCEPTION_CONTINUE_SEARCH
+    }
+    let ctx = *(pev as *const *const u8).add(1);
+    let code = *(rec as *const u32);
+    // EXCEPTION_RECORD: code +0, flags +4, nested +8, ExceptionAddress +0x10
+    let addr = *(rec as *const *const u8).add(2);
+    let rip = if ctx.is_null() {
+        0
+    } else {
+        *(ctx.add(0xF8) as *const usize)
+    };
+    let inst = crate::runtime::bootstrap::instance();
+    if inst.is_null() {
+        return 1;
+    }
+    let mut line = [0u8; 43];
+    line[..7].copy_from_slice(b"veh:exc");
+    line[7..8].copy_from_slice(b" ");
+    line[8..12].copy_from_slice(&code.to_le_bytes());
+    line[12..16].copy_from_slice(b"rip ");
+    line[16..24].copy_from_slice(&(rip as u64).to_le_bytes());
+    line[24..29].copy_from_slice(b"addr ");
+    line[29..37].copy_from_slice(&(addr as u64).to_le_bytes());
+    line[37..42].copy_from_slice(b"crash");
+    line[42] = b'\n';
+    log(&*inst, &line);
+    1 // EXCEPTION_CONTINUE_SEARCH: the crash proceeds untouched
+}
+
+/// Register the crash logger (DEBUG builds only). Failure is silent.
+///
+/// # Safety
+///
+/// Beacon thread, after `store_instance`.
+pub unsafe fn register_crash_logger(ntdll: *mut core::ffi::c_void) {
+    if !enabled() || ntdll.is_null() {
+        return;
+    }
+    let add = peb::find_export(ntdll, H_RTL_ADD_VEH);
+    if add.is_null() {
+        return;
+    }
+    let add = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(u32, *mut core::ffi::c_void) -> *mut core::ffi::c_void,
+    >(add as *const core::ffi::c_void);
+    add(1, veh_crash_logger as *mut core::ffi::c_void);
+    // registration proof (diagnostic): the handler itself cannot log from
+    // inside an encrypted image.
+    let inst = crate::runtime::bootstrap::instance();
+    if !inst.is_null() {
+        log(&*inst, b"veh: on\n");
+    }
+}

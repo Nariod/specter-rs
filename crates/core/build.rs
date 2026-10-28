@@ -85,6 +85,11 @@ fn main() {
     manifest.push("sm: probe".to_string());
     manifest.push("sm: probe1".to_string());
     manifest.push("sm: probe2".to_string());
+    manifest.push("sm: enter".to_string());
+    manifest.push("sm: flips ok".to_string());
+    manifest.push("sm: flip fail".to_string());
+    manifest.push("veh:exc".to_string());
+    manifest.push("veh: on".to_string());
     manifest.push("bs: instance ok".to_string());
     manifest.push("bs: FAIL modules".to_string());
     manifest.push("bs: FAIL exit".to_string());

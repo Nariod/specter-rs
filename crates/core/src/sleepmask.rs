@@ -45,6 +45,8 @@ pub struct SleepMaskParams {
     pub interval: i64,     // +0x38 (relative delay)
     pub protect_ssn: u32,  // +0x40 (NtProtectVirtualMemory)
     pub orig_protect: u32, // +0x44 (image protection, probed at bootstrap)
+    pub flip1_status: u32, // +0x48 (range-1 flip NTSTATUS, written by the stub)
+    pub flip2_status: u32, // +0x4C (range-2 flip NTSTATUS, written by the stub)
 }
 
 /// Walk down from a hint address in fixed steps, returning the first
@@ -118,7 +120,9 @@ mod tests {
         assert_eq!(offset_of!(SleepMaskParams, interval), 0x38);
         assert_eq!(offset_of!(SleepMaskParams, protect_ssn), 0x40);
         assert_eq!(offset_of!(SleepMaskParams, orig_protect), 0x44);
-        assert_eq!(core::mem::size_of::<SleepMaskParams>(), 0x48);
+        assert_eq!(offset_of!(SleepMaskParams, flip1_status), 0x48);
+        assert_eq!(offset_of!(SleepMaskParams, flip2_status), 0x4C);
+        assert_eq!(core::mem::size_of::<SleepMaskParams>(), 0x50);
     }
 
     #[test]
