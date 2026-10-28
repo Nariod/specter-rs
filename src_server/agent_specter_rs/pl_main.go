@@ -286,6 +286,9 @@ type GenerateConfig struct {
 	SleepMask  bool   `json:"sleep_mask"`
 	Stages     int    `json:"stages"`
 	Hooks      bool   `json:"hooks"`
+	// Diagnostic: skip the JMP [RBX] gadget scan so the ADD RSP harness
+	// runs on every spoofed call (retspoof validation mode).
+	RetSpoofAddrSp bool `json:"retspoof_force_addrsp"`
 }
 
 // sptConfig: the beacon build contract (crates/core/build.rs).
@@ -300,7 +303,10 @@ type sptConfig struct {
 	SleepMask   bool            `json:"sleep_mask"`
 	Stages      uint32          `json:"stages"`
 	Hooks       bool            `json:"hooks"`
-	Profile     json.RawMessage `json:"profile"`
+	// Diagnostic: skip the JMP [RBX] gadget scan so the ADD RSP harness
+	// runs on every spoofed call (retspoof validation mode).
+	RetSpoofAddrSp bool            `json:"retspoof_force_addrsp"`
+	Profile        json.RawMessage `json:"profile"`
 }
 
 // listenerConfig: the fields of the listener's saved profile (TransportConfig
@@ -536,8 +542,9 @@ func (p *PluginAgent) BuildPayload(profile adaptix.BuildProfile, agentProfiles [
 			}
 			return uint32(generateConfig.Stages)
 		}(),
-		Hooks:      generateConfig.Hooks,
-		Profile:     profileJSON,
+		Hooks:         generateConfig.Hooks,
+		RetSpoofAddrSp: generateConfig.RetSpoofAddrSp,
+		Profile:       profileJSON,
 	}
 	cfgJSON, err := json.Marshal(cfg)
 	if err != nil {

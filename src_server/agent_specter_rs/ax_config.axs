@@ -123,6 +123,8 @@ function GenerateUI(listeners_type)
     let checkHooks = form.create_check("Evasion hooks (ETW/AMSI)");
     checkHooks.setChecked(true);
 
+    let checkAddrsp = form.create_check("Force ADD RSP retspoof (diagnostic)");
+
     let layout = form.create_gridlayout();
     layout.addWidget(labelFormat,   0, 0, 1, 1);
     layout.addWidget(comboFormat,   0, 1, 1, 1);
@@ -136,6 +138,7 @@ function GenerateUI(listeners_type)
     layout.addWidget(checkDebug,    5, 0, 1, 1);
     layout.addWidget(checkSleepMask, 6, 0, 1, 1);
     layout.addWidget(checkHooks,    7, 0, 1, 1);
+    layout.addWidget(checkAddrsp,   8, 0, 1, 1);
 
     let container = form.create_container();
     container.put("format",     comboFormat);
@@ -147,6 +150,7 @@ function GenerateUI(listeners_type)
     container.put("debug",       checkDebug);
     container.put("sleep_mask",  checkSleepMask);
     container.put("hooks",       checkHooks);
+    container.put("retspoof_force_addrsp", checkAddrsp);
 
     let panel = form.create_panel();
     panel.setLayout(layout);
