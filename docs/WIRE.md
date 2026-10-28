@@ -155,6 +155,38 @@ RC4(session, frame(flags=0, u32 LE origLen,
   u32 BE sleepSec || u32 BE jitterPct` → « Sleep time has been changed ».
 - terminate : le beacon sort silencieusement ; pas d'accusé.
 
+## ps run + jobs — infrastructure jobs (itération 16, pinné sur beacon_agent CmdPsRun/JobsController)
+
+Tâches (`PackArray` : bool = 1 octet, int = u32 LE, string = u32 LE len+NUL) :
+
+```
+ps run    u32 LE 43 || u8 progOutput || u8 useToken || u32 LE progState
+          || pack_string progArgs || u32 LE taskId
+jobs list u32 LE 46 || u32 LE taskId
+jobs kill u32 LE 47 || u32 LE jobId || u32 LE taskId
+```
+
+`useToken` est parsé puis ignoré (pas d'infrastructure tokens — MVP).
+`jobId` = le taskId de la tâche `ps run` d'origine (le plugin l'utilise
+comme identifiant de job).
+
+Résultats du beacon (BE, un ou plusieurs par cycle) :
+
+- `COMMAND_PS_RUN` (43) : `u32 BE taskId || u32 BE 43 || u32 BE pid ||
+  u8 isOutput || array prog` → « Program %v started with PID %d ».
+- `COMMAND_JOB` (0x8437) : `u32 BE jobId || u32 BE 0x8437 || u8 jobType
+  || u8 state [|| array data]`. `jobType` = 3 (process). États natifs :
+  1 = RUNNING (porte la sortie drainée du pipe, `Completed=false`, la
+  tâche reste ouverte), 2 = FINISHED, 3 = KILLED (fin de vie, tâche
+  close). Le beacon garde au plus 8 jobs, draine le pipe à chaque cycle
+  (cap 8 KiB par read) et récolte le job sur sortie détectée
+  (`GetExitCodeProcess != STILL_ACTIVE`) ; le record JOB porte le taskId
+  d'origine, pas un id de tâche jobs.
+- `COMMAND_JOB_LIST` (46) : `u32 BE taskId || u32 BE 46 || u32 BE count`,
+  puis par entrée `u32 BE jobId || u16 BE jobType || u16 BE pid`.
+- `COMMAND_JOBS_KILL` (47) : `u32 BE taskId || u32 BE 47 || u8 found ||
+  u32 BE jobId` → « Job %08x mark as Killed » / « Job %08x not found ».
+
 ## BOF — `execute bof` (itération 14, pinné sur beacon_agent pl_main.go/pl_utils.go)
 
 Tâche (`PackArray` : bool = 1 octet, bytes = brut, string = u32 LE len+NUL,
