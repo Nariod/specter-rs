@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-28** (phase 3, itération 16 : ps run + jobs list/kill validés sur l'implant réel).
+Dernière mise à jour : **2026-10-28** (phase 3, itération 17 : screenshot validé sur l'implant réel — capture GDI streamée, réassemblage serveur, TsScreenshotAdd).
 
 ---
 
@@ -99,7 +99,7 @@ Dernière mise à jour : **2026-10-28** (phase 3, itération 16 : ps run + jobs 
 | `bof` (loader COFF) — l'intérêt central du C2 | Beacon : `core::coff` (parse COFF x64 pur, borné — 512 symboles, relocations 10 octets) + chargeur `beacon::coff` (port de runner.c : layout data→mapFuncs→code, `VirtualAlloc` RWX, relocations additives ADDR64/ADDR32NB/REL32..REL32_5 exactes, ADDR32 non patché comme l'original, imports `__imp_MODULE$Func` par hash via PEB puis LoadLibraryA, table Beacon API par hash — Output/Printf/DataParse/Int/Short/Length/Extract/Ptr, `BeaconPrintf` C-variadic natif → formateur pur borné `%s %d %u %x %X %c %p` sans flottants, .pdata enregistré via RtlAddFunctionTable pour les BOFs SEH, erreur SYMBOL = nom du symbole) ; records : lifecycle EXEC_BOF (état 1/2) dans la file de cycle, outputs EXEC_BOF_OUT dans une file heap drainée au POST par records entiers (fin en dernier — l'ordre natif) ; plugin Go : CreateCommand `execute bof` (base64 + fallback brut+NUL), ProcessData EXEC_BOF/EXEC_BOF_OUT portés (map bof_output), dialogues ax natifs | Fait | Itération 14 (loader+parsing pinnés par tests host, COFF synthétique) + **16 : validé sur l'implant Windows réel** — `execute bof` (BOF Rust `tools/bof/hello.rs`, 858 o) sur session vivante : `bof: exec`/`bof: done`, sortie « hello from the specter-rs bof » rendue à l'opérateur, beacon stable ensuite. Convention d'appel indirecte documentée (WIRE.md §BOF : extern static/refptr — un `jmp rel32` direct saute dans le slot mapFuncs, comportement identique à l'original). Écarts documentés : async séquentiel (state 1 puis exécution inline — pas de pool de threads), une région RWX au lieu du split data/code RX, sous-ensemble de l'API Beacon (tokens/format/KV à suivre), pas de wrapper CreateThread pour les BOFs qui spawnent leurs threads |
 | `tkn` (steal/make/impersonate/revert/list/remove/getuid/privs) | — | À faire | Phase 3 |
 | `socks` (SOCKS5), `lportfwd`, `rportfwd` | — | À faire | Phase 3 |
-| `screenshot` | — | À faire | Phase 3 |
+| `screenshot` | Beacon : capture GDI par hash (user32/gdi32 résolus PEB puis `LoadLibraryA`, tiering 24bpp/8bpp du natif contre la borne heap 8 MiB), BMP complet en heap puis **streamé comme un download** (START/CONTINUE/FINISH, 48 KiB par cycle — le corps POST est borné à 0x12000, un BMP plein écran fait ~6 Mo) ; échec de capture = record COMMAND_ERROR ; plugin Go : CreateCommand `screenshot`, ProcessData réassemblage par task id (map mutex) → `TsScreenshotAdd`, dialogue ax déclaré | Fait* | **17 : validé sur l'implant réel** — 1920x1122 24bpp, 6 462 774 o streamés en 276 s (sleep 2s), « Screenshot captured », BMP valide stocké côté serveur (DB + disque). Écarts : le fallback 8bpp n'est pas déclenché par la VM de test (écran 24bpp sous la borne) ; une capture à la fois |
 | `joblist` / `jobkill` | Couvert par l'infrastructure jobs (ligne `Jobs` ci-dessus) : tableau de jobs de l'instance, list/kill par ID | Fait* | **16 : validés en live** (voir ligne Jobs) |
 
 ## 7. Protocole wire
@@ -143,6 +143,6 @@ Dernière mise à jour : **2026-10-28** (phase 3, itération 16 : ps run + jobs 
 | Runtime | 7 | 0 | 1 | 0 |
 | Évasion | 5 | 2 | 2 | 0 |
 | Transports | 1 | 2 | 1 | 0 |
-| Commandes | 9 | 0 | 4 | 0 |
+| Commandes | 10 | 0 | 3 | 0 |
 | Wire | 1 | 0 | 0 | 0 |
 | Serveur Go | 0 | 2 | 0 | 3 |

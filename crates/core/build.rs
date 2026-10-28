@@ -55,6 +55,8 @@ fn main() {
     manifest.push("winhttp.dll".to_string());
     manifest.push("iphlpapi.dll".to_string());
     manifest.push("advapi32.dll".to_string());
+    manifest.push("user32.dll".to_string());
+    manifest.push("gdi32.dll".to_string());
     // Debug-channel literals (config::DEBUG builds only; a false build
     // const-folds every site away, and absence is fine for the guard).
     manifest.push("specter.log".to_string());

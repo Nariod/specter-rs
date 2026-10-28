@@ -43,7 +43,9 @@ AdaptixC2, never the other way around.
   start/stop/cancel, `ps` (tree, arch/context per process), `getuid`,
   `ps kill`, **`ps run`** (hidden window, stdout captured through an
   anonymous pipe, output streamed across cycles), **`jobs list` /
-  `jobs kill`**, `disks`, and the **COFF/BOF loader** (`execute bof`,
+  `jobs kill`**, `disks`, **`screenshot`** (GDI capture by hash, BMP
+  streamed across cycles and reassembled server-side), and the
+  **COFF/BOF loader** (`execute bof`,
   full relocation set, subset of the Beacon API, `.pdata` registration,
   variadic `BeaconPrintf`) — BOFs compile with plain `rustc` or MSVC C.
 - **Server plugin (Go, ABI v1.2)** — real agent generation dialog driving

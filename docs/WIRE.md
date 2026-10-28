@@ -187,6 +187,45 @@ Résultats du beacon (BE, un ou plusieurs par cycle) :
 - `COMMAND_JOBS_KILL` (47) : `u32 BE taskId || u32 BE 47 || u8 found ||
   u32 BE jobId` → « Job %08x mark as Killed » / « Job %08x not found ».
 
+## Screenshot — `screenshot` (itération 17, port du natif SptCmdScreenshot)
+
+Tâche (`PackArray`) :
+
+```
+screenshot  u32 LE 44 || u32 LE taskId
+```
+
+44 est un id libre de la numérotation native beacon_agent (le voisinage
+41-47 est ps/jobs, 44/45 inutilisés). Le natif specter utilise son propre
+0x28 sur son propre wire ; côté AdaptixC2 c'est notre wire qui fait foi.
+
+Le beacon capture l'écran à la réception de la tâche (GDI par hash :
+user32/gdi32 résolus PEB puis `LoadLibraryA`, `GetSystemMetrics` →
+`GetDC`/`CreateCompatibleDC`/`CreateCompatibleBitmap`/`BitBlt`/
+`GetDIBits`) et écrit un BMP complet dans un buffer heap : 24bpp si les
+pixels tiennent dans la borne heap (8 MiB), sinon 8bpp niveaux de gris
+avec palette (tiering du natif ; un écran 2560x1440 ne tient pas en
+24bpp sous la borne). Échec de capture = record COMMAND_ERROR.
+
+Le BMP (typiquement ~6 Mo) ne tient pas dans le cadre body 0x12000 :
+il est **streamé comme un download**, 48 KiB par cycle, records BE :
+
+```
+START    u32 BE taskId || u32 BE 44 || u8 1 || u64 BE totalSize
+CONTINUE u32 BE taskId || u32 BE 44 || u8 2 || array chunk (48 KiB)
+FINISH   u32 BE taskId || u32 BE 44 || u8 3
+```
+
+Une seule capture à la fois (une seconde tâche pendant un stream =
+COMMAND_ERROR). Un push CONTINUE qui ne tient pas dans le body (download
+concurrent) est retenté au cycle suivant. Côté plugin : le START affiche
+« Screenshot capture started », les CONTINUE s'accumulent par task id
+(map protégée mutex), le FINISH rend la main à `TsScreenshotAdd` avec le
+BMP complet (« Screenshot captured »).
+
+Validé sur l'implant réel (itération 17) : 1920x1122 24bpp, 6 462 774 o,
+START→FINISH en 276 s à sleep 2s (~132 cycles), BMP valide côté serveur.
+
 ## BOF — `execute bof` (itération 14, pinné sur beacon_agent pl_main.go/pl_utils.go)
 
 Tâche (`PackArray` : bool = 1 octet, bytes = brut, string = u32 LE len+NUL,

