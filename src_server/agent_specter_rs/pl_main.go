@@ -166,6 +166,14 @@ const (
 	COMMAND_DISKS      = 15
 	COMMAND_PS_LIST    = 41
 	COMMAND_PS_KILL    = 42
+	COMMAND_PS_RUN     = 43
+	COMMAND_JOB        = 0x8437
+	COMMAND_JOB_LIST   = 46
+	COMMAND_JOBS_KILL  = 47
+	JOB_TYPE_PROCESS   = 0x3
+	JOB_STATE_RUNNING  = 0x1
+	JOB_STATE_FINISHED = 0x2
+	JOB_STATE_KILLED   = 0x3
 	COMMAND_DOWNLOAD   = 32
 	COMMAND_UPLOAD     = 33
 	COMMAND_EXFIL      = 35
@@ -824,6 +832,45 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 				goto RET
 			}
 			array = []interface{}{COMMAND_PS_KILL, int(pid)}
+		} else if subcommand == "run" {
+			// Port of the native `ps run` (beacon_agent CreateCommand):
+			// output capture flag, token flag (MVP: parsed, unused by the
+			// beacon), suspend flag -> creation state, full command line.
+			taskData.Type = adaptix.TASK_TYPE_JOB
+
+			output := getBoolArg(args, "-o")
+			impersonation := getBoolArg(args, "-i")
+			suspend := getBoolArg(args, "-s")
+			programState := 0
+			if suspend {
+				programState = 4
+			}
+			programArgs, _ := args["args"].(string)
+			programArgs = Ts.TsConvertUTF8toCp(programArgs, agentData.ACP)
+
+			array = []interface{}{COMMAND_PS_RUN, output, impersonation, programState, programArgs}
+		} else {
+			err = errors.New("subcommand must be 'list', 'kill' or 'run'")
+			goto RET
+		}
+
+	case "jobs":
+		if subcommand == "list" {
+			array = []interface{}{COMMAND_JOB_LIST}
+		} else if subcommand == "kill" {
+			var job string
+			var jobId int64
+
+			job, err = getStringArg(args, "task_id")
+			if err != nil {
+				goto RET
+			}
+			jobId, err = strconv.ParseInt(job, 16, 64)
+			if err != nil {
+				goto RET
+			}
+
+			array = []interface{}{COMMAND_JOBS_KILL, int(jobId)}
 		} else {
 			err = errors.New("subcommand must be 'list' or 'kill'")
 			goto RET
@@ -1334,6 +1381,92 @@ func (e *ExtenderAgent) ProcessData(agentData adaptix.AgentData, decryptedData [
 			}
 			pid := packer.ParseInt32()
 			task.Message = fmt.Sprintf("Process %d killed", pid)
+
+		case COMMAND_PS_RUN:
+			if false == packer.CheckPacker([]string{"int", "byte", "array"}) {
+				goto HANDLER
+			}
+			pid := packer.ParseInt32()
+			isOutput := packer.ParseInt8()
+			prog := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.ACP)
+
+			status := "no output"
+			if isOutput > 0 {
+				status = "with output"
+			}
+
+			task.Completed = false
+			task.Message = fmt.Sprintf("Program %v started with PID %d (output - %v)", prog, pid, status)
+
+		case COMMAND_JOB:
+			if false == packer.CheckPacker([]string{"byte", "byte"}) {
+				goto HANDLER
+			}
+			jobType := packer.ParseInt8()
+			state := packer.ParseInt8()
+
+			if jobType == JOB_TYPE_PROCESS {
+				if state == JOB_STATE_RUNNING {
+					if false == packer.CheckPacker([]string{"array"}) {
+						goto HANDLER
+					}
+					task.Completed = false
+					jobOutput := Ts.TsConvertCpToUTF8(packer.ParseString(), agentData.OemCP)
+					task.Message = fmt.Sprintf("Job [%v] output:", task.TaskId)
+					task.ClearText = jobOutput
+				} else if state == JOB_STATE_KILLED {
+					task.Completed = true
+					task.MessageType = adaptix.MESSAGE_INFO
+					task.Message = fmt.Sprintf("Job [%v] canceled", task.TaskId)
+				} else if state == JOB_STATE_FINISHED {
+					task.Completed = true
+					task.Message = fmt.Sprintf("Job [%v] finished", task.TaskId)
+				}
+			}
+
+		case COMMAND_JOB_LIST:
+			if false == packer.CheckPacker([]string{"int"}) {
+				goto HANDLER
+			}
+			count := packer.ParseInt32()
+
+			var Output string
+			if count > 0 {
+				Output += fmt.Sprintf(" %-10s  %-5s  %-13s\n", "JobID", "PID", "Type")
+				Output += fmt.Sprintf(" %-10s  %-5s  %-13s", "--------", "-----", "-------")
+				for i := 0; i < int(count); i++ {
+					if false == packer.CheckPacker([]string{"int", "word", "word"}) {
+						goto HANDLER
+					}
+					jobId := fmt.Sprintf("%08x", packer.ParseInt32())
+					jobType := packer.ParseInt16()
+					pid := packer.ParseInt16()
+
+					stringType := "Unknown"
+					if jobType == JOB_TYPE_PROCESS {
+						stringType = "Process"
+					}
+					Output += fmt.Sprintf("\n %-10v  %-5v  %-13s", jobId, pid, stringType)
+				}
+				task.Message = "Job list:"
+				task.ClearText = Output
+			} else {
+				task.Message = "No active jobs"
+			}
+
+		case COMMAND_JOBS_KILL:
+			if false == packer.CheckPacker([]string{"byte", "int"}) {
+				goto HANDLER
+			}
+			result := packer.ParseInt8()
+			jobId := packer.ParseInt32()
+
+			if result == 0 {
+				task.MessageType = adaptix.MESSAGE_ERROR
+				task.Message = fmt.Sprintf("Job %08x not found", jobId)
+			} else {
+				task.Message = fmt.Sprintf("Job %08x mark as Killed", jobId)
+			}
 
 		case COMMAND_DOWNLOAD:
 			if false == packer.CheckPacker([]string{"int", "byte"}) {

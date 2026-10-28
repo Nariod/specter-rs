@@ -89,6 +89,12 @@ fn main() {
     manifest.push("sm: flips ok".to_string());
     manifest.push("sm: flip fail".to_string());
     manifest.push("veh:exc".to_string());
+    manifest.push("jt: drain".to_string());
+    manifest.push("jt: peeked ".to_string());
+    manifest.push("jt: exit?".to_string());
+    manifest.push("jt: avail".to_string());
+    manifest.push("jt: read".to_string());
+    manifest.push("jt: push".to_string());
     manifest.push("veh: on".to_string());
     manifest.push("bs: instance ok".to_string());
     manifest.push("bs: FAIL modules".to_string());

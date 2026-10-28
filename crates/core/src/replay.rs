@@ -387,6 +387,39 @@ fn replay_check_in_against_real_listener() {
                 println!("[replay] task {id:08x}: terminate");
                 return; // the real beacon exits here
             }
+            Some((
+                transport::Task::PsRun {
+                    output, prog_state, ..
+                },
+                id,
+            )) => {
+                println!("[replay] task {id:08x}: ps run (fabricated)");
+                assert!(transport::push_ps_run_result(
+                    &mut w,
+                    id,
+                    0x1234,
+                    output,
+                    b"replay.exe"
+                ));
+                let _ = prog_state;
+                handled += 1;
+            }
+            Some((transport::Task::JobsList, id)) => {
+                println!("[replay] task {id:08x}: jobs list (fabricated)");
+                assert!(transport::push_jobs_list_header(&mut w, id, 1));
+                assert!(transport::push_jobs_list_entry(
+                    &mut w,
+                    id,
+                    transport::JOB_TYPE_PROCESS,
+                    0x1234
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::JobsKill { job_id }, id)) => {
+                println!("[replay] task {id:08x}: jobs kill {job_id:08x} (fabricated)");
+                assert!(transport::push_jobs_kill_result(&mut w, id, true, job_id));
+                handled += 1;
+            }
             None => break,
         }
     }
