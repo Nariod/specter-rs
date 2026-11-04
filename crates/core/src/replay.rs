@@ -559,6 +559,24 @@ fn replay_check_in_against_real_listener() {
                 assert!(transport::push_tunnel_reverse_result(&mut w, tunnel_id, 1));
                 handled += 1;
             }
+            Some((transport::Task::Link { .. }, id)) => {
+                println!("[replay] task {id:08x}: link (fabricated, no pipe on host)");
+                assert!(transport::push_plain_result(
+                    &mut w,
+                    id,
+                    transport::COMMAND_LINK
+                ));
+                handled += 1;
+            }
+            Some((transport::Task::Unlink, id)) => {
+                println!("[replay] task {id:08x}: unlink (fabricated)");
+                assert!(transport::push_plain_result(
+                    &mut w,
+                    id,
+                    transport::COMMAND_UNLINK
+                ));
+                handled += 1;
+            }
             None => break,
         }
     }
