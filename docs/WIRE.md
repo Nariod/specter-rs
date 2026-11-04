@@ -474,6 +474,19 @@ comportement est identique dans l'original — runner.c). La référence doit
   référence : `tools/bof/hello.rs` (build :
   `rustc --target x86_64-pc-windows-gnu --emit=obj -C opt-level=z`).
 
+## ps run avec PPID spoofé — COMMAND_PS_RUN_PPID (itération 26)
+
+- `COMMAND_PS_RUN_PPID` (75) : `u32 LE 75 || u8 output || u8 useToken ||
+  u32 LE progState || u32 LE ppid || string args || u32 LE taskId` — même
+  layout que `COMMAND_PS_RUN` (43) avec le pid parent inséré avant les
+  args. Côté beacon : `OpenProcess(PROCESS_CREATE_PROCESS, ppid)` +
+  `InitializeProcThreadAttributeList` / `UpdateProcThreadAttribute`
+  (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` = 0x20002) + `CreateProcessA`
+  avec `EXTENDED_STARTUPINFO_PRESENT` et une `STARTUPINFOEXA` (cb =
+  0x70, `lpAttributeList` en +0x68), puis cleanup (`DeleteProcThread-
+  AttributeList` + `CloseHandle`). ppid = 0 sur `COMMAND_PS_RUN` : chemin
+  inchangé (STARTUPINFOA, pas d'attribut).
+
 ## Pivot SMB named pipe — link / unlink (itération 24)
 
 Le beacon peut rediriger tout son transport check-in vers un named pipe
