@@ -53,7 +53,10 @@ PRINTABLE = range(0x20, 0x7F)
 # TIB stack spoof module (Ekko worker, donor thread, x64 CONTEXT, tunnels
 # at 47.9 KiB): headroom for the remaining portage (pivot SMB, watchdog,
 # PPID spoof). Deliberate raise, its own commit.
-DEFAULT_MAX_SIZE = 53248
+# Raised 53248 -> 57344 for Astral Projection mode 1 (external stub copy,
+# backup + NtUnmapViewOfSection/NtAllocateVirtualMemory remap in the sleep
+# stub, heapmask) at 52.2 KiB. Deliberate raise, its own commit.
+DEFAULT_MAX_SIZE = 57344
 
 
 def find_strings(blob):
