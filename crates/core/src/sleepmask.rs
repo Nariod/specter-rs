@@ -36,7 +36,7 @@ pub const ENTRY_PROLOGUE: [u8; 5] = [0x48, 0x83, 0xEC, 0x08, 0xE8];
 pub struct SleepMaskParams {
     pub img_base: usize,   // +0x00
     pub img_end: usize,    // +0x08
-    pub stub_start: usize, // +0x10
+    pub stub_start: usize, // +0x10 (mode 0: encrypted-range bounds clamped around the stub page; mode 1: caller sets both to img_end so range 1 = the whole image)
     pub stub_end: usize,   // +0x18
     pub seed: u64,         // +0x20
     pub ssn: u32,          // +0x28 (NtDelayExecution)
@@ -47,6 +47,13 @@ pub struct SleepMaskParams {
     pub orig_protect: u32, // +0x44 (image protection, probed at bootstrap)
     pub flip1_status: u32, // +0x48 (range-1 flip NTSTATUS, written by the stub)
     pub flip2_status: u32, // +0x4C (range-2 flip NTSTATUS, written by the stub)
+    pub backup: usize, // +0x50 (mode 1: heap buffer receiving the encrypted image copy before the unmap)
+    pub mode: u32, // +0x58 (0 = in-image mask only; 1 = external stub: full-image mask + backup + unmap + remap)
+    pub unmap_ssn: u32, // +0x5C (NtUnmapViewOfSection, mode 1)
+    pub alloc_ssn: u32, // +0x60 (NtAllocateVirtualMemory, mode 1 remap)
+    pub img_size: u64, // +0x68 (img_end - img_base, remap allocation size)
+    pub unmap_status: u32, // +0x70 (mode-1 remap NTSTATUS, written by the stub)
+    pub _pad2: u32, // +0x74
 }
 
 /// Walk down from a hint address in fixed steps, returning the first
@@ -122,7 +129,13 @@ mod tests {
         assert_eq!(offset_of!(SleepMaskParams, orig_protect), 0x44);
         assert_eq!(offset_of!(SleepMaskParams, flip1_status), 0x48);
         assert_eq!(offset_of!(SleepMaskParams, flip2_status), 0x4C);
-        assert_eq!(core::mem::size_of::<SleepMaskParams>(), 0x50);
+        assert_eq!(offset_of!(SleepMaskParams, backup), 0x50);
+        assert_eq!(offset_of!(SleepMaskParams, mode), 0x58);
+        assert_eq!(offset_of!(SleepMaskParams, unmap_ssn), 0x5C);
+        assert_eq!(offset_of!(SleepMaskParams, alloc_ssn), 0x60);
+        assert_eq!(offset_of!(SleepMaskParams, img_size), 0x68);
+        assert_eq!(offset_of!(SleepMaskParams, unmap_status), 0x70);
+        assert_eq!(core::mem::size_of::<SleepMaskParams>(), 0x78);
     }
 
     #[test]
