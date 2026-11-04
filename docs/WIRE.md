@@ -474,6 +474,38 @@ comportement est identique dans l'original — runner.c). La référence doit
   référence : `tools/bof/hello.rs` (build :
   `rustc --target x86_64-pc-windows-gnu --emit=obj -C opt-level=z`).
 
+## Pivot SMB named pipe — link / unlink (itération 24)
+
+Le beacon peut rediriger tout son transport check-in vers un named pipe
+(local `\\.\pipe\...` ou distant `\\host\pipe\...` sur SMB) — le pivot
+vers un listener SMB exposé par un autre segment. Le listener SMB reste
+côté serveur (hors périmètre, inchangé).
+
+### Tâches serveur → beacon (PackArray)
+
+- `COMMAND_LINK` (73) : `u32 LE 73 || string pipe || u32 LE taskId` —
+  `CreateFileA` lecture/écriture sur le pipe (`WaitNamedPipeA` 20 s puis
+  un retry si occupé) ; tant qu'un pivot est actif, chaque cycle check-in
+  passe par le pipe au lieu de WinHTTP. Un `link` sur un pivot actif
+  ferme d'abord l'ancien (`unlink` implicite).
+- `COMMAND_UNLINK` (74) : `u32 LE 74 || u32 LE taskId` — ferme le pipe,
+  retour au transport HTTP direct.
+
+Résultats : `push_plain_result` (header taskId/commandId seul), ou
+`COMMAND_ERROR` si l'ouverture du pipe échoue.
+
+### Échange sur le pipe (contrat, itération 24)
+
+Flux d'octets, un frame par échange dans chaque sens :
+
+- requête : `u32 LE bodyLen || body` où `body` est **le même corps RC4
+  chiffré** que le POST HTTP du cycle (beat + résultats, identical bytes) ;
+- réponse : `u32 LE respLen || page` où `page` est la même page de réponse
+  (gabarit + payload chiffré) qu'en HTTP.
+
+Le beacon écrit/lee en boucles jusqu'au frame complet (`net::pipe_exchange`,
+`crates/beacon/src/net.rs`) ; `respLen > 0x10000` est refusé.
+
 ## Écart avec la version précédente de ce document
 
 La relecture de la source serveur (2026-10-22, itération 6) a remplacé la
