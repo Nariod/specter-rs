@@ -657,6 +657,21 @@ fn pad(out: &mut [u8], written: &mut usize, digits: usize, width: usize, zero: b
     }
 }
 
+/// Append `src` to a format buffer at `*len` (bounded by `buf.len()`).
+/// Returns false on overflow — the caller grows the buffer and retries.
+pub fn format_append(buf: &mut [u8], len: &mut usize, src: &[u8]) -> bool {
+    if *len + src.len() > buf.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < src.len() {
+        buf[*len + i] = src[i];
+        i += 1;
+    }
+    *len += src.len();
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -952,6 +967,19 @@ mod tests {
         let mut written = 0usize;
         assert!(bof_format(&mut out, &mut written, long, &args)); // no conversions
         assert_eq!(written, 32); // truncated, no panic
+    }
+
+    #[test]
+    fn format_append_is_bounded_and_advances_len() {
+        let mut buf = [0u8; 8];
+        let mut len = 0usize;
+        assert!(format_append(&mut buf, &mut len, b"abc"));
+        assert_eq!(len, 3);
+        assert!(format_append(&mut buf, &mut len, b"defgh")); // 3+5 = 8 fits
+        assert_eq!(len, 8);
+        assert!(!format_append(&mut buf, &mut len, b"x")); // overflow refused
+        assert_eq!(len, 8);
+        assert_eq!(&buf[..], b"abcdefgh");
     }
 
     #[test]
