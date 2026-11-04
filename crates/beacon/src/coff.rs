@@ -50,12 +50,6 @@ const MEM_RESERVE: u32 = 0x2000;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RELEASE: u32 = 0x8000;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
-const PAGE_MASK: u32 = 0x0FFF;
-
-/// Original MAX_MAP_FUNCS (runner.c): trampoline slots for externals.
-const MAX_MAP_FUNCS: usize = 256;
-/// Original MAX_SECTIONS (the core parser caps at 96).
-const MAX_SECTIONS: usize = 16;
 /// Vararg slots read by the BeaconPrintf shim.
 const PRINTF_SLOTS: usize = 16;
 /// One BeaconPrintf formatted output cap.
@@ -577,59 +571,15 @@ unsafe fn load_and_run(instance: &mut Instance, task: &BofTask) -> Result<(), Lo
         Some(c) => c,
         None => return Err(LoadError::simple(transport::BOF_ERROR_PARSE)),
     };
-    let nsec = coff.num_sections();
-    if nsec > MAX_SECTIONS {
-        return Err(LoadError::simple(transport::BOF_ERROR_PARSE));
-    }
-
     // Layout (runner.c): data sections first, then the mapFuncs trampoline,
-    // then code sections page-aligned. Raw size first, virtual size for
-    // BSS; 16-byte granularity; one region keeps REL32 in range.
-    let mut sec_size = [0u32; MAX_SECTIONS];
-    let mut sec_off = [0u32; MAX_SECTIONS];
-    let mut i = 0;
-    while i < nsec {
-        let s = coff
-            .section(i)
-            .ok_or_else(|| LoadError::simple(transport::BOF_ERROR_PARSE))?;
-        sec_size[i] = if s.raw_size > 0 {
-            s.raw_size
-        } else {
-            s.virtual_size
-        };
-        i += 1;
-    }
-    let mut data_end: u32 = 0;
-    i = 0;
-    while i < nsec {
-        let s = coff.section(i);
-        if let Some(s) = s {
-            if sec_size[i] > 0 && !s.executable() {
-                sec_off[i] = data_end;
-                data_end = data_end.wrapping_add((sec_size[i] + 15) & !15);
-            }
-        }
-        i += 1;
-    }
-    let map_off = data_end;
-    data_end = data_end.wrapping_add((MAX_MAP_FUNCS * 8) as u32);
-    let code_start = (data_end + PAGE_MASK) & !PAGE_MASK;
-    let mut code_end = code_start;
-    i = 0;
-    while i < nsec {
-        let s = coff.section(i);
-        if let Some(s) = s {
-            if sec_size[i] > 0 && s.executable() {
-                sec_off[i] = code_end;
-                code_end = code_end.wrapping_add((sec_size[i] + 15) & !15);
-            }
-        }
-        i += 1;
-    }
-    let total = code_end as usize;
-    if total == 0 {
-        return Err(LoadError::simple(transport::BOF_ERROR_PARSE));
-    }
+    // then code sections page-aligned. Planned in 64-bit by the core parser
+    // so a hostile object cannot wrap the size accumulators into a tiny
+    // allocation followed by out-of-region writes.
+    let plan = match coff::plan_layout(&coff) {
+        Some(p) => p,
+        None => return Err(LoadError::simple(transport::BOF_ERROR_PARSE)),
+    };
+    let total = plan.total;
 
     let va = peb::find_export(instance.kernel32, H_VIRTUAL_ALLOC);
     if va.is_null() {
@@ -649,7 +599,7 @@ unsafe fn load_and_run(instance: &mut Instance, task: &BofTask) -> Result<(), Lo
         return Err(LoadError::simple(transport::BOF_ERROR_ALLOC));
     }
 
-    let result = load_into(instance, &coff, task, base, &sec_size, &sec_off, map_off);
+    let result = load_into(instance, &coff, task, base, &plan);
     if result.is_err() {
         let vf = peb::find_export(instance.kernel32, H_VIRTUAL_FREE);
         if !vf.is_null() {
@@ -670,9 +620,7 @@ unsafe fn load_into(
     coff: &Coff,
     task: &BofTask,
     base: *mut u8,
-    sec_size: &[u32; MAX_SECTIONS],
-    sec_off: &[u32; MAX_SECTIONS],
-    map_off: u32,
+    plan: &coff::Layout,
 ) -> Result<(), LoadError> {
     let nsec = coff.num_sections();
     // Section copies (manual: the memcpy rule).
@@ -686,7 +634,10 @@ unsafe fn load_into(
             if raw.len() != s.raw_size as usize {
                 return Err(LoadError::simple(transport::BOF_ERROR_PARSE));
             }
-            let dst = base.add(sec_off[i] as usize);
+            if plan.sec_off[i] as usize + raw.len() > plan.total {
+                return Err(LoadError::simple(transport::BOF_ERROR_PARSE));
+            }
+            let dst = base.add(plan.sec_off[i] as usize);
             let mut j = 0;
             while j < raw.len() {
                 *dst.add(j) = raw[j];
@@ -697,7 +648,7 @@ unsafe fn load_into(
     }
 
     // mapFuncs trampoline slots.
-    let map_funcs = base.add(map_off as usize) as *mut usize;
+    let map_funcs = base.add(plan.map_off as usize) as *mut usize;
 
     // Pass 1: resolve external symbols (runner.c first pass).
     let mut map_count = 0usize;
@@ -708,7 +659,7 @@ unsafe fn load_into(
             .ok_or_else(|| LoadError::simple(transport::BOF_ERROR_PARSE))?;
         let step = 1 + sym.aux as usize;
         if sym.is_import() {
-            if map_count >= MAX_MAP_FUNCS {
+            if map_count >= coff::MAX_MAP_FUNCS {
                 return Err(LoadError::simple(transport::BOF_ERROR_MAX_FUNCS));
             }
             let name = coff.symbol_name(idx);
@@ -729,14 +680,14 @@ unsafe fn load_into(
         let s = coff
             .section(i)
             .ok_or_else(|| LoadError::simple(transport::BOF_ERROR_PARSE))?;
-        let sec_base = base.add(sec_off[i] as usize);
+        let sec_base = base.add(plan.sec_off[i] as usize);
         let mut r = 0usize;
         while r < s.num_relocs as usize {
             let (site, typ, sym_idx) = match coff.reloc(&s, r) {
                 Some(x) => x,
                 None => return Err(LoadError::simple(transport::BOF_ERROR_PARSE)),
             };
-            if site as usize >= sec_size[i] as usize {
+            if !coff::reloc_site_ok(plan.sec_size[i], site, typ) {
                 return Err(LoadError::simple(transport::BOF_ERROR_PARSE));
             }
             let sym = coff
@@ -763,10 +714,13 @@ unsafe fn load_into(
                 map_funcs.add(ext_idx) as usize
             } else if sym.secnum > 0 {
                 let sn = sym.secnum as usize - 1;
-                if sn >= nsec || sec_size[sn] == 0 {
+                if sn >= nsec || plan.sec_size[sn] == 0 {
                     continue; // the native array walk would run off; we skip
                 }
-                base.add(sec_off[sn] as usize + sym.value as usize) as usize
+                if sym.value as usize >= plan.sec_size[sn] as usize {
+                    return Err(LoadError::simple(transport::BOF_ERROR_PARSE));
+                }
+                base.add(plan.sec_off[sn] as usize + sym.value as usize) as usize
             } else {
                 continue;
             };
@@ -799,7 +753,10 @@ unsafe fn load_into(
     // Entry point: the task names it (the server always sends "go").
     let (entry_sec, value) = find_defined(coff, task.entry_name())
         .ok_or_else(|| LoadError::simple(transport::BOF_ERROR_ENTRY))?;
-    let entry = base.add(sec_off[entry_sec] as usize + value as usize);
+    if value as usize >= plan.sec_size[entry_sec] as usize {
+        return Err(LoadError::simple(transport::BOF_ERROR_ENTRY));
+    }
+    let entry = base.add(plan.sec_off[entry_sec] as usize + value as usize);
 
     // .pdata registration for SEH BOFs (runner.c): RUNTIME_FUNCTION entries
     // whose RVAs the ADDR32NB relocations fixed against our base.
@@ -808,9 +765,9 @@ unsafe fn load_into(
     i = 0;
     while i < nsec {
         if let Some(s) = coff.section(i) {
-            if sec_size[i] > 0 && s.name.len() >= 7 && bytes_eq(&s.name[..7], b".pdata\0") {
-                pdata_base = base.add(sec_off[i] as usize) as *mut c_void;
-                pdata_count = sec_size[i] / 12;
+            if plan.sec_size[i] > 0 && s.name.len() >= 7 && bytes_eq(&s.name[..7], b".pdata\0") {
+                pdata_base = base.add(plan.sec_off[i] as usize) as *mut c_void;
+                pdata_count = plan.sec_size[i] / 12;
                 break;
             }
         }
@@ -818,6 +775,19 @@ unsafe fn load_into(
     }
     let mut func_table = false;
     if !pdata_base.is_null() && pdata_count > 0 {
+        // Validate every RUNTIME_FUNCTION entry before handing the table to
+        // ntdll: a hostile .pdata with out-of-image RVAs must not reach
+        // RtlAddFunctionTable.
+        let mut k = 0usize;
+        while k < pdata_count as usize {
+            let e = (pdata_base as *const u8).add(k * 12);
+            let begin = (e as *const u32).read_unaligned();
+            let end = (e.add(4) as *const u32).read_unaligned();
+            if begin > end || end as usize > plan.total {
+                return Err(LoadError::simple(transport::BOF_ERROR_PARSE));
+            }
+            k += 1;
+        }
         let add = peb::find_export(instance.ntdll, H_RTL_ADD_FUNCTION_TABLE);
         if !add.is_null() {
             let add = core::mem::transmute::<

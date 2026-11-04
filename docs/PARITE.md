@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-10-28** — **release candidate (RC1)** : gel de l'état au terme de l'itération 20 (sommeil threadpool + TIB spoof validés sur l'implant réel, 43 cycles pool sans exception).
+Dernière mise à jour : **2026-11-04** — itération 21 : durcissement anti-pack hostile (voir point 1 des ouverts), au-dessus du gel RC1 **2026-10-28** (itération 20 : sommeil threadpool + TIB spoof validés sur l'implant réel, 43 cycles pool sans exception).
 
 ---
 
@@ -149,12 +149,23 @@ Dernière mise à jour : **2026-10-28** — **release candidate (RC1)** : gel de
 
 **Points ouverts au gel RC1** (par ordre de risque) :
 
-1. **Pack hostile** : un serveur AdaptixC2 restauré avec une DB chargée
-   re-héberge des tâches aux nouveaux beacons ; une de ces tâches crashe
-   le beacon au sommeil suivant le dispatch (RIP=0, reproductible avec le
-   code d'avant l'itération 20). Le beacon doit survivre un pack hostile —
-   instrumentation du dispatch + durcissement du parse à faire avant la
-   release finale.
+1. **Pack hostile** : le crash RIP=0 au sommeil suivant le dispatch était
+   corrigé par l'itération 20 (`async_active`). **Itération 21 : audit + durcissement
+   du parse, fait côté host** — les parsers de tâches (`parse_task`,
+   `parse_save_memory`, `parse_tunnel_write`, `parse_exec_bof`) étaient déjà
+   bornés (Reader borné, caps vérifiés, handlers en recherche linéaire sans
+   index brut) et le sont désormais sous fuzz déterministe (20 000 packs
+   mutés rejoués dans la boucle de dispatch exacte : aucun panic, accesseurs
+   bornés). Le loader COFF est durci : layout planifié en 64 bits avec cap
+   `LAYOUT_MAX` (64 MiB) dans `specter_core::coff::plan_layout` — les
+   accumulateurs u32 `wrapping_add` du loader pouvaient wrap le total d'un
+   BOF hostile (sections énormes) en une allocation trop petite suivie
+   d'écritures hors région ; bornes vérifiées désormais sur les copies de
+   sections, les sites de relocation (champ patché entier : `site + len <=
+   sec_size`), la valeur du symbole d'entrée et chaque entrée `.pdata`
+   avant `RtlAddFunctionTable` ; fuzz COFF hostiles (5 000 objets mutés)
+   borné. **Reste** : rejouer un pack hostile contre l'implant réel en
+   live avant la release finale.
 2. **Astral Projection** (chiffrement du tas privé pendant le sommeil,
    SsnUnmap + backup de l'image) : la partie restante du sleep.c natif.
 3. **Pivot SMB named pipe** (`link`/`unlink`) : la dernière grosse
