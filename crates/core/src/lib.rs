@@ -43,6 +43,7 @@ pub mod coff;
 pub mod config;
 pub mod fnv;
 pub mod heap;
+pub mod heapmask;
 pub mod hwbp;
 pub mod peb;
 pub mod rc4;
