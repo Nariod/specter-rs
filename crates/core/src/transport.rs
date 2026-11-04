@@ -1736,4 +1736,151 @@ mod tests {
         assert_eq!(jitter, 10);
         assert_eq!(r.remaining(), 0);
     }
+
+    /// One valid multi-record task pack, built with the wire Writer exactly
+    /// like the server's PackTasks: `[data || u32 LE taskId]` records.
+    fn valid_pack() -> Vec<u8> {
+        fn ps(w: &mut Writer, s: &[u8]) {
+            w.u32_le((s.len() + 1) as u32);
+            w.push(s);
+            w.u8(0);
+        }
+        let mut buf = [0u8; 4096];
+        let mut w = Writer::new(&mut buf);
+        w.u32_le(COMMAND_PROFILE);
+        w.u32_le(1);
+        w.u32_le(5);
+        w.u32_le(10);
+        w.u32_le(1);
+        w.u32_le(COMMAND_TERMINATE);
+        w.u32_le(1);
+        w.u32_le(2);
+        w.u32_le(COMMAND_CD);
+        ps(&mut w, b"C:\\Test");
+        w.u32_le(3);
+        w.u32_le(COMMAND_COPY);
+        ps(&mut w, b"a.txt");
+        ps(&mut w, b"b.txt");
+        w.u32_le(4);
+        w.u32_le(COMMAND_PS_RUN);
+        w.u8(1);
+        w.u8(0);
+        w.u32_le(0);
+        ps(&mut w, b"cmd.exe /c whoami");
+        w.u32_le(5);
+        w.u32_le(COMMAND_TOKEN_MAKE);
+        w.u32_le(2);
+        ps(&mut w, b"MEGACORP");
+        ps(&mut w, b"doria");
+        ps(&mut w, b"pass");
+        w.u32_le(6);
+        w.u32_le(COMMAND_SHELL_START);
+        w.u32_le(7);
+        ps(&mut w, b"cmd.exe");
+        w.u32_le(7);
+        w.u32_le(COMMAND_SHELL_WRITE);
+        w.u32_le(7);
+        w.u32_le(4);
+        w.push(b"who\r");
+        w.u32_le(8);
+        w.u32_le(COMMAND_TUNNEL_START_TCP);
+        w.u32_le(100);
+        w.u32_le(1);
+        ps(&mut w, b"127.0.0.1");
+        w.u32_le(8080);
+        w.u32_le(9);
+        w.u32_le(COMMAND_TUNNEL_WRITE_TCP);
+        w.u32_le(100);
+        w.u32_le(5);
+        w.push(b"hello");
+        w.u32_le(10);
+        w.u32_le(COMMAND_SAVEMEMORY);
+        w.u32_le(0x55);
+        w.u32_le(1024);
+        w.u32_le(4);
+        w.push(b"data");
+        w.u32_le(11);
+        w.u32_le(COMMAND_EXEC_BOF);
+        w.u8(0);
+        ps(&mut w, b"go");
+        w.u32_le(8);
+        w.push(&[0xCC; 8]);
+        w.u32_le(2);
+        w.push(b"\x01\x02");
+        w.u32_le(12);
+        w.written_bytes().to_vec()
+    }
+
+    /// Deterministic hostile-pack fuzz: mutate a valid pack (truncation,
+    /// bit flips, u32::MAX length writes) and replay the exact dispatch loop
+    /// of the beacon. The contract: never panic, and any task that parses
+    /// keeps its accessors inside the declared caps.
+    #[test]
+    fn hostile_pack_fuzz_never_panics() {
+        use crate::rng::XorShift64;
+        let base = valid_pack();
+        let mut rng = XorShift64::new(0x5FEC_2026);
+        let mut it = 0;
+        while it < 20000 {
+            let mut pack = base.clone();
+            let mutations = 1 + (rng.next_u64() % 6) as usize;
+            let mut m = 0;
+            while m < mutations && !pack.is_empty() {
+                match rng.next_u64() % 4 {
+                    0 => {
+                        let cut = (rng.next_u64() as usize) % pack.len();
+                        pack.truncate(cut);
+                    }
+                    1 => {
+                        let pos = (rng.next_u64() as usize) % pack.len();
+                        pack[pos] ^= 1 << (rng.next_u64() % 8) as u8;
+                    }
+                    2 => {
+                        let pos = (rng.next_u64() as usize) % pack.len();
+                        pack[pos] = 0xFF;
+                    }
+                    _ => {
+                        let pos = (rng.next_u64() as usize) % pack.len();
+                        let n = 1 + (rng.next_u64() as usize) % 4.min(pack.len() - pos);
+                        let b = u32::MAX.to_le_bytes();
+                        let mut k = 0;
+                        while k < n {
+                            pack[pos + k] = b[k % 4];
+                            k += 1;
+                        }
+                    }
+                }
+                m += 1;
+            }
+            let mut r = Reader::new(&pack);
+            while r.remaining() >= 8 {
+                if r.peek_u32_le() == Some(COMMAND_EXEC_BOF) {
+                    if parse_exec_bof(&mut r).is_none() {
+                        break;
+                    }
+                    continue;
+                }
+                if r.peek_u32_le() == Some(COMMAND_TUNNEL_WRITE_TCP) {
+                    if parse_tunnel_write(&mut r).is_none() {
+                        break;
+                    }
+                    continue;
+                }
+                if r.peek_u32_le() == Some(COMMAND_SAVEMEMORY) {
+                    if parse_save_memory(&mut r).is_none() {
+                        break;
+                    }
+                    continue;
+                }
+                match parse_task(&mut r) {
+                    Some((task, _id)) => {
+                        assert!(task.path().len() <= PATH_CAP);
+                        assert!(task.dst().len() <= PATH_CAP);
+                    }
+                    None => break,
+                }
+            }
+            it += 1;
+        }
+    }
 }

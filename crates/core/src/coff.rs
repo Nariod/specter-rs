@@ -278,6 +278,104 @@ impl<'a> Coff<'a> {
     }
 }
 
+/// Native runner.c array bound for sections (the beacon loader's tables).
+pub const MAX_SECTIONS: usize = 16;
+/// Native runner.c bound for external trampoline slots.
+pub const MAX_MAP_FUNCS: usize = 256;
+/// Hard cap on a loaded BOF image: a hostile object declaring huge section
+/// sizes must be rejected here, before any allocation, never wrapped into
+/// a tiny one.
+pub const LAYOUT_MAX: usize = 64 * 1024 * 1024;
+/// x64 page size used to align the code region of the layout.
+pub const PAGE_SIZE: u64 = 0x1000;
+
+/// The loaded-image layout (runner.c): data sections first at 16-byte
+/// granularity, then the mapFuncs trampoline, then the code sections
+/// page-aligned. Computed in 64-bit arithmetic so hostile section sizes
+/// cannot wrap a u32 accumulator into a small total.
+#[derive(Debug, Clone, Copy)]
+pub struct Layout {
+    pub sec_size: [u32; MAX_SECTIONS],
+    pub sec_off: [u32; MAX_SECTIONS],
+    pub map_off: u32,
+    pub total: usize,
+}
+
+/// Plan the in-memory layout of a parsed COFF. `None` on any structural
+/// problem, more than [`MAX_SECTIONS`] sections, an offset that does not
+/// fit a u32, a zero-size image, or a total over [`LAYOUT_MAX`].
+pub fn plan_layout(coff: &Coff) -> Option<Layout> {
+    let nsec = coff.num_sections();
+    if nsec == 0 || nsec > MAX_SECTIONS {
+        return None;
+    }
+    let mut sec_size = [0u32; MAX_SECTIONS];
+    let mut sec_off = [0u32; MAX_SECTIONS];
+    let mut i = 0;
+    while i < nsec {
+        let s = coff.section(i)?;
+        sec_size[i] = if s.raw_size > 0 {
+            s.raw_size
+        } else {
+            s.virtual_size
+        };
+        i += 1;
+    }
+    let mut data_end: u64 = 0;
+    i = 0;
+    while i < nsec {
+        if sec_size[i] > 0 && !coff.section(i)?.executable() {
+            sec_off[i] = u32::try_from(data_end).ok()?;
+            data_end += (sec_size[i] as u64 + 15) & !15;
+        }
+        i += 1;
+    }
+    let map_off = u32::try_from(data_end).ok()?;
+    data_end += (MAX_MAP_FUNCS * 8) as u64;
+    let code_start = (data_end + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+    let mut code_end = code_start;
+    i = 0;
+    while i < nsec {
+        if sec_size[i] > 0 && coff.section(i)?.executable() {
+            sec_off[i] = u32::try_from(code_end).ok()?;
+            code_end += (sec_size[i] as u64 + 15) & !15;
+        }
+        i += 1;
+    }
+    let total = code_end as usize;
+    if total == 0 || total > LAYOUT_MAX {
+        return None;
+    }
+    Some(Layout {
+        sec_size,
+        sec_off,
+        map_off,
+        total,
+    })
+}
+
+/// Bytes a relocation of `typ` patches at its site (`Some(0)` for ADDR32:
+/// accepted, never patched, native parity). `None` for a type the native
+/// switch rejects.
+pub fn reloc_patch_len(typ: u16) -> Option<usize> {
+    match typ {
+        REL_ADDR64 => Some(8),
+        REL_ADDR32NB => Some(4),
+        REL_REL32..=REL_REL32_5 => Some(4),
+        REL_ADDR32 => Some(0),
+        _ => None,
+    }
+}
+
+/// A relocation site is in bounds when the whole patched field fits inside
+/// the section: `site + patch_len <= sec_size`.
+pub fn reloc_site_ok(sec_size: u32, site: u32, typ: u16) -> bool {
+    match reloc_patch_len(typ) {
+        Some(plen) => site as usize + plen <= sec_size as usize,
+        None => false,
+    }
+}
+
 fn u32_from(b: &[u8]) -> u32 {
     u32::from_le_bytes([b[0], b[1], b[2], b[3]])
 }
@@ -861,5 +959,137 @@ mod tests {
         let (out, ok) = fmt_out(b"%q", &[0]);
         assert!(ok);
         assert_eq!(out, b"%q".to_vec());
+    }
+
+    // ------------------------------------------------------------------
+    // Hostile-object hardening (pack hostile: the loader must reject, never
+    // wrap or panic)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn plan_layout_matches_runner_layout() {
+        let blob = synth_coff();
+        let coff = Coff::parse(&blob).expect("parse");
+        let plan = plan_layout(&coff).expect("layout");
+        assert_eq!(plan.sec_size[0], 0x20);
+        assert_eq!(plan.map_off, 0); // no data sections
+        assert_eq!(plan.sec_off[0], 0x1000); // code page-aligned after mapFuncs
+        assert_eq!(plan.total, 0x1000 + 0x20);
+    }
+
+    #[test]
+    fn plan_layout_rejects_hostile_section_sizes() {
+        // raw_size = u32::MAX would wrap a u32 accumulator into a tiny
+        // total, then the section copies would write out of the region.
+        let mut blob = synth_coff();
+        blob[36..40].copy_from_slice(&u32::MAX.to_le_bytes()); // raw_size
+        let coff = Coff::parse(&blob).expect("parse");
+        assert!(plan_layout(&coff).is_none());
+
+        // Same through the BSS path: raw_size = 0, virtual_size huge.
+        let mut blob = synth_coff();
+        blob[36..40].copy_from_slice(&0u32.to_le_bytes()); // raw_size
+        blob[28..32].copy_from_slice(&0xFFFF_FFF0u32.to_le_bytes()); // virtual_size
+        let coff = Coff::parse(&blob).expect("parse");
+        assert!(plan_layout(&coff).is_none());
+
+        // Just under the cap still plans.
+        let mut blob = synth_coff();
+        blob[36..40].copy_from_slice(&(LAYOUT_MAX as u32).to_le_bytes());
+        blob[28..32].copy_from_slice(&(LAYOUT_MAX as u32).to_le_bytes());
+        let coff = Coff::parse(&blob).expect("parse");
+        assert!(plan_layout(&coff).is_none()); // over the cap once aligned
+    }
+
+    #[test]
+    fn plan_layout_keeps_every_section_inside_total() {
+        let blob = synth_coff();
+        let coff = Coff::parse(&blob).expect("parse");
+        let plan = plan_layout(&coff).expect("layout");
+        let mut i = 0;
+        while i < coff.num_sections() {
+            if plan.sec_size[i] > 0 {
+                assert!(plan.sec_off[i] as usize + plan.sec_size[i] as usize <= plan.total);
+            }
+            i += 1;
+        }
+    }
+
+    #[test]
+    fn reloc_site_checks_whole_patch_field() {
+        assert!(reloc_site_ok(0x20, 0x18, REL_ADDR64)); // 0x18+8 == 0x20
+        assert!(!reloc_site_ok(0x20, 0x19, REL_ADDR64)); // 8 bytes past the end
+        assert!(reloc_site_ok(0x20, 0x1C, REL_REL32)); // 0x1C+4 == 0x20
+        assert!(!reloc_site_ok(0x20, 0x1D, REL_REL32));
+        assert!(reloc_site_ok(0x20, 0x1F, REL_ADDR32)); // never patched
+        assert!(!reloc_site_ok(0x20, 0, 0x0A)); // unknown type
+        assert_eq!(reloc_patch_len(REL_ADDR64), Some(8));
+        assert_eq!(reloc_patch_len(REL_ADDR32), Some(0));
+        assert_eq!(reloc_patch_len(0x0A), None);
+    }
+
+    #[test]
+    fn hostile_coff_fuzz_never_panics_and_stays_bounded() {
+        use crate::rng::XorShift64;
+        let base = synth_coff();
+        let mut rng = XorShift64::new(0xC0FF_EE42);
+        let mut it = 0;
+        while it < 5000 {
+            let mut blob = base.clone();
+            let mutations = 1 + (rng.next_u64() % 8) as usize;
+            let mut m = 0;
+            while m < mutations && !blob.is_empty() {
+                let pos = (rng.next_u64() as usize) % blob.len();
+                match rng.next_u64() % 3 {
+                    0 => blob[pos] ^= 1 << (rng.next_u64() % 8) as u8, // bit flip
+                    1 => blob[pos] = 0xFF,
+                    _ => {
+                        let v = u32::MAX;
+                        let n = 1 + (rng.next_u64() as usize) % 4.min(blob.len() - pos);
+                        let mut k = 0;
+                        while k < n {
+                            blob[pos + k] = v.to_le_bytes()[k % 4];
+                            k += 1;
+                        }
+                    }
+                }
+                m += 1;
+            }
+            if let Some(coff) = Coff::parse(&blob) {
+                if let Some(plan) = plan_layout(&coff) {
+                    let mut i = 0;
+                    while i < coff.num_sections() {
+                        if let Some(s) = coff.section(i) {
+                            if plan.sec_size[i] > 0 {
+                                assert!(
+                                    plan.sec_off[i] as usize + plan.sec_size[i] as usize
+                                        <= plan.total
+                                );
+                            }
+                            let mut r = 0;
+                            while r < s.num_relocs as usize {
+                                if let Some((site, typ, _)) = coff.reloc(&s, r) {
+                                    if let Some(plen) = reloc_patch_len(typ) {
+                                        assert!(
+                                            !reloc_site_ok(plan.sec_size[i], site, typ)
+                                                || site as usize + plen
+                                                    <= plan.sec_size[i] as usize
+                                        );
+                                    }
+                                }
+                                r += 1;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                let mut i = 0;
+                while i < coff.num_symbols() {
+                    let _ = coff.symbol_name(i);
+                    i += 1;
+                }
+            }
+            it += 1;
+        }
     }
 }
