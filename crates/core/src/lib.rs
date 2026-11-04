@@ -54,6 +54,7 @@ pub mod sleepmask;
 pub mod syscalls;
 pub mod time;
 pub mod transport;
+pub mod watchdog;
 pub mod wire;
 
 /// Check-in replay harness against a live listener (`#[ignore]`d test,

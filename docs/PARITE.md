@@ -14,7 +14,7 @@
 > | **À faire** | Non commencé (phase planifiée, voir l'étude §8) |
 > | **Hors périmètre** | Reste en Go côté serveur (ABI plugin AdaptixC2) — l'architecture hybride de l'étude §2 |
 
-Dernière mise à jour : **2026-11-04** — itération 24 : pivot SMB named pipe link/unlink (voir §5 et point 3), au-dessus de l'itération 23 (Astral Projection mode 1 : unmap + backup, §4 et point 2), de l'itération 22 (moitié « tas privé »), de l'itération 21 (durcissement anti-pack hostile, point 1) et du gel RC1 **2026-10-28** (itération 20 : sommeil threadpool + TIB spoof validés sur l'implant réel, 43 cycles pool sans exception).
+Dernière mise à jour : **2026-11-04** — itération 25 : watchdog + install.sh (voir §3/§2 et point 4), au-dessus de l'itération 24 (pivot SMB link/unlink, §5 et point 3), de l'itération 23 (Astral Projection mode 1 : unmap + backup, §4 et point 2), de l'itération 22 (moitié « tas privé »), de l'itération 21 (durcissement anti-pack hostile, point 1) et du gel RC1 **2026-10-28** (itération 20 : sommeil threadpool + TIB spoof validés sur l'implant réel, 43 cycles pool sans exception).
 
 ---
 
@@ -46,7 +46,7 @@ Dernière mise à jour : **2026-11-04** — itération 24 : pivot SMB named pipe
 | Formats de payloads `bin` | `beacon.x64.bin` brut | Fait | — |
 | Formats `exe` / `dll` / `svc` / `ps1` / downloader stagé | Génération PE côté plugin Go | Hors périmètre | Inchangé ; adaptation de l'appel au build (gcc → cargo) : phase 4 |
 | Rich header / EAT / overlay / donor cloning | Génération PE côté plugin Go | Hors périmètre | Inchangé |
-| `install.sh` (prérequis teamserver, pins) | — | À faire | Phase 4 : rustup + cible + pin nightly exacte |
+| `install.sh` (prérequis teamserver, pins) | install.sh exécutable : lit le pin `rust-toolchain.toml`, installe la nightly + composants (rust-src/rustfmt/clippy) + cibles (windows-gnu, linux-gnu), `rustup default`, puis `make test` de vérification | Fait | Itération 25 |
 
 ## 3. Runtime
 
@@ -58,7 +58,7 @@ Dernière mise à jour : **2026-11-04** — itération 24 : pivot SMB named pipe
 | Bootstrap (PEB → modules → instance) | `runtime::bootstrap::main` | Fait | Résout ntdll/kernel32, stocke l'instance TEB |
 | Heap custom / allocation | `specter_core::heap::Heap` (handle + pointeurs résolus), méthodes Instance-scoped | Fait | Pas de `GlobalAlloc` global (philosophie no-globals) ; testé avec mocks WinAPI |
 | Sortie silencieuse `RtlExitUserThread(0)` | Résolu par hash depuis ntdll, appelé au killswitch et en échec de bootstrap | Fait | Résolu en premier au bootstrap : toute défaillance ultérieure doit pouvoir partir sans trace |
-| Watchdog | — | À faire | Phase 2/3 |
+| Watchdog | `specter_core::watchdog::Watchdog` : compteur d'échecs check-in consécutifs (seuil 30), reset sur succès, sortie silencieuse `RtlExitUserThread(0)` au-delà ; câblé sur les 9 chemins « ci: fail » + reset sur les 2 « check-in: ok » | Fait | Itération 25 (tests host) — pas encore de validation live |
 
 ## 4. Évasion
 
@@ -168,7 +168,5 @@ Dernière mise à jour : **2026-11-04** — itération 24 : pivot SMB named pipe
    live avant la release finale.
 2. **Astral Projection** : **fait** (itérations 22-23, voir §4 — tas privé masqué + image backup/unmap/remap pendant la fenêtre ; pas encore de validation live sur implant réel).
 3. **Pivot SMB named pipe** (`link`/`unlink`) : **fait côté beacon** (itération 24, voir §5 — pas encore de validation live contre un listener SMB réel).
-4. Petits utilitaires : watchdog, `dll-notify`, PPID spoofing, pool BOF
-   asynchrone, `install.sh`, stub du masque en fin d'image (première page
-   en clair), sous-ensemble étendu de l'API Beacon.
+4. Petits utilitaires : **watchdog et `install.sh` faits** (itération 25) ; reste : `dll-notify`, PPID spoofing, pool BOF asynchrone, stub du masque en fin d'image (résolu en mode 1 quand la copie externe existe — mode 0 garde la page du stub en clair, documenté), sous-ensemble étendu de l'API Beacon.
 
