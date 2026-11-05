@@ -8,12 +8,14 @@
 </p>
 
 > [!NOTE]
-> **Release candidate (RC1).** The full C2 loop — check-in, task
-> execution, results, tunnels, encrypted sleep — is functional and
-> validated against a real AdaptixC2 server on a live Windows implant.
-> A few original features are still missing (see the open points in
-> [PARITE.md](docs/PARITE.md): SMB pivot, Astral Projection, hostile-pack
-> hardening).
+> **Release candidate RC1 — validated live.** The full C2 loop and every
+> operator command below were re-run green on a real Windows 11 implant
+> against a real AdaptixC2 v1.2 server (session r03, 2026-11-05): files,
+> ps/jobs, transfers (md5-verified), exfil, screenshot, BOF, tkn, shell,
+> tunnels byte-exact, sleep, terminate, and the threadpool+TIB encrypted
+> sleep for 1790 cycles without a fault. Hostile-pack hardening, full
+> Astral Projection and the SMB named-pipe pivot are in (iterations
+> 21-31, see [PARITE.md](docs/PARITE.md)).
 
 A Rust rewrite of the Specter beacon: an [AdaptixC2](https://github.com/nicecatch-cyber/AdaptixC2)
 Windows x64 agent focused on **EDR evasion**, preserving the original project's
@@ -59,14 +61,60 @@ AdaptixC2, never the other way around.
   and **tunnels** — `socks` (SOCKS5), `lportfwd`, `rportfwd`, all
   relayed through the check-in cycle and validated byte-exact against
   a live implant.
+- **SMB named-pipe pivot** — `link \\host\pipe\name` / `unlink`: while a
+  pivot is active the whole check-in transport runs over the pipe
+  (frame `u32 LE len || payload` each way, same RC4 body as HTTP).
+- **Resilience** — hostile task-pack hardening (fuzzed parsers, bounded
+  COFF loader, 64-bit layout with a 64 MiB cap), check-in watchdog (silent
+  exit after 30 consecutive failures), `ps run -ppid <pid>` parent spoofing,
+  dll-notify (foreign loader-notification callbacks unhooked, ours kept),
+  async BOFs on a dedicated thread, extended Beacon API (`BeaconFormat*`,
+  `BeaconUseToken`/`BeaconRevertToken`).
+- **Response page buffer** — 256 KiB heap buffer (64 KiB stack fallback);
+  the server caps task packs at 192 KiB and re-queues the overflow, so big
+  uploads/BOFs no longer truncate the page.
 - **Server plugin (Go, ABI v1.2)** — real agent generation dialog driving
   the beacon's own cargo pipeline, RC4 Encrypt/Decrypt, PackTasks /
-  ProcessData for every command above, native-style task rendering.
+  ProcessData for every command above (pack capped + re-queued),
+  native-style task rendering and session menu (all commands, incl.
+  `link`/`unlink` and `ps run -ppid`).
 
 Position-independent, single `.text` section, no CRT, no globals (the
 instance lives in `TEB->NtTib.ArbitraryUserPointer`), per-build
 encryption and build-time injected configuration, malleable profiles
 (`profiles/`). Blob currently ~50 KiB (budget 52 KiB, see guardrails).
+
+## Quick start — using specter-rs from AdaptixC2
+
+1. **Prerequisites + build** (once, on the teamserver):
+   ```bash
+   ./install.sh                 # pins the Rust nightly + targets, then make test
+   make                         # build/beacon.x64.bin (raw PIC blob)
+   cd src_server/agent_specter_rs && make    # agent_specter_rs.so (ABI v1.2 plugin)
+   ```
+   `install.sh` reads the pinned toolchain from `rust-toolchain.toml` — no
+   MinGW/NASM needed. The plugin Makefile uses the same Go version and
+   `GOEXPERIMENT` as the `adaptixserver` binary (see its header comment).
+2. **Install the plugin**: copy `src_server/agent_specter_rs/agent_specter_rs.so`
+   into the AdaptixC2 server's extenders directory (next to the other
+   `agent_*.so`) and restart the server — it logs a load error if the
+   file is missing.
+3. **Create a listener**: type `specter-http`, set host/port and the
+   malleable profile (`profiles/default.json`, or your own — format v2
+   unchanged; the listener's profile overrides the embedded one).
+4. **Generate an agent**: agent type `specter-rs`, fill the dialog (sleep,
+   jitter, killdate, watermark, debug, sleep-mask; the listener key and
+   URIs are injected at build time), payload format `Bin`. The dialog
+   drives the same cargo pipeline as `make`.
+5. **Run the blob** on the target with any injection method — it is
+   position-independent, single `.text`, no import table, per-build
+   encrypted by the server wrapper. The session shows up in the client.
+6. **Operate**: session menu / console — `sleep`, `terminate`,
+   `pwd cd ls cat mkdir rm cp mv`, `upload`/`download`/`exfil`,
+   `ps list|kill|run` (optional `-ppid`), `jobs list|kill`, `disks`,
+   `screenshot`, `tkn ...`, interactive shell, `execute bof` (BOFs compile
+   with plain `rustc` or MSVC C — see `tools/bof/hello.rs`),
+   `socks`/`lportfwd`/`rportfwd`, `link`/`unlink` (SMB pivot).
 
 ## Documentation
 
@@ -87,6 +135,8 @@ crates/core/            Pure no_std logic: wire, rc4, transport, config
 src_server/agent_specter_rs/  AdaptixC2 v1.2 agent plugin (Go)
 docs/                   Feasibility study, parity tracking, wire contract
 profiles/               Malleable C2 profile definitions (JSON, format v2)
+install.sh              One-shot prerequisites + verification (rustup pin,
+                        targets, make test)
 tools/                  Blob pipeline (pe_blob.py, check_blob.py), test
                         harness (server.py / agent.ps1 / queue_job.py),
                         reference BOFs
@@ -129,16 +179,16 @@ CI (`.github/workflows/ci.yml`) gates every push and PR through layers:
 
 ## Status
 
-**Release candidate (RC1)** — phases 0-3 done: PIC pipeline with a proven
-position-independence check, syscall engine, HWBP hooks, encrypted sleep
-mask (threadpool + TIB spoof), HTTP check-in, wire contract, the full
-operator command set listed above, and the Go plugin — all validated
-against a live AdaptixC2 v1.2 server on a real Windows 11 implant.
-Open before the final release (see [PARITE.md](docs/PARITE.md) open
-points): hostile-pack hardening (the beacon must survive any server-side
-task state), Astral Projection (private heap encryption during sleep),
-SMB named-pipe pivot, watchdog, dll-notify, PPID spoofing, async BOF
-pool, `install.sh`.
+**Release candidate RC1** — everything above is implemented and was
+validated against a live AdaptixC2 v1.2 server on a real Windows 11
+implant (session r03, 2026-11-05, incl. 1790 clean threadpool-sleep
+cycles). Iterations 21-31 landed the hostile-pack hardening, full Astral
+Projection (private-heap mask + image backup/unmap/remap during sleep),
+the SMB named-pipe pivot, watchdog, `install.sh`, PPID spoofing, the
+extended Beacon API, dll-notify, the async BOF pool, and the sleep stub
+moved to the end of the image. The parity table in
+[PARITE.md](docs/PARITE.md) is the source of truth (41 done / 5 partial /
+0 todo / 6 out of scope by design — the server side stays in Go).
 
 ---
 
