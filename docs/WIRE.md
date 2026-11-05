@@ -56,11 +56,11 @@ page = prepend || RC4( session_key, PackTasks() ) || append
 ```
 
 **Budget de page** : le beacon lit la page dans un tampon **tas de
-256 KiB** (`VirtualAlloc`, repli page stack 64 KiB si l'alloc échoue) ;
-le plugin cappe le pack à **192 KiB** (`packCap` dans `PackTasks`) et
-**re-queue** les tâches au-delà pour le check-in suivant (ordre conservé).
+256 KiB** (`VirtualAlloc`, repli page stack 64 KiB si l'alloc echoue) ;
+le plugin cappe le pack a **192 KiB** (`packCap` dans `PackTasks`) et
+**re-queue** les taches au-dela pour le check-in suivant (ordre conserve).
 Sans ce cap, un gros upload/BOF tronquait le marqueur `append` et tout le
-pack partait à la poubelle (`ci: fail range` — constaté en live sur un
+pack partait a la poubelle (`ci: fail range` — constate en live sur un
 upload de 100 KiB avant le correctif).
 
 `prepend`/`append` sont injectés au build (split du gabarit au marqueur —
@@ -481,6 +481,51 @@ comportement est identique dans l'original — runner.c). La référence doit
   fonction (`mov reg, [refptr]; mov reg, [reg]; call reg`). Source de
   référence : `tools/bof/hello.rs` (build :
   `rustc --target x86_64-pc-windows-gnu --emit=obj -C opt-level=z`).
+
+## ps run avec PPID spoofé — COMMAND_PS_RUN_PPID (itération 26)
+
+- `COMMAND_PS_RUN_PPID` (75) : `u32 LE 75 || u8 output || u8 useToken ||
+  u32 LE progState || u32 LE ppid || string args || u32 LE taskId` — même
+  layout que `COMMAND_PS_RUN` (43) avec le pid parent inséré avant les
+  args. Côté beacon : `OpenProcess(PROCESS_CREATE_PROCESS, ppid)` +
+  `InitializeProcThreadAttributeList` / `UpdateProcThreadAttribute`
+  (`PROC_THREAD_ATTRIBUTE_PARENT_PROCESS` = 0x20002) + `CreateProcessA`
+  avec `EXTENDED_STARTUPINFO_PRESENT` et une `STARTUPINFOEXA` (cb =
+  0x70, `lpAttributeList` en +0x68), puis cleanup (`DeleteProcThread-
+  AttributeList` + `CloseHandle`). ppid = 0 sur `COMMAND_PS_RUN` : chemin
+  inchangé (STARTUPINFOA, pas d'attribut).
+
+## Pivot SMB named pipe — link / unlink (itération 24)
+
+Le beacon peut rediriger tout son transport check-in vers un named pipe
+(local `\\.\pipe\...` ou distant `\\host\pipe\...` sur SMB) — le pivot
+vers un listener SMB exposé par un autre segment. Le listener SMB reste
+côté serveur (hors périmètre, inchangé).
+
+### Tâches serveur → beacon (PackArray)
+
+- `COMMAND_LINK` (73) : `u32 LE 73 || string pipe || u32 LE taskId` —
+  `CreateFileA` lecture/écriture sur le pipe (`WaitNamedPipeA` 20 s puis
+  un retry si occupé) ; tant qu'un pivot est actif, chaque cycle check-in
+  passe par le pipe au lieu de WinHTTP. Un `link` sur un pivot actif
+  ferme d'abord l'ancien (`unlink` implicite).
+- `COMMAND_UNLINK` (74) : `u32 LE 74 || u32 LE taskId` — ferme le pipe,
+  retour au transport HTTP direct.
+
+Résultats : `push_plain_result` (header taskId/commandId seul), ou
+`COMMAND_ERROR` si l'ouverture du pipe échoue.
+
+### Échange sur le pipe (contrat, itération 24)
+
+Flux d'octets, un frame par échange dans chaque sens :
+
+- requête : `u32 LE bodyLen || body` où `body` est **le même corps RC4
+  chiffré** que le POST HTTP du cycle (beat + résultats, identical bytes) ;
+- réponse : `u32 LE respLen || page` où `page` est la même page de réponse
+  (gabarit + payload chiffré) qu'en HTTP.
+
+Le beacon écrit/lee en boucles jusqu'au frame complet (`net::pipe_exchange`,
+`crates/beacon/src/net.rs`) ; `respLen > 0x10000` est refusé.
 
 ## Écart avec la version précédente de ce document
 
