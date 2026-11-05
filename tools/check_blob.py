@@ -56,7 +56,10 @@ PRINTABLE = range(0x20, 0x7F)
 # Raised 53248 -> 57344 for Astral Projection mode 1 (external stub copy,
 # backup + NtUnmapViewOfSection/NtAllocateVirtualMemory remap in the sleep
 # stub, heapmask) at 52.2 KiB. Deliberate raise, its own commit.
-DEFAULT_MAX_SIZE = 57344
+# Raised 57344 -> 61440 for the async BOF pool (worker thread, heap ctx
+# with args copy, spinlock on the output queue) at 56.6 KiB. Deliberate
+# raise, its own commit.
+DEFAULT_MAX_SIZE = 61440
 
 
 def find_strings(blob):
