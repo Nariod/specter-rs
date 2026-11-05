@@ -134,15 +134,15 @@ Dernière mise à jour : **2026-11-04** — itération 31 : stub du masque en fi
 
 ---
 
-## Résumé (RC1 — recompté ligne à ligne)
+## Résumé (recompté au 2026-11-04, itérations 21-31)
 
 | Domaine | Fait | Partiel | À faire | Hors périmètre |
 |---|---|---|---|---|
 | Invariants philosophie | 8 | 0 | 0 | 1 |
-| Build / config | 7 | 1 | 1 | 2 |
-| Runtime | 6 | 0 | 1 | 0 |
-| Évasion | 7 | 1 | 1 | 0 |
-| Transports | 1 | 2 | 1 | 0 |
+| Build / config | 8 | 1 | 0 | 2 |
+| Runtime | 7 | 0 | 0 | 0 |
+| Évasion | 8 | 1 | 0 | 0 |
+| Transports | 2 | 2 | 0 | 0 |
 | Commandes | 14 | 0 | 0 | 0 |
 | Wire | 1 | 0 | 0 | 0 |
 | Serveur Go | 1 | 1 | 0 | 3 |
