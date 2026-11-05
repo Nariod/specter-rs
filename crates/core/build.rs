@@ -113,6 +113,9 @@ fn main() {
     manifest.push("sm: nodonor".to_string());
     manifest.push("sm: donorfail".to_string());
     manifest.push("sm: ekko ok".to_string());
+    manifest.push("sh: bmp".to_string());
+    manifest.push("sh: getdc".to_string());
+    manifest.push("sh: metrics".to_string());
     manifest.push("wk: enter".to_string());
     manifest.push("wk: stub".to_string());
     manifest.push("wk: back".to_string());
@@ -150,15 +153,6 @@ fn main() {
     // naming convention of runner.c, the .pdata SEH registration probe,
     // and the append-seek of the debug log.
     manifest.push("BeaconOutput".to_string());
-    // Beacon API names added in iteration 27 (Format*/UseToken/RevertToken).
-    manifest.push("BeaconFormatAlloc".to_string());
-    manifest.push("BeaconFormatFree".to_string());
-    manifest.push("BeaconFormatReset".to_string());
-    manifest.push("BeaconFormatAppend".to_string());
-    manifest.push("BeaconFormatPrintf".to_string());
-    manifest.push("BeaconFormatToString".to_string());
-    manifest.push("BeaconUseToken".to_string());
-    manifest.push("BeaconRevertToken".to_string());
     manifest.push("BeaconPrintf".to_string());
     manifest.push("BeaconDataParse".to_string());
     manifest.push("BeaconDataInt".to_string());

