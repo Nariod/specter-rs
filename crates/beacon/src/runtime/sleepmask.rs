@@ -49,6 +49,7 @@ const PAGE_EXECUTE_READWRITE: u32 = 0x40;
 /// image's original protection.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".sptend")]
 pub unsafe extern "C" fn spt_sleepmask(params: usize) -> usize {
     naked_asm!(
         // ---- prologue: save everything the stub uses -----------------
