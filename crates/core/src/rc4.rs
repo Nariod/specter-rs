@@ -50,7 +50,6 @@ mod tests {
     use super::*;
     use std::format;
     use std::string::String;
-    use std::vec::Vec;
 
     /// RFC 6429 test vectors.
     #[test]

@@ -157,7 +157,6 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::format;
     use std::vec;
 
     #[test]
