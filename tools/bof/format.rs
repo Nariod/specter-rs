@@ -1,12 +1,12 @@
-// Test BOF: the extended BeaconFormat* API (itÃ©ration 27) â Alloc, Printf,
-// Append, ToString, Output, Free â exercising the heap-backed format buffer
+// Test BOF: the extended BeaconFormat* API (itération 27) — Alloc, Printf,
+// Append, ToString, Output, Free — exercising the heap-backed format buffer
 // and its manual growth path.
 //
 // Build:
 //   rustc --target x86_64-pc-windows-gnu --emit=obj -C opt-level=z \
 //       -C panic=abort format.rs -o format.o
 //
-// Convention: extern *static* (refptr), never a direct extern fn â see
+// Convention: extern *static* (refptr), never a direct extern fn — see
 // docs/WIRE.md (BOF contract) and tools/bof/hello.rs.
 
 #![no_std]
@@ -28,14 +28,14 @@ struct FormatP {
     original: *mut u8,
     buffer: *mut u8,
     length: i32,
-    size: i33,
+    size: i32,
 }
 
 extern "C" {
     #[link_name = "BeaconFormatAlloc"]
     static B_FALLOC: *const c_void;
     #[link_name = "BeaconFormatPrintf"]
-    static B_FPRINDF: *const c_void;
+    static B_FPRINTF: *const c_void;
     #[link_name = "BeaconFormatAppend"]
     static B_FAPPEND: *const c_void;
     #[link_name = "BeaconFormatToString"]

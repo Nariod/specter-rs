@@ -7,11 +7,11 @@
 //
 // Call convention follows docs/WIRE.md (BOF contract): every Beacon API is
 // an extern *static (refptr into the mapFuncs slot), never a direct extern
-// fn â see tools/bof/hello.rs.
+// fn — see tools/bof/hello.rs.
 
 #![no_std]
-# [crate_type = "cdylib"]
-#![allow clippy::missing_safety_doc)]
+#![crate_type = "cdylib"]
+#![allow(clippy::missing_safety_doc)]
 
 use core::ffi::c_void;
 

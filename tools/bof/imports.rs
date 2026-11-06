@@ -1,4 +1,4 @@
-// Test BOF: dynamic import resolution â the loader must resolve
+// Test BOF: dynamic import resolution — the loader must resolve
 // __imp_KERNEL32$GetTickCount by FNV-64 hash through the PEB, then the BOF
 // calls it through the mapFuncs slot and reports via BeaconPrintf.
 //
@@ -6,7 +6,7 @@
 //   rustc --target x86_64-pc-windows-gnu --emit=obj -C opt-level=z \
 //       -C panic=abort imports.rs -o imports.o
 //
-// Convention: extern *static* (refptr), never a direct extern fn â see
+// Convention: extern *static* (refptr), never a direct extern fn — see
 // docs/WIRE.md (BOF contract) and tools/bof/hello.rs.
 
 #![no_std]
