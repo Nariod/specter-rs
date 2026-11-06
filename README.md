@@ -16,6 +16,8 @@
 > sleep for 1790 cycles without a fault. Hostile-pack hardening, full
 > Astral Projection and the SMB named-pipe pivot are in (iterations
 > 21-31, see [PARITE.md](docs/PARITE.md)).
+>
+> **New to specter-rs / AdaptixC2?** See the [operator user guide](docs/USER-GUIDE.md).
 
 A Rust rewrite of the Specter beacon: an [AdaptixC2](https://github.com/nicecatch-cyber/AdaptixC2)
 Windows x64 agent focused on **EDR evasion**, preserving the original project's
