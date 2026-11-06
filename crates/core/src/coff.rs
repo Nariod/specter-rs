@@ -298,6 +298,8 @@ pub struct Layout {
     pub sec_size: [u32; MAX_SECTIONS],
     pub sec_off: [u32; MAX_SECTIONS],
     pub map_off: u32,
+    /// Page-aligned start of the code region (data + mapFuncs stay below).
+    pub code_start: u32,
     pub total: usize,
 }
 
@@ -350,6 +352,7 @@ pub fn plan_layout(coff: &Coff) -> Option<Layout> {
         sec_size,
         sec_off,
         map_off,
+        code_start: code_start as u32,
         total,
     })
 }
@@ -1002,6 +1005,7 @@ mod tests {
         assert_eq!(plan.sec_size[0], 0x20);
         assert_eq!(plan.map_off, 0); // no data sections
         assert_eq!(plan.sec_off[0], 0x1000); // code page-aligned after mapFuncs
+        assert_eq!(plan.code_start, 0x1000); // data/mapFuncs region ends at the page break
         assert_eq!(plan.total, 0x1000 + 0x20);
     }
 

