@@ -1166,7 +1166,7 @@ mod tests {
                 Coff::parse(&blob).unwrap_or_else(|| panic!("{path:?}: not a valid x64 COFF"));
             assert!(coff.find_entry(b"go").is_some(), "{path:?}: no `go` entry");
             assert!(plan_layout(&coff).is_some(), "{path:?}: layout rejected");
-            // The loader resolves only the symbol targets of relocations â
+            // The loader resolves only the symbol targets of relocations —
             // collect them, then check each resolved external's name.
             let mut needed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
             for si in 0..coff.num_sections() {
@@ -1202,8 +1202,8 @@ mod tests {
                 let sym = name.strip_prefix(b"__imp_").unwrap_or(name);
                 let dollar = sym.iter().position(|&c| c == b'$');
                 match dollar {
-                     None => assert!(
-                          SUBSET.contains(&sym),
+                    None => assert!(
+                        SUBSET.contains(&sym),
                         "{path:?}: bare extern outside the Beacon API subset: {name:?}"
                     ),
                     Some(d) => {

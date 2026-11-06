@@ -196,7 +196,7 @@ CI (`.github/workflows/ci.yml`) gates every push and PR through layers:
 3. **Blob invariants** — the blob must build, pass layout verification
    (`tools/pe_blob.py`: entry prologue at offset 0, call target in range,
    `SPT_END` marker last), contain **no text strings** and stay under the
-   **size budget** (`tools/check_blob.py`, 52 KiB — every raise is its own
+   **size budget** (`tools/check_blob.py`, 60 KiB — every raise is its own
    dedicated commit), and prove **position independence** by byte-identical
    double-base linking (`make pic-check`).
 4. **Tooling tests** — the Python verification pipeline is itself tested
