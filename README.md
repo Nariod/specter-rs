@@ -82,7 +82,8 @@ AdaptixC2, never the other way around.
 Position-independent, single `.text` section, no CRT, no globals (the
 instance lives in `TEB->NtTib.ArbitraryUserPointer`), per-build
 encryption and build-time injected configuration, malleable profiles
-(`profiles/`). Blob currently ~50 KiB (budget 52 KiB, see guardrails).
+(`profiles/`). Blob currently ~57 KiB — 58,128 bytes (budget 60 KiB, see
+guardrails).
 
 ## Quick start — using specter-rs from AdaptixC2
 
@@ -91,21 +92,25 @@ encryption and build-time injected configuration, malleable profiles
    ./install.sh                 # pins the Rust nightly + targets, then make test
    make                         # build/beacon.x64.bin (raw PIC blob)
    cd src_server/agent_specter_rs && make    # agent_specter_rs.so (ABI v1.2 plugin)
+   make test                               # plugin integration harness, no UI needed
    ```
    `install.sh` reads the pinned toolchain from `rust-toolchain.toml` — no
    MinGW/NASM needed. The plugin Makefile uses the same Go version and
    `GOEXPERIMENT` as the `adaptixserver` binary (see its header comment).
-2. **Install the plugin**: copy `src_server/agent_specter_rs/agent_specter_rs.so`
-   into the AdaptixC2 server's extenders directory (next to the other
-   `agent_*.so`) and restart the server — it logs a load error if the
-   file is missing.
+   The beacon checkout path is configurable via `SPECTER_RS_DIR`
+   (default `~/Documents/specter-rs`).
+2. **Install the plugin**: copy the whole `src_server/agent_specter_rs/`
+   directory (`agent_specter_rs.so`, `ax_config.axs`, `config.yaml`) into
+   the server's `extenders/agent_specter_rs/` folder and restart the
+   server — it logs a load error if the `.so` is missing.
 3. **Create a listener**: type `specter-http`, set host/port and the
    malleable profile (`profiles/default.json`, or your own — format v2
    unchanged; the listener's profile overrides the embedded one).
 4. **Generate an agent**: agent type `specter-rs`, fill the dialog (sleep,
-   jitter, killdate, watermark, debug, sleep-mask; the listener key and
-   URIs are injected at build time), payload format `Bin`. The dialog
-   drives the same cargo pipeline as `make`.
+   jitter, killdate, watermark, sleep-mask, and the `debug` checkbox —
+   it makes the payload emit `specter.log` next to it; the listener key
+   and URIs are injected at build time), payload format `Bin`. The
+   dialog drives the same cargo pipeline as `make`.
 5. **Run the blob** on the target with any injection method — it is
    position-independent, single `.text`, no import table, per-build
    encrypted by the server wrapper. The session shows up in the client.
@@ -113,8 +118,28 @@ encryption and build-time injected configuration, malleable profiles
    `pwd cd ls cat mkdir rm cp mv`, `upload`/`download`/`exfil`,
    `ps list|kill|run` (optional `-ppid`), `jobs list|kill`, `disks`,
    `screenshot`, `tkn ...`, interactive shell, `execute bof` (BOFs compile
-   with plain `rustc` or MSVC C — see `tools/bof/hello.rs`),
-   `socks`/`lportfwd`/`rportfwd`, `link`/`unlink` (SMB pivot).
+   with plain `rustc` or MSVC C — see `tools/bof/`), `socks` /
+   `lportfwd` / `rportfwd`, `link`/`unlink` (SMB pivot).
+
+### Running BOFs (`execute bof`)
+
+Any x64 COFF object with a `go(args, len)` entry works. Reference BOFs live
+in `tools/bof/` (`hello`, `args`, `imports`, `format`, `dump_entry`):
+
+```bash
+rustc --target x86_64-pc-windows-gnu --emit=obj -C opt-level=z \
+    -C panic=abort my_bof.rs -o my_bof.o
+```
+
+Call convention (see `docs/WIRE.md` §BOF): never call a Beacon API or a
+`__imp_MODULE$Func` import directly — in Rust use an `extern *static*`
+(LLVM emits a `refptr`, the call goes through the `mapFuncs` slot); in C use
+`DECLSPEC_IMPORT`. Supported Beacon API: `BeaconOutput`, `BeaconPrintf`
+(C-variadic, `%s %d %u %x %X %c %p`), `BeaconDataParse/Int/Short/Length/
+Extract/Ptr`, and `BeaconFormatAlloc/Free/Reset/Append/Printf/ToString`,
+`BeaconUseToken`, `BeaconRevertToken`. Compatibility of third-party `.o`
+files can be checked on the host before a session:
+`SPT_BOF_DIR=/path/to/objs cargo test -p specter-core --lib external_bofs`.
 
 ## Documentation
 

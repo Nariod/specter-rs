@@ -5,3 +5,4 @@ Cargo.lock
 *.so
 agent_specter_rs_harness
 src_server/agent_specter_rs/agent_specter_rs
+*.o

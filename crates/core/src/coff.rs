@@ -1120,4 +1120,104 @@ mod tests {
             it += 1;
         }
     }
+
+    // External BOF compatibility sweep: when SPT_BOF_DIR points at a
+    // directory of .o files (the reference BOFs of tools/bof plus third-party
+    // x64 COFF objects), every object must satisfy the loader's contract:
+    // a `go` entry, an accepted layout, only supported relocation types with
+    // in-section sites, imports exclusively `__imp_MODULE$Func`, and Beacon
+    // API symbols restricted to the dispatched subset (beacon::coff::beacon_api).
+    #[test]
+    fn external_bofs_compatible() {
+        let dir = match std::env::var("SPT_BOF_DIR") {
+            Ok(d) => d,
+            Err(_) => return, // not set: nothing to sweep
+        };
+        let mut entries: std::vec::Vec<_> = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("SPT_BOF_DIR {dir} unreadable: {e}"))
+            .map(|e| e.expect("dir entry").path())
+            .filter(|p| p.extension().map_or(false, |e| e == "o"))
+            .collect();
+        entries.sort();
+        assert!(!entries.is_empty(), "SPT_BOF_DIR set but no .o in {dir}");
+        // The Beacon API subset the loader dispatches by hash
+        // (crates/beacon/src/coff.rs `beacon_api`).
+        const SUBSET: &[&[u8]] = &[
+            b"BeaconOutput",
+            b"BeaconPrintf",
+            b"BeaconDataParse",
+            b"BeaconDataInt",
+            b"BeaconDataShort",
+            b"BeaconDataLength",
+            b"BeaconDataExtract",
+            b"BeaconDataPtr",
+            b"BeaconFormatAlloc",
+            b"BeaconFormatFree",
+            b"BeaconFormatReset",
+            b"BeaconFormatAppend",
+            b"BeaconFormatPrintf",
+            b"BeaconFormatToString",
+            b"BeaconUseToken",
+            b"BeaconRevertToken",
+        ];
+        for path in entries {
+            let blob = std::fs::read(&path).expect("read bof");
+            let coff =
+                Coff::parse(&blob).unwrap_or_else(|| panic!("{path:?}: not a valid x64 COFF"));
+            assert!(coff.find_entry(b"go").is_some(), "{path:?}: no `go` entry");
+            assert!(plan_layout(&coff).is_some(), "{path:?}: layout rejected");
+            // The loader resolves only the symbol targets of relocations â
+            // collect them, then check each resolved external's name.
+            let mut needed: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for si in 0..coff.num_sections() {
+                let sec = coff.section(si).expect("section");
+                let mut r = 0;
+                while let Some((site, typ, symi)) = coff.reloc(&sec, r) {
+                    assert!(
+                        reloc_patch_len(typ).is_some(),
+                        "{path:?}: unsupported reloc type {typ} in section {si}"
+                    );
+                    assert!(
+                        reloc_site_ok(sec.raw_size, site, typ),
+                        "{path:?}: reloc site out of section {si}"
+                    );
+                    needed.insert(symi as usize);
+                    r += 1;
+                }
+            }
+            for &i in &needed {
+                let s = coff.symbol(i).expect("symbol");
+                if !s.is_external() {
+                    continue;
+                }
+                let name = coff.symbol_name(i);
+                // LLVM refptr/section symbols (`.refptr.X`, `.text`...) are
+                // compiler-internal, never resolved by the loader.
+                if name.starts_with(b".") {
+                    continue;
+                }
+                // Mirror resolve_external (beacon::coff): strip __imp_, then a
+                // bare name or BEACON$Name is a Beacon API symbol, anything
+                // else must be a MODULE$Function dynamic import.
+                let sym = name.strip_prefix(b"__imp_").unwrap_or(name);
+                let dollar = sym.iter().position(|&c| c == b'$');
+                match dollar {
+                     None => assert!(
+                          SUBSET.contains(&sym),
+                        "{path:?}: bare extern outside the Beacon API subset: {name:?}"
+                    ),
+                    Some(d) => {
+                        let module = &sym[..d];
+                        let func = &sym[d + 1..];
+                        if module.eq_ignore_ascii_case(b"beacon") {
+                            assert!(
+                                SUBSET.contains(&func),
+                                "{path:?}: Beacon API outside the loader subset: {name:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
